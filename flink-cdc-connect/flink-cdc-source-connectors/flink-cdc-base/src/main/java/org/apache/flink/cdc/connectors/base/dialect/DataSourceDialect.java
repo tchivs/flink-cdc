@@ -81,6 +81,11 @@ public interface DataSourceDialect<C extends SourceConfig> extends Serializable,
     /** The task context used for fetch task to fetch data from external systems. */
     FetchTask.Context createFetchTaskContext(C sourceConfig);
 
+    /** Try to reuse Context if reuse is true. */
+    default FetchTask.Context createFetchTaskContext(C sourceConfig, boolean reuse) {
+        return createFetchTaskContext(sourceConfig);
+    }
+
     /**
      * We may need the offset corresponding to the checkpointId. For example, we should commit LSN
      * of checkpoint to postgres's slot.

@@ -118,40 +118,24 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
         return PostgresOffsetUtils.getPostgresOffsetContext(loader, offset);
     }
 
+    private boolean isInitialized = false;
+
     @Override
     public void configure(SourceSplitBase sourceSplitBase) {
         LOG.debug("Configuring PostgresSourceFetchTaskContext for split: {}", sourceSplitBase);
-        PostgresConnectorConfig dbzConfig = getDbzConnectorConfig();
-        if (sourceSplitBase instanceof SnapshotSplit) {
-            dbzConfig =
-                    new PostgresConnectorConfig(
-                            dbzConfig
-                                    .getConfig()
-                                    .edit()
-                                    .with(
-                                            "table.include.list",
-                                            ((SnapshotSplit) sourceSplitBase)
-                                                    .getTableId()
-                                                    .toString())
-                                    .with(
-                                            SLOT_NAME.name(),
-                                            ((PostgresSourceConfig) sourceConfig)
-                                                    .getSlotNameForBackfillTask())
-                                    // drop slot for backfill stream split
-                                    .with(DROP_SLOT_ON_STOP.name(), true)
-                                    // Disable heartbeat event in snapshot split fetcher
-                                    .with(Heartbeat.HEARTBEAT_INTERVAL, 0)
-                                    .build());
+
+        // Only initialize once to avoid repeated schema refresh
+        if (!isInitialized) {
+            initializeContext(sourceSplitBase);
+            isInitialized = true;
         } else {
-            dbzConfig =
-                    new PostgresConnectorConfig(
-                            dbzConfig
-                                    .getConfig()
-                                    .edit()
-                                    // never drop slot for stream split, which is also global split
-                                    .with(DROP_SLOT_ON_STOP.name(), false)
-                                    .build());
+            // For subsequent splits, only update split-specific configurations
+            updateSplitSpecificConfig(sourceSplitBase);
         }
+    }
+
+    private void initializeContext(SourceSplitBase sourceSplitBase) {
+        PostgresConnectorConfig dbzConfig = buildDbzConfig(sourceSplitBase);
 
         LOG.info("PostgresConnectorConfig is ", dbzConfig.getConfig().asProperties().toString());
         setDbzConnectorConfig(dbzConfig);
@@ -174,13 +158,15 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
                 sourceSplitBase.getTableSchemas().values());
 
         try {
-            this.schema =
-                    PostgresObjectUtils.newSchema(
-                            jdbcConnection,
-                            dbzConfig,
-                            jdbcConnection.getTypeRegistry(),
-                            topicSelector,
-                            valueConverterBuilder.build(jdbcConnection.getTypeRegistry()));
+            if (this.schema == null) {
+                this.schema =
+                        PostgresObjectUtils.newSchema(
+                                jdbcConnection,
+                                dbzConfig,
+                                jdbcConnection.getTypeRegistry(),
+                                topicSelector,
+                                valueConverterBuilder.build(jdbcConnection.getTypeRegistry()));
+            }
         } catch (SQLException e) {
             throw new RuntimeException("Failed to initialize PostgresSchema", e);
         }
@@ -264,6 +250,47 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
                 new DefaultChangeEventSourceMetricsFactory<>();
         this.snapshotChangeEventSourceMetrics =
                 metricsFactory.getSnapshotMetrics(taskContext, queue, metadataProvider);
+    }
+
+    private void updateSplitSpecificConfig(SourceSplitBase sourceSplitBase) {
+        // Update only split-specific configurations without reinitializing schema
+        PostgresConnectorConfig dbzConfig = buildDbzConfig(sourceSplitBase);
+        setDbzConnectorConfig(dbzConfig);
+
+        // Update offset context for the new split
+        this.offsetContext =
+                loadStartingOffsetState(
+                        new PostgresOffsetContext.Loader(dbzConfig), sourceSplitBase);
+    }
+
+    private PostgresConnectorConfig buildDbzConfig(SourceSplitBase sourceSplitBase) {
+        PostgresConnectorConfig dbzConfig = getDbzConnectorConfig();
+        if (sourceSplitBase instanceof SnapshotSplit) {
+            return new PostgresConnectorConfig(
+                    dbzConfig
+                            .getConfig()
+                            .edit()
+                            .with(
+                                    "table.include.list",
+                                    ((SnapshotSplit) sourceSplitBase).getTableId().toString())
+                            .with(
+                                    SLOT_NAME.name(),
+                                    ((PostgresSourceConfig) sourceConfig)
+                                            .getSlotNameForBackfillTask())
+                            // drop slot for backfill stream split
+                            .with(DROP_SLOT_ON_STOP.name(), true)
+                            // Disable heartbeat event in snapshot split fetcher
+                            .with(Heartbeat.HEARTBEAT_INTERVAL, 0)
+                            .build());
+        } else {
+            return new PostgresConnectorConfig(
+                    dbzConfig
+                            .getConfig()
+                            .edit()
+                            // never drop slot for stream split, which is also global split
+                            .with(DROP_SLOT_ON_STOP.name(), false)
+                            .build());
+        }
     }
 
     @Override

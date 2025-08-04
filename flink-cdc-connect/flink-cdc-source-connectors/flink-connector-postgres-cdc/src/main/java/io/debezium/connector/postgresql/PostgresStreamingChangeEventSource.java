@@ -5,7 +5,6 @@
  */
 package io.debezium.connector.postgresql;
 
-import io.debezium.DebeziumException;
 import io.debezium.connector.postgresql.connection.LogicalDecodingMessage;
 import io.debezium.connector.postgresql.connection.Lsn;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
@@ -109,16 +108,6 @@ public class PostgresStreamingChangeEventSource
         this.connectionProbeTimer =
                 ElapsedTimeStrategy.constant(
                         Clock.system(), connectorConfig.statusUpdateInterval());
-    }
-
-    @Override
-    public void init() {
-        // refresh the schema so we have a latest view of the DB tables
-        try {
-            taskContext.refreshSchema(connection, true);
-        } catch (SQLException e) {
-            throw new DebeziumException("Error while executing initial schema load", e);
-        }
     }
 
     @Override
