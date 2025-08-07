@@ -17,6 +17,7 @@
 
 package org.apache.flink.cdc.runtime.serializer.data.binary;
 
+import org.apache.flink.cdc.common.data.DecimalData;
 import org.apache.flink.cdc.common.data.binary.BinaryRecordData;
 import org.apache.flink.cdc.common.data.binary.BinarySegmentUtils;
 import org.apache.flink.cdc.runtime.serializer.data.util.DataFormatTestUtil;
@@ -189,5 +190,78 @@ class BinarySegmentUtilsTest {
 
         assertThat(BinarySegmentUtils.find(segments1, 34, 0, segments2, 0, 0)).isEqualTo(34);
         assertThat(BinarySegmentUtils.find(segments1, 34, 0, segments2, 0, 15)).isEqualTo(-1);
+    }
+
+    @Test
+    void testReadDecimalDataWithInvalidOffset() {
+        // Test our fix for corrupted binary data that causes IndexOutOfBoundsException
+        MemorySegment[] segments = new MemorySegment[1];
+        segments[0] = MemorySegmentFactory.wrap(new byte[64]);
+
+        // Create invalid offsetAndSize that would cause negative offset
+        // High 32 bits = negative subOffset, Low 32 bits = size
+        long invalidOffsetAndSize = ((-2130706448L) << 32) | 48L;
+
+        // This should return zero decimal instead of throwing IndexOutOfBoundsException
+        DecimalData result =
+                BinarySegmentUtils.readDecimalData(segments, 16, invalidOffsetAndSize, 10, 0);
+
+        assertThat(result).isNotNull();
+        assertThat(result.toBigDecimal().intValue()).isEqualTo(0);
+    }
+
+    @Test
+    void testReadDecimalDataWithNegativeSize() {
+        // Test handling of invalid size in offsetAndSize
+        MemorySegment[] segments = new MemorySegment[1];
+        segments[0] = MemorySegmentFactory.wrap(new byte[64]);
+
+        // Create offsetAndSize with negative size (invalid)
+        long invalidOffsetAndSize = (10L << 32) | (-5L & 0xFFFFFFFFL);
+
+        // This should return zero decimal for invalid size
+        DecimalData result =
+                BinarySegmentUtils.readDecimalData(segments, 0, invalidOffsetAndSize, 10, 2);
+
+        assertThat(result).isNotNull();
+        assertThat(result.toBigDecimal().intValue()).isEqualTo(0);
+    }
+
+    @Test
+    void testReadDecimalDataWithZeroSize() {
+        // Test handling of zero size in offsetAndSize
+        MemorySegment[] segments = new MemorySegment[1];
+        segments[0] = MemorySegmentFactory.wrap(new byte[64]);
+
+        // Create offsetAndSize with zero size
+        long zeroSizeOffsetAndSize = (10L << 32) | 0L;
+
+        // This should return zero decimal for zero size
+        DecimalData result =
+                BinarySegmentUtils.readDecimalData(segments, 0, zeroSizeOffsetAndSize, 10, 2);
+
+        assertThat(result).isNotNull();
+        assertThat(result.toBigDecimal().intValue()).isEqualTo(0);
+    }
+
+    @Test
+    void testReadDecimalDataValidCase() {
+        // Test that valid decimal data still works correctly
+        MemorySegment[] segments = new MemorySegment[1];
+        byte[] data = new byte[64];
+        // Put valid decimal bytes (representing number 42) at offset 20
+        byte[] decimalBytes = {42}; // Simple byte representation
+        System.arraycopy(decimalBytes, 0, data, 20, decimalBytes.length);
+        segments[0] = MemorySegmentFactory.wrap(data);
+
+        // Create valid offsetAndSize: subOffset=20, size=1
+        long validOffsetAndSize = (20L << 32) | 1L;
+
+        // This should read the decimal correctly
+        DecimalData result =
+                BinarySegmentUtils.readDecimalData(segments, 0, validOffsetAndSize, 10, 0);
+
+        assertThat(result).isNotNull();
+        assertThat(result.toBigDecimal().intValue()).isEqualTo(42);
     }
 }

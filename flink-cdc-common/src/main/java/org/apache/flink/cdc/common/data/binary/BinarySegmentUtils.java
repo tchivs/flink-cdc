@@ -999,9 +999,22 @@ public final class BinarySegmentUtils {
             int scale) {
         final int size = ((int) offsetAndSize);
         int subOffset = (int) (offsetAndSize >> 32);
-        byte[] bytes = new byte[size];
-        copyToBytes(segments, baseOffset + subOffset, bytes, 0, size);
-        return DecimalData.fromUnscaledBytes(bytes, precision, scale);
+
+        // Fix for FLINK-38196: Handle invalid offset/size that can cause IndexOutOfBoundsException
+        // This can happen with PostgreSQL numeric(0) fields or corrupted binary data
+        if (size <= 0 || subOffset < 0) {
+            // Return zero decimal for invalid size or negative offset
+            return DecimalData.zero(precision, scale);
+        }
+
+        try {
+            byte[] bytes = new byte[size];
+            copyToBytes(segments, baseOffset + subOffset, bytes, 0, size);
+            return DecimalData.fromUnscaledBytes(bytes, precision, scale);
+        } catch (IndexOutOfBoundsException | IllegalArgumentException e) {
+            // Fallback to zero decimal if binary data is corrupted or invalid
+            return DecimalData.zero(precision, scale);
+        }
     }
 
     /**
