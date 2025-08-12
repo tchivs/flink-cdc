@@ -24,6 +24,7 @@ import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.state.OperatorStateStore;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.cdc.connectors.postgres.testutils.PostgresVersion;
 import org.apache.flink.cdc.connectors.utils.TestSourceContext;
 import org.apache.flink.cdc.debezium.DebeziumDeserializationSchema;
 import org.apache.flink.cdc.debezium.DebeziumSourceFunction;
@@ -41,7 +42,7 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestTemplate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -70,34 +71,34 @@ import static org.apache.flink.cdc.connectors.utils.AssertUtils.assertUpdate;
 import static org.testcontainers.containers.PostgreSQLContainer.POSTGRESQL_PORT;
 
 /** Tests for {@link PostgreSQLSource} which also heavily tests {@link DebeziumSourceFunction}. */
-class PostgreSQLSourceTest extends PostgresTestBase {
+@PostgresVersion(version = "14")
+class PostgreSQLSourceTest extends PostgresVersionedTestBase {
     private static final Logger LOG = LoggerFactory.getLogger(PostgreSQLSourceTest.class);
     private String slotName;
 
     @BeforeEach
     public void before() {
-        initializePostgresTable(POSTGRES_CONTAINER, "inventory");
+        initializePostgresTable("inventory");
         slotName = getSlotName();
     }
 
     @AfterEach
     public void after() throws SQLException {
         String sql = String.format("SELECT pg_drop_replication_slot('%s')", slotName);
-        try (Connection connection =
-                        PostgresTestBase.getJdbcConnection(POSTGRES_CONTAINER, "postgres");
+        try (Connection connection = getJdbcConnection("postgres");
                 Statement statement = connection.createStatement()) {
             statement.execute(sql);
         }
     }
 
-    @Test
+    @TestTemplate
     void testConsumingAllEvents() throws Exception {
         DebeziumSourceFunction<SourceRecord> source = createPostgreSqlSourceWithHeartbeatDisabled();
         TestSourceContext<SourceRecord> sourceContext = new TestSourceContext<>();
 
         setupSource(source);
 
-        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+        try (Connection connection = getJdbcConnection();
                 Statement statement = connection.createStatement()) {
             // start the source
             final CheckedThread runThread =
@@ -159,7 +160,7 @@ class PostgreSQLSourceTest extends PostgresTestBase {
         }
     }
 
-    @Test
+    @TestTemplate
     void testCheckpointAndRestore() throws Exception {
         final TestingListState<byte[]> offsetState = new TestingListState<>();
         final TestingListState<String> historyState = new TestingListState<>();
@@ -254,7 +255,7 @@ class PostgreSQLSourceTest extends PostgresTestBase {
             Assertions.assertThat(waitForAvailableRecords(Duration.ofSeconds(5), sourceContext2))
                     .isFalse();
 
-            try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+            try (Connection connection = getJdbcConnection();
                     Statement statement = connection.createStatement()) {
 
                 statement.execute(
@@ -322,7 +323,7 @@ class PostgreSQLSourceTest extends PostgresTestBase {
                     .isFalse();
 
             // can continue to receive new events
-            try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+            try (Connection connection = getJdbcConnection();
                     Statement statement = connection.createStatement()) {
                 statement.execute("DELETE FROM inventory.products WHERE id=1001");
             }
@@ -414,7 +415,7 @@ class PostgreSQLSourceTest extends PostgresTestBase {
                     };
             runThread5.start();
 
-            try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+            try (Connection connection = getJdbcConnection();
                     Statement statement = connection.createStatement()) {
 
                 statement.execute(
@@ -464,7 +465,7 @@ class PostgreSQLSourceTest extends PostgresTestBase {
                         }
                     };
             runThread6.start();
-            try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+            try (Connection connection = getJdbcConnection();
                     Statement statement = connection.createStatement()) {
 
                 statement.execute(
@@ -478,7 +479,64 @@ class PostgreSQLSourceTest extends PostgresTestBase {
         }
     }
 
-    @Test
+    @TestTemplate
+    void testPartitionTableParentConfiguration() throws Exception {
+        DebeziumSourceFunction<SourceRecord> source = createPostgreSqlSourceForPartitionTables();
+        TestSourceContext<SourceRecord> sourceContext = new TestSourceContext<>();
+
+        setupSource(source);
+
+        try (Connection connection = getJdbcConnection();
+                Statement statement = connection.createStatement()) {
+            // start the source
+            final CheckedThread runThread =
+                    new CheckedThread() {
+                        @Override
+                        public void go() throws Exception {
+                            source.run(sourceContext);
+                        }
+                    };
+            runThread.start();
+
+            // Wait for snapshot data from partition table (should capture from all partitions)
+            List<SourceRecord> records = drain(sourceContext, 6);
+            Assertions.assertThat(records).hasSize(6);
+
+            // Verify initial snapshot data from all partitions is captured
+            for (int i = 0; i < records.size(); i++) {
+                assertRead(records.get(i), "id", i + 1);
+            }
+
+            // Test streaming changes to partition table
+            statement.execute(
+                    "INSERT INTO inventory.orders (customer_id, order_date, product_id, quantity, total_amount, status) "
+                            + "VALUES (105, '2024-01-25', 106, 2, 149.99, 'PENDING')"); // id=7
+            records = drain(sourceContext, 1);
+            assertInsert(records.get(0), "id", 7);
+
+            statement.execute(
+                    "INSERT INTO inventory.orders (customer_id, order_date, product_id, quantity, total_amount, status) "
+                            + "VALUES (106, '2024-04-15', 107, 3, 299.97, 'COMPLETED')"); // id=8
+            records = drain(sourceContext, 1);
+            assertInsert(records.get(0), "id", 8);
+
+            // Update records across partitions
+            statement.execute("UPDATE inventory.orders SET status='COMPLETED' WHERE id=3");
+            records = drain(sourceContext, 1);
+            assertUpdate(records.get(0), "id", 3);
+
+            statement.execute(
+                    "UPDATE inventory.orders SET quantity=5, total_amount=499.95 WHERE id=5");
+            records = drain(sourceContext, 1);
+            assertUpdate(records.get(0), "id", 5);
+
+            // cleanup
+            source.close();
+            runThread.sync();
+        }
+    }
+
+    @TestTemplate
     void testFlushLsn() throws Exception {
         final TestingListState<byte[]> offsetState = new TestingListState<>();
         final TestingListState<String> historyState = new TestingListState<>();
@@ -563,7 +621,7 @@ class PostgreSQLSourceTest extends PostgresTestBase {
             Assertions.assertThat(flushLsn.add(getConfirmedFlushLsn())).isTrue();
 
             // verify LSN is advanced even if there is no changes on the table
-            try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+            try (Connection connection = getJdbcConnection();
                     Statement statement = connection.createStatement()) {
                 // we have to do some transactions which is not related to the monitored table
                 statement.execute("CREATE TABLE dummy (a int)");
@@ -598,7 +656,7 @@ class PostgreSQLSourceTest extends PostgresTestBase {
             TestSourceContext<SourceRecord> sourceContext,
             long checkpointId)
             throws Exception {
-        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+        try (Connection connection = getJdbcConnection();
                 Statement statement = connection.createStatement()) {
             for (int i = 0; i < num; i++) {
                 statement.execute(
@@ -629,11 +687,11 @@ class PostgreSQLSourceTest extends PostgresTestBase {
         Properties properties = new Properties();
         properties.setProperty("heartbeat.interval.ms", String.valueOf(heartbeatInterval));
         return PostgreSQLSource.<SourceRecord>builder()
-                .hostname(POSTGRES_CONTAINER.getHost())
-                .port(POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT))
-                .database(POSTGRES_CONTAINER.getDatabaseName())
-                .username(POSTGRES_CONTAINER.getUsername())
-                .password(POSTGRES_CONTAINER.getPassword())
+                .hostname(getContainer().getHost())
+                .port(getContainer().getMappedPort(POSTGRESQL_PORT))
+                .database(getContainer().getDatabaseName())
+                .username(getContainer().getUsername())
+                .password(getContainer().getPassword())
                 .schemaList("inventory")
                 .tableList("inventory.products")
                 .deserializer(new ForwardDeserializeSchema())
@@ -643,14 +701,32 @@ class PostgreSQLSourceTest extends PostgresTestBase {
                 .build();
     }
 
+    private DebeziumSourceFunction<SourceRecord> createPostgreSqlSourceForPartitionTables() {
+        Properties properties = new Properties();
+        properties.setProperty("heartbeat.interval.ms", "0");
+        return PostgreSQLSource.<SourceRecord>builder()
+                .hostname(getContainer().getHost())
+                .port(getContainer().getMappedPort(POSTGRESQL_PORT))
+                .database(getContainer().getDatabaseName())
+                .username(getContainer().getUsername())
+                .password(getContainer().getPassword())
+                .schemaList("inventory")
+                .tableList("inventory.orders") // Parent partition table
+                .deserializer(new ForwardDeserializeSchema())
+                .decodingPluginName("pgoutput")
+                .slotName(slotName)
+                .debeziumProperties(properties)
+                .build();
+    }
+
     private String getConfirmedFlushLsn() throws SQLException {
-        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+        try (Connection connection = getJdbcConnection();
                 Statement statement = connection.createStatement()) {
             ResultSet rs =
                     statement.executeQuery(
                             String.format(
                                     "select * from pg_replication_slots where slot_name = '%s' and database = '%s' and plugin = '%s'",
-                                    slotName, POSTGRES_CONTAINER.getDatabaseName(), "pgoutput"));
+                                    slotName, getContainer().getDatabaseName(), "pgoutput"));
             if (rs.next()) {
                 return rs.getString("confirmed_flush_lsn");
             } else {

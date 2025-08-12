@@ -6,6 +6,10 @@
 
 package io.debezium.connector.postgresql.connection;
 
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionHandlingStrategy;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresSqlQueries;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresVersionStrategy;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresVersionUtils;
 import org.apache.flink.cdc.connectors.postgres.source.utils.TableDiscoveryUtils;
 
 import io.debezium.DebeziumException;
@@ -22,7 +26,6 @@ import io.debezium.util.Clock;
 import io.debezium.util.Metronome;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.postgresql.core.BaseConnection;
-import org.postgresql.core.ServerVersion;
 import org.postgresql.replication.PGReplicationStream;
 import org.postgresql.replication.fluent.logical.ChainedLogicalStreamBuilder;
 import org.postgresql.util.PSQLException;
@@ -176,10 +179,13 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
                 Connection conn = pgConnection();
                 conn.setAutoCommit(false);
 
+                // Use PostgresVersionStrategy for consistent version-specific query selection
+                PostgresVersionStrategy strategy =
+                        PostgresVersionStrategy.forConnection(jdbcConnection);
                 String selectPublication =
-                        String.format(
-                                "SELECT COUNT(1) FROM pg_publication WHERE pubname = '%s'",
-                                publicationName);
+                        PostgresSqlQueries.getQuery(
+                                PostgresSqlQueries.QueryType.CHECK_PUBLICATION_EXISTS, strategy);
+                selectPublication = String.format(selectPublication, publicationName);
                 try (Statement stmt = conn.createStatement();
                         ResultSet rs = stmt.executeQuery(selectPublication)) {
                     if (rs.next()) {
@@ -206,14 +212,14 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
                                     stmt.execute(createPublicationStmt);
                                     break;
                                 case FILTERED:
-                                    createOrUpdatePublicationModeFilterted(
+                                    createOrUpdatePublicationModeFiltered(
                                             tableFilterString, stmt, false);
                                     break;
                             }
                         } else {
                             switch (publicationAutocreateMode) {
                                 case FILTERED:
-                                    createOrUpdatePublicationModeFilterted(
+                                    createOrUpdatePublicationModeFiltered(
                                             tableFilterString, stmt, true);
                                     break;
                                 default:
@@ -235,13 +241,20 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
         }
     }
 
-    private void createOrUpdatePublicationModeFilterted(
+    private void createOrUpdatePublicationModeFiltered(
             String tableFilterString, Statement stmt, boolean isUpdate) {
         String createOrUpdatePublicationStmt;
         try {
-            Set<TableId> tablesToCapture = determineCapturedTables();
+            Set<org.apache.flink.cdc.connectors.postgres.source.utils.TableInfo> tablesWithType =
+                    determineCapturedTablesWithType();
+
+            // Handle partitioned tables using strategy pattern based on PostgreSQL version
+            PartitionHandlingStrategy strategy =
+                    PartitionHandlingStrategy.forConnection(jdbcConnection);
+            Set<TableId> finalTablesToCapture = strategy.processPartitionedTables(tablesWithType);
+
             tableFilterString =
-                    tablesToCapture.stream()
+                    finalTablesToCapture.stream()
                             .map(TableId::toDoubleQuotedString)
                             .collect(Collectors.joining(", "));
             if (tableFilterString.isEmpty()) {
@@ -273,9 +286,11 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
         }
     }
 
-    private Set<TableId> determineCapturedTables() throws Exception {
-        return TableDiscoveryUtils.listTables(
-                connectorConfig.databaseName(), jdbcConnection.connect(), tableFilter);
+    private Set<org.apache.flink.cdc.connectors.postgres.source.utils.TableInfo>
+            determineCapturedTablesWithType() throws Exception {
+        // Use enhanced table discovery to get table types along with identifiers
+        return TableDiscoveryUtils.listTablesWithType(
+                connectorConfig.databaseName(), jdbcConnection, tableFilter);
     }
 
     protected void initReplicationSlot() throws SQLException, InterruptedException {
@@ -420,7 +435,7 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
         LOGGER.debug("Creating new replication slot '{}' for plugin '{}'", slotName, plugin);
         String tempPart = "";
         // Exported snapshots are supported in Postgres 9.4+
-        boolean canExportSnapshot = pgConnection().haveMinimumServerVersion(ServerVersion.v9_4);
+        boolean canExportSnapshot = PostgresVersionUtils.isServer94OrLater(jdbcConnection);
         if ((dropSlotOnClose) && !canExportSnapshot) {
             LOGGER.warn(
                     "A slot marked as temporary or with an exported snapshot was created, "
@@ -734,8 +749,25 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
 
     private Boolean hasMinimumVersion(int version) {
         try {
-            return pgConnection().haveMinimumServerVersion(version);
-        } catch (SQLException e) {
+            // Use PostgresVersionUtils for consistent version checking
+            // Convert version number to major version
+            int majorVersion = version / 10000;
+
+            // Use specific version checking methods for known versions
+            switch (majorVersion) {
+                case 9:
+                    return PostgresVersionUtils.isServer94OrLater(jdbcConnection);
+                case 10:
+                    return PostgresVersionUtils.isServer10OrLater(jdbcConnection);
+                case 11:
+                    return PostgresVersionUtils.isServer11OrLater(jdbcConnection);
+                case 12:
+                    return PostgresVersionUtils.isServer12OrLater(jdbcConnection);
+                case 13:
+                default:
+                    return PostgresVersionUtils.isServer13OrLater(jdbcConnection);
+            }
+        } catch (Exception e) {
             throw new DebeziumException(e);
         }
     }

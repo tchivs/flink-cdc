@@ -231,6 +231,15 @@ public class PostgresSourceBuilder<T> {
     }
 
     /**
+     * The partition properties. For example, "partition-tables.inventory.public.order_history:
+     * inventory.public.order_history_\d{2-6}".
+     */
+    public PostgresSourceBuilder<T> partitionProperties(Properties properties) {
+        this.configFactory.partitionProperties(properties);
+        return this;
+    }
+
+    /**
      * scan.incremental.close-idle-reader.enabled
      *
      * <p>Whether to close idle readers at the end of the snapshot phase. This feature depends on

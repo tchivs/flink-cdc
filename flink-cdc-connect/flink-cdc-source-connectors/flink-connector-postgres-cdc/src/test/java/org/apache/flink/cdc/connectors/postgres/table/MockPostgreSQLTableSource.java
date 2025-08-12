@@ -50,6 +50,7 @@ public class MockPostgreSQLTableSource extends PostgreSQLTableSource {
                 (String) get(postgreSQLTableSource, "slotName"),
                 (DebeziumChangelogMode) get(postgreSQLTableSource, "changelogMode"),
                 (Properties) get(postgreSQLTableSource, "dbzProperties"),
+                (Properties) get(postgreSQLTableSource, "partitionProperties"),
                 (boolean) get(postgreSQLTableSource, "enableParallelRead"),
                 (int) get(postgreSQLTableSource, "splitSize"),
                 (int) get(postgreSQLTableSource, "splitMetaGroupSize"),

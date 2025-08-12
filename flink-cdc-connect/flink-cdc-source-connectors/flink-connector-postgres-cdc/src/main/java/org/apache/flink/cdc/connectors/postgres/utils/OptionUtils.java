@@ -23,9 +23,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Map;
+import java.util.Properties;
 
 /** A utility class to print configuration of connectors. */
 public class OptionUtils {
+    public static final String PARTITION_TABLES = "partition-tables";
 
     private static final Logger LOG = LoggerFactory.getLogger(OptionUtils.class);
 
@@ -38,5 +40,17 @@ public class OptionUtils {
         for (String key : hideMap.keySet()) {
             LOG.info("{} = {}", key, hideMap.get(key));
         }
+    }
+
+    public static Properties getPartitionProperties(Map<String, String> configMap) {
+        Properties partitionProperties = new Properties();
+        configMap.entrySet().stream()
+                .filter(entry -> entry.getKey().startsWith(PARTITION_TABLES))
+                .forEach(
+                        entry -> {
+                            String key = entry.getKey().substring(PARTITION_TABLES.length() + 1);
+                            partitionProperties.put(key, entry.getValue());
+                        });
+        return partitionProperties;
     }
 }

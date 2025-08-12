@@ -38,7 +38,6 @@ import javax.annotation.Nullable;
 
 import java.sql.SQLException;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -72,22 +71,16 @@ public class PostgresSchemaUtils {
 
     public static List<TableId> listTables(
             PostgresSourceConfig sourceConfig, @Nullable String dbName) {
+        LOG.trace("Listing tables for database: {}", dbName);
         try (PostgresConnection jdbc = getPostgresDialect(sourceConfig).openJdbcConnection()) {
-            List<String> databases =
-                    dbName != null
-                            ? Collections.singletonList(dbName)
-                            : Collections.singletonList(sourceConfig.getDatabaseList().get(0));
-            return listTables(jdbc, databases.toArray(new String[0]));
+            String database = dbName != null ? dbName : sourceConfig.getDatabaseList().get(0);
+            return TableDiscoveryUtils.listTables(database, jdbc, sourceConfig.getTableFilters())
+                    .stream()
+                    .map(PostgresSchemaUtils::toCdcTableId)
+                    .collect(Collectors.toList());
         } catch (SQLException e) {
             throw new RuntimeException("Error to list databases: " + e.getMessage(), e);
         }
-    }
-
-    public static List<TableId> listTables(PostgresConnection jdbc, String... databases)
-            throws SQLException {
-        return TableDiscoveryUtils.listTables(jdbc, databases).stream()
-                .map(PostgresSchemaUtils::toCdcTableId)
-                .collect(Collectors.toList());
     }
 
     public static Schema getTableSchema(PostgresSourceConfig sourceConfig, TableId tableId) {
@@ -150,6 +143,7 @@ public class PostgresSchemaUtils {
             PostgresSourceConfig sourceConfig,
             PostgresConnection jdbc) {
         try {
+            LOG.trace("Fetching schema for table {}", tableId);
             // fetch table schemas
             TopicSelector<io.debezium.relational.TableId> topicSelector =
                     PostgresTopicSelector.create(sourceConfig.getDbzConnectorConfig());

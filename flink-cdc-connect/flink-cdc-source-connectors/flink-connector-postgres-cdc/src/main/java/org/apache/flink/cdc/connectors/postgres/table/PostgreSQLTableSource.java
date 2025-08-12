@@ -69,6 +69,7 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
     private final String slotName;
     private final DebeziumChangelogMode changelogMode;
     private final Properties dbzProperties;
+    private final Properties partitionProperties;
     private final boolean enableParallelRead;
     private final int splitSize;
     private final int splitMetaGroupSize;
@@ -111,6 +112,7 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
             String slotName,
             DebeziumChangelogMode changelogMode,
             Properties dbzProperties,
+            Properties partitionProperties,
             boolean enableParallelRead,
             int splitSize,
             int splitMetaGroupSize,
@@ -141,6 +143,7 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
         this.slotName = slotName;
         this.changelogMode = changelogMode;
         this.dbzProperties = dbzProperties;
+        this.partitionProperties = partitionProperties;
         this.enableParallelRead = enableParallelRead;
         this.splitSize = splitSize;
         this.splitMetaGroupSize = splitMetaGroupSize;
@@ -213,6 +216,7 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
                             .decodingPluginName(pluginName)
                             .slotName(slotName)
                             .debeziumProperties(dbzProperties)
+                            .partitionProperties(partitionProperties)
                             .deserializer(deserializer)
                             .splitSize(splitSize)
                             .splitMetaGroupSize(splitMetaGroupSize)
@@ -283,6 +287,7 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
                         slotName,
                         changelogMode,
                         dbzProperties,
+                        partitionProperties,
                         enableParallelRead,
                         splitSize,
                         splitMetaGroupSize,

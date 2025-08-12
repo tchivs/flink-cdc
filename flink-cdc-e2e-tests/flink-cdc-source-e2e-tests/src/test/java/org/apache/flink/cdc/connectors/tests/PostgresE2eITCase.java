@@ -174,6 +174,123 @@ class PostgresE2eITCase extends FlinkContainerTestEnvironment {
     }
 
     @Test
+    void testPartitionTableParentConfiguration() throws Exception {
+        List<String> sourceSql =
+                Arrays.asList(
+                        "SET 'execution.checkpointing.interval' = '3s';",
+                        "CREATE TABLE orders_source (",
+                        " `id` INT NOT NULL,",
+                        " `customer_id` INT NOT NULL,",
+                        " `order_date` DATE NOT NULL,",
+                        " `product_id` INT NOT NULL,",
+                        " `quantity` INT NOT NULL,",
+                        " `total_amount` DECIMAL(10,2) NOT NULL,",
+                        " `status` STRING,",
+                        " primary key (`id`, `order_date`) not enforced",
+                        ") WITH (",
+                        " 'connector' = 'postgres-cdc',",
+                        " 'hostname' = '" + INTER_CONTAINER_PG_ALIAS + "',",
+                        " 'port' = '" + POSTGRESQL_PORT + "',",
+                        " 'username' = '" + PG_TEST_USER + "',",
+                        " 'password' = '" + PG_TEST_PASSWORD + "',",
+                        " 'database-name' = '" + POSTGRES.getDatabaseName() + "',",
+                        " 'schema-name' = 'inventory',",
+                        " 'table-name' = 'orders',", // Parent partition table
+                        " 'slot.name' = '" + getSlotName("flink_partition_") + "',",
+                        " 'debezium.slot.drop.on.stop' = 'true'",
+                        ");");
+
+        List<String> sinkSqlForOrders =
+                Arrays.asList(
+                        "CREATE TABLE orders_sink (",
+                        " `id` INT NOT NULL,",
+                        " `customer_id` INT NOT NULL,",
+                        " `order_date` DATE NOT NULL,",
+                        " `product_id` INT NOT NULL,",
+                        " `quantity` INT NOT NULL,",
+                        " `total_amount` DECIMAL(10,2) NOT NULL,",
+                        " `status` STRING,",
+                        " primary key (`id`, `order_date`) not enforced",
+                        ") WITH (",
+                        " 'connector' = 'jdbc',",
+                        String.format(
+                                " 'url' = 'jdbc:mysql://%s:3306/%s',",
+                                INTER_CONTAINER_MYSQL_ALIAS,
+                                mysqlInventoryDatabase.getDatabaseName()),
+                        " 'table-name' = 'orders_sink',",
+                        " 'username' = '" + MYSQL_TEST_USER + "',",
+                        " 'password' = '" + MYSQL_TEST_PASSWORD + "'",
+                        ");",
+                        "INSERT INTO orders_sink",
+                        "SELECT * FROM orders_source;");
+
+        List<String> sqlLines =
+                Stream.concat(sourceSql.stream(), sinkSqlForOrders.stream())
+                        .collect(Collectors.toList());
+
+        submitSQLJob(sqlLines, postgresCdcJar, jdbcJar, mysqlDriverJar);
+        waitUntilJobRunning(Duration.ofSeconds(30));
+        Thread.sleep(30000);
+
+        // Test streaming changes to partition table
+        try (Connection conn = getPgJdbcConnection();
+                Statement statement = conn.createStatement()) {
+
+            // Insert into different partitions
+            statement.execute(
+                    "INSERT INTO inventory.orders (customer_id, order_date, product_id, quantity, total_amount, status) "
+                            + "VALUES (105, '2024-01-25', 106, 2, 149.99, 'PENDING')");
+            statement.execute(
+                    "INSERT INTO inventory.orders (customer_id, order_date, product_id, quantity, total_amount, status) "
+                            + "VALUES (106, '2024-04-15', 107, 3, 299.97, 'COMPLETED')");
+
+            // Update existing records across partitions
+            statement.execute("UPDATE inventory.orders SET status='COMPLETED' WHERE id=3");
+            statement.execute(
+                    "UPDATE inventory.orders SET quantity=5, total_amount=499.95 WHERE id=5");
+
+        } catch (SQLException e) {
+            LOG.error("Update partition table for CDC failed.", e);
+            throw e;
+        }
+
+        // Verify results - should capture data from all partitions
+        String mysqlUrl =
+                String.format(
+                        "jdbc:mysql://%s:%s/%s",
+                        MYSQL.getHost(),
+                        MYSQL.getDatabasePort(),
+                        mysqlInventoryDatabase.getDatabaseName());
+        JdbcProxy proxy =
+                new JdbcProxy(mysqlUrl, MYSQL_TEST_USER, MYSQL_TEST_PASSWORD, MYSQL_DRIVER_CLASS);
+
+        // Expected results should include initial data and streaming changes
+        List<String> expectResult =
+                Arrays.asList(
+                        "1,101,2023-11-15,101,2,199.99,COMPLETED",
+                        "2,102,2023-12-20,102,1,89.50,SHIPPED",
+                        "3,103,2024-01-10,103,3,150.75,COMPLETED", // Updated status
+                        "4,101,2024-02-14,101,1,99.99,COMPLETED",
+                        "5,104,2024-03-18,104,5,499.95,PROCESSING", // Updated quantity & amount
+                        "6,102,2024-05-22,105,1,45.99,SHIPPED",
+                        "7,105,2024-01-25,106,2,149.99,PENDING", // New insert
+                        "8,106,2024-04-15,107,3,299.97,COMPLETED"); // New insert
+        proxy.checkResultWithTimeout(
+                expectResult,
+                "orders_sink",
+                new String[] {
+                    "id",
+                    "customer_id",
+                    "order_date",
+                    "product_id",
+                    "quantity",
+                    "total_amount",
+                    "status"
+                },
+                90000L);
+    }
+
+    @Test
     void testPostgresCdcNonIncremental() throws Exception {
         List<String> sourceSql =
                 Arrays.asList(

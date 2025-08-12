@@ -32,6 +32,7 @@ import io.debezium.util.Clock;
 import io.debezium.util.Metronome;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.postgresql.core.BaseConnection;
+import org.postgresql.core.ServerVersion;
 import org.postgresql.jdbc.PgConnection;
 import org.postgresql.jdbc.TimestampUtils;
 import org.postgresql.replication.LogSequenceNumber;
@@ -113,6 +114,8 @@ public class PostgresConnection extends JdbcConnection {
     private final TypeRegistry typeRegistry;
     private final PostgresDefaultValueConverter defaultValueConverter;
 
+    private final ServerVersion cachedServerVersion;
+
     /**
      * Creates a Postgres connection using the supplied configuration. If necessary this connection
      * is able to resolve data type mappings. Such a connection requires a {@link
@@ -166,8 +169,41 @@ public class PostgresConnection extends JdbcConnection {
             this.defaultValueConverter =
                     new PostgresDefaultValueConverter(valueConverter, this.getTimestampUtils());
         }
+        this.cachedServerVersion = initServerVersion();
     }
 
+    private ServerVersion initServerVersion() {
+        try (Connection conn = this.connection()) {
+            DatabaseMetaData metaData = conn.getMetaData();
+            return convertVersionNumberToServerVersion(metaData.getDatabaseMajorVersion());
+        } catch (SQLException e) {
+            LOGGER.warn("Failed to get server version, defaulting to PostgreSQL 10", e);
+            return ServerVersion.v10;
+        }
+    }
+    /**
+     * Convert numeric version number to ServerVersion.
+     *
+     * @param major the numeric version (e.g., 14)
+     * @return the corresponding ServerVersion
+     */
+    private static ServerVersion convertVersionNumberToServerVersion(int major) {
+        // Map major version to ServerVersion
+        if (major >= 14) {
+            return ServerVersion.v14;
+        } else if (major == 13) {
+            return ServerVersion.v13;
+        } else if (major == 12) {
+            return ServerVersion.v12;
+        } else if (major == 11) {
+            return ServerVersion.v11;
+        } else if (major == 10) {
+            return ServerVersion.v10;
+        } else if (major == 9) {
+            return ServerVersion.v9_6;
+        }
+        return ServerVersion.INVALID;
+    }
     /**
      * Create a Postgres connection using the supplied configuration and {@link TypeRegistry}
      *
@@ -194,6 +230,7 @@ public class PostgresConnection extends JdbcConnection {
             this.defaultValueConverter =
                     new PostgresDefaultValueConverter(valueConverter, this.getTimestampUtils());
         }
+        this.cachedServerVersion = initServerVersion();
     }
 
     /**
@@ -207,6 +244,9 @@ public class PostgresConnection extends JdbcConnection {
         this(config, null, connectionUsage);
     }
 
+    public ServerVersion getServerVersion() {
+        return cachedServerVersion;
+    }
     /** Return an unwrapped PgConnection instead of HikariProxyConnection */
     @Override
     public synchronized Connection connection() throws SQLException {
@@ -848,6 +888,63 @@ public class PostgresConnection extends JdbcConnection {
                     && !EXPRESSION_DEFAULT_PATTERN.matcher(columnName).matches();
         }
         return false;
+    }
+
+    /**
+     * Retrieves table names along with their types from the database metadata.
+     *
+     * <p>This method extends the functionality of the standard readTableNames method by also
+     * returning the table type information, which can be used to efficiently identify partitioned
+     * tables without additional database queries.
+     *
+     * @param databaseCatalog the database catalog name
+     * @param schemaNamePattern the schema name pattern (can be null for all schemas)
+     * @param tableNamePattern the table name pattern (can be null for all tables)
+     * @param tableTypes the array of table types to include
+     * @return a map of TableId to PostgresTableType
+     * @throws SQLException if a database exception occurred
+     */
+    public java.util.Map<
+                    TableId,
+                    org.apache.flink.cdc.connectors.postgres.source.utils.PostgresTableType>
+            readTableNamesWithType(
+                    String databaseCatalog,
+                    String schemaNamePattern,
+                    String tableNamePattern,
+                    String[] tableTypes)
+                    throws SQLException {
+
+        if (tableNamePattern == null) {
+            tableNamePattern = "%";
+        }
+
+        java.util.Map<
+                        TableId,
+                        org.apache.flink.cdc.connectors.postgres.source.utils.PostgresTableType>
+                result = new java.util.HashMap<>();
+
+        try (Connection conn = connection()) {
+            DatabaseMetaData metadata = conn.getMetaData();
+            try (ResultSet rs =
+                    metadata.getTables(
+                            databaseCatalog, schemaNamePattern, tableNamePattern, tableTypes)) {
+                while (rs.next()) {
+                    String catalogName = resolveCatalogName(rs.getString(1));
+                    String schemaName = rs.getString(2);
+                    String tableName = rs.getString(3);
+                    String tableTypeStr = rs.getString(4); // Get table type from JDBC metadata
+
+                    TableId tableId = new TableId(catalogName, schemaName, tableName);
+                    org.apache.flink.cdc.connectors.postgres.source.utils.PostgresTableType
+                            tableType =
+                                    org.apache.flink.cdc.connectors.postgres.source.utils
+                                            .PostgresTableType.fromJdbcTypeName(tableTypeStr);
+
+                    result.put(tableId, tableType);
+                }
+            }
+        }
+        return result;
     }
 
     /**

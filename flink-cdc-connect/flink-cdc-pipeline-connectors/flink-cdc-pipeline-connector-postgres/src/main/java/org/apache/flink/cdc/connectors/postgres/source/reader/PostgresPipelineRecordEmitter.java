@@ -28,6 +28,7 @@ import org.apache.flink.cdc.connectors.base.source.metrics.SourceReaderMetrics;
 import org.apache.flink.cdc.connectors.base.source.reader.IncrementalSourceRecordEmitter;
 import org.apache.flink.cdc.connectors.postgres.source.PostgresDialect;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
+import org.apache.flink.cdc.connectors.postgres.source.utils.TableDiscoveryUtils;
 import org.apache.flink.cdc.connectors.postgres.utils.PostgresSchemaUtils;
 import org.apache.flink.cdc.debezium.DebeziumDeserializationSchema;
 import org.apache.flink.connector.base.source.reader.RecordEmitter;
@@ -42,9 +43,7 @@ import java.util.List;
 import java.util.Set;
 
 import static org.apache.flink.cdc.connectors.base.source.meta.wartermark.WatermarkEvent.isLowWatermarkEvent;
-import static org.apache.flink.cdc.connectors.base.utils.SourceRecordUtils.getTableId;
-import static org.apache.flink.cdc.connectors.base.utils.SourceRecordUtils.isDataChangeRecord;
-import static org.apache.flink.cdc.connectors.base.utils.SourceRecordUtils.isSchemaChangeEvent;
+import static org.apache.flink.cdc.connectors.base.utils.SourceRecordUtils.*;
 
 /** The {@link RecordEmitter} implementation for PostgreSQL pipeline connector. */
 public class PostgresPipelineRecordEmitter<T> extends IncrementalSourceRecordEmitter<T> {
@@ -115,20 +114,22 @@ public class PostgresPipelineRecordEmitter<T> extends IncrementalSourceRecordEmi
     private void sendCreateTableEvent(
             PostgresConnection jdbc, TableId tableId, SourceOutput<Event> output) {
         Schema schema = PostgresSchemaUtils.getTableSchema(tableId, sourceConfig, jdbc);
-        output.collect(
-                new CreateTableEvent(
-                        org.apache.flink.cdc.common.event.TableId.tableId(
-                                tableId.schema(), tableId.table()),
-                        schema));
+        output.collect(new CreateTableEvent(convertTableId(tableId), schema));
+    }
+
+    private static org.apache.flink.cdc.common.event.TableId convertTableId(TableId tableId) {
+        return org.apache.flink.cdc.common.event.TableId.tableId(tableId.schema(), tableId.table());
     }
 
     private void generateCreateTableEvent(PostgresSourceConfig sourceConfig) {
         try (PostgresConnection jdbc = postgresDialect.openJdbcConnection()) {
-            for (org.apache.flink.cdc.common.event.TableId tableId :
-                    PostgresSchemaUtils.listTables(
-                            sourceConfig, sourceConfig.getDatabaseList().get(0))) {
+            for (TableId tableId :
+                    TableDiscoveryUtils.listTables(
+                            sourceConfig.getDatabaseList().get(0),
+                            jdbc,
+                            sourceConfig.getTableFilters())) {
                 Schema schema = PostgresSchemaUtils.getTableSchema(tableId, sourceConfig, jdbc);
-                createTableEventCache.add(new CreateTableEvent(tableId, schema));
+                createTableEventCache.add(new CreateTableEvent(convertTableId(tableId), schema));
             }
         } catch (Exception e) {
             throw new RuntimeException("Cannot start emitter to fetch table schema.", e);

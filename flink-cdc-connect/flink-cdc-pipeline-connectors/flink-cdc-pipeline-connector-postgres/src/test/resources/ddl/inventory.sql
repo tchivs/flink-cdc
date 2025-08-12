@@ -4,9 +4,9 @@
 -- The ASF licenses this file to You under the Apache License, Version 2.0
 -- (the "License"); you may not use this file except in compliance with
 -- the License.  You may obtain a copy of the License at
--- 
+--
 --      http://www.apache.org/licenses/LICENSE-2.0
--- 
+--
 -- Unless required by applicable law or agreed to in writing, software
 -- distributed under the License is distributed on an "AS IS" BASIS,
 -- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -20,10 +20,10 @@ SET search_path TO inventory;
 
 -- Create and populate our products using a single insert with many rows
 CREATE TABLE products (
-  id SERIAL NOT NULL PRIMARY KEY,
-  name VARCHAR(255) NOT NULL DEFAULT 'flink',
-  description VARCHAR(512),
-  weight FLOAT(38)
+                          id SERIAL NOT NULL PRIMARY KEY,
+                          name VARCHAR(255) NOT NULL DEFAULT 'flink',
+                          description VARCHAR(512),
+                          weight FLOAT(38)
 );
 ALTER SEQUENCE products_id_seq RESTART WITH 101;
 ALTER TABLE products REPLICA IDENTITY FULL;
@@ -98,3 +98,80 @@ VALUES ('', 0, 'flink'),
        ('E', 2, 'flink'),
        ('e', 4, 'flink'),
        ('E', 3, 'flink');
+
+-- ============================================================================
+-- Partition Table Test Cases for Parent Table Discovery Bug Fix
+-- ============================================================================
+
+-- Create partitioned order_history table (Range Partitioned by order_date)
+CREATE TABLE order_history (
+                               id SERIAL ,
+                               order_number INTEGER NOT NULL,
+                               customer_id INTEGER NOT NULL,
+                               order_date DATE NOT NULL,
+                               total_amount DECIMAL(12,2) NOT NULL,
+                               order_status VARCHAR(20) DEFAULT 'PENDING',
+                               processed_at TIMESTAMP
+) PARTITION BY RANGE (order_date);
+
+ALTER TABLE order_history REPLICA IDENTITY FULL;
+ALTER SEQUENCE order_history_id_seq RESTART WITH 1;
+
+-- Create yearly partitions for order_history
+CREATE TABLE order_history_2023 PARTITION OF order_history
+    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+ALTER TABLE order_history_2023 ADD PRIMARY KEY (id);
+
+CREATE TABLE order_history_2024 PARTITION OF order_history
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+ALTER TABLE order_history_2024 ADD PRIMARY KEY (id);
+
+ALTER TABLE order_history_2023 REPLICA IDENTITY FULL;
+ALTER TABLE order_history_2024 REPLICA IDENTITY FULL;
+
+-- Insert test data into partitioned order_history table
+INSERT INTO order_history (order_number, customer_id, order_date, total_amount, order_status, processed_at)
+VALUES
+    (1001, 1001, '2023-06-15', 299.99, 'COMPLETED', '2023-06-15 10:30:00'),
+    (1002, 1002, '2023-08-20', 145.75, 'SHIPPED', '2023-08-20 14:20:00'),
+    (1003, 1003, '2024-01-10', 89.50, 'PROCESSING', NULL),
+    (1004, 1001, '2024-03-18', 199.99, 'COMPLETED', '2024-03-18 16:45:00'),
+    (1005, 1004, '2024-05-22', 349.99, 'SHIPPED', '2024-05-22 11:15:00');
+
+-- Create partitioned customer_segments table (List Partitioned by segment)
+CREATE TABLE customer_segments (
+                                   id SERIAL,
+                                   customer_id INTEGER NOT NULL,
+                                   segment VARCHAR(20) NOT NULL,
+                                   tier VARCHAR(10) NOT NULL,
+                                   points INTEGER DEFAULT 0,
+                                   joined_date DATE NOT NULL,
+                                   last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) PARTITION BY LIST (segment);
+
+ALTER TABLE customer_segments REPLICA IDENTITY FULL;
+
+-- Create segment-based partitions
+CREATE TABLE customer_segments_premium PARTITION OF customer_segments
+    FOR VALUES IN ('premium', 'vip', 'platinum');
+
+CREATE TABLE customer_segments_standard PARTITION OF customer_segments
+    FOR VALUES IN ('standard', 'regular', 'bronze');
+
+CREATE TABLE customer_segments_basic PARTITION OF customer_segments
+    FOR VALUES IN ('basic', 'starter', 'trial');
+ALTER TABLE customer_segments_premium ADD PRIMARY KEY (id);
+ALTER TABLE customer_segments_premium REPLICA IDENTITY FULL;
+ALTER TABLE customer_segments_standard ADD PRIMARY KEY (id);
+ALTER TABLE customer_segments_standard REPLICA IDENTITY FULL;
+ALTER TABLE customer_segments_basic ADD PRIMARY KEY (id);
+ALTER TABLE customer_segments_basic REPLICA IDENTITY FULL;
+
+-- Insert test data into partitioned customer_segments table
+INSERT INTO customer_segments (customer_id, segment, tier, points, joined_date)
+VALUES
+    (1001, 'premium', 'gold', 2500, '2023-01-15'),
+    (1002, 'standard', 'silver', 1200, '2023-03-20'),
+    (1003, 'basic', 'bronze', 350, '2024-01-10'),
+    (1004, 'vip', 'platinum', 5000, '2022-12-05'),
+    (1001, 'regular', 'silver', 800, '2023-06-18');

@@ -172,4 +172,159 @@ public class PostgresE2eITCase extends PipelineTestEnvironment {
             throw new RuntimeException(e);
         }
     }
+
+    @Test
+    void testPartitionTableParentConfiguration() throws Exception {
+        String pipelineJob =
+                String.format(
+                        "source:\n"
+                                + "  type: postgres\n"
+                                + "  hostname: %s\n"
+                                + "  port: %d\n"
+                                + "  username: %s\n"
+                                + "  password: %s\n"
+                                + "  tables: %s.inventory.orders\n" // Parent partition table
+                                + "  slot.name: %s\n"
+                                + "  scan.startup.mode: initial\n"
+                                + "  server-time-zone: UTC\n"
+                                + "  connect.timeout: 120s\n"
+                                + "\n"
+                                + "sink:\n"
+                                + "  type: values\n"
+                                + "\n"
+                                + "pipeline:\n"
+                                + "  parallelism: %d",
+                        INTER_CONTAINER_POSTGRES_ALIAS,
+                        5432,
+                        POSTGRES_TEST_USER,
+                        POSTGRES_TEST_PASSWORD,
+                        postgresInventoryDatabase.getDatabaseName(),
+                        slotName,
+                        parallelism);
+
+        Path postgresCdcJar = TestUtils.getResource("postgres-cdc-pipeline-connector.jar");
+        submitPipelineJob(pipelineJob, postgresCdcJar);
+
+        waitUntilJobRunning(Duration.ofSeconds(30));
+        // Verify snapshot data from all partitions
+        validateResult(
+                dbNameFormatter,
+                "CreateTableEvent{tableId=inventory.orders, schema=columns={`id` INT NOT NULL,`customer_id` INT NOT NULL,`order_date` DATE NOT NULL,`product_id` INT NOT NULL,`quantity` INT NOT NULL,`total_amount` DECIMAL(10, 2) NOT NULL,`status` STRING}, primaryKeys=id,order_date, options=()}",
+                "DataChangeEvent{tableId=inventory.orders, before=[], after=[1, 101, 2023-11-15, 101, 2, 199.99, COMPLETED], op=INSERT, meta=()}",
+                "DataChangeEvent{tableId=inventory.orders, before=[], after=[2, 102, 2023-12-20, 102, 1, 89.50, SHIPPED], op=INSERT, meta=()}",
+                "DataChangeEvent{tableId=inventory.orders, before=[], after=[3, 103, 2024-01-10, 103, 3, 150.75, PENDING], op=INSERT, meta=()}",
+                "DataChangeEvent{tableId=inventory.orders, before=[], after=[4, 101, 2024-02-14, 101, 1, 99.99, COMPLETED], op=INSERT, meta=()}",
+                "DataChangeEvent{tableId=inventory.orders, before=[], after=[5, 104, 2024-03-18, 104, 2, 299.98, PROCESSING], op=INSERT, meta=()}",
+                "DataChangeEvent{tableId=inventory.orders, before=[], after=[6, 102, 2024-05-22, 105, 1, 45.99, SHIPPED], op=INSERT, meta=()}");
+
+        LOG.info("Begin partition table incremental reading stage.");
+
+        // Test streaming changes to partition table
+        try (Connection conn =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER, postgresInventoryDatabase.getDatabaseName());
+                Statement stat = conn.createStatement()) {
+
+            // Insert into different partitions
+            stat.execute(
+                    "INSERT INTO inventory.orders (customer_id, order_date, product_id, quantity, total_amount, status) "
+                            + "VALUES (105, '2024-01-25', 106, 2, 149.99, 'PENDING')");
+            stat.execute(
+                    "INSERT INTO inventory.orders (customer_id, order_date, product_id, quantity, total_amount, status) "
+                            + "VALUES (106, '2024-04-15', 107, 3, 299.97, 'COMPLETED')");
+
+            // Update existing records
+            stat.execute("UPDATE inventory.orders SET status='COMPLETED' WHERE id=3");
+            stat.execute("UPDATE inventory.orders SET quantity=5, total_amount=499.95 WHERE id=5");
+
+            // Verify streaming changes
+            waitUntilSpecificEvent(
+                    "DataChangeEvent{tableId=inventory.orders, before=[], after=[7, 105, 2024-01-25, 106, 2, 149.99, PENDING], op=INSERT, meta=()}");
+            waitUntilSpecificEvent(
+                    "DataChangeEvent{tableId=inventory.orders, before=[], after=[8, 106, 2024-04-15, 107, 3, 299.97, COMPLETED], op=INSERT, meta=()}");
+            waitUntilSpecificEvent(
+                    "DataChangeEvent{tableId=inventory.orders, before=[3, 103, 2024-01-10, 103, 3, 150.75, PENDING], after=[3, 103, 2024-01-10, 103, 3, 150.75, COMPLETED], op=UPDATE, meta=()}");
+            waitUntilSpecificEvent(
+                    "DataChangeEvent{tableId=inventory.orders, before=[5, 104, 2024-03-18, 104, 2, 299.98, PROCESSING], after=[5, 104, 2024-03-18, 104, 5, 499.95, PROCESSING], op=UPDATE, meta=()}");
+
+        } catch (Exception e) {
+            LOG.error("Update partition table for CDC failed.", e);
+            throw new RuntimeException(e);
+        }
+    }
+
+    @Test
+    void testMultiplePartitionTablesConfiguration() throws Exception {
+        String pipelineJob =
+                String.format(
+                        "source:\n"
+                                + "  type: postgres\n"
+                                + "  hostname: %s\n"
+                                + "  port: %d\n"
+                                + "  username: %s\n"
+                                + "  password: %s\n"
+                                + "  tables: %s.inventory.(orders|inventory|user_sessions)\n" // Multiple partition tables
+                                + "  slot.name: %s\n"
+                                + "  scan.startup.mode: initial\n"
+                                + "  server-time-zone: UTC\n"
+                                + "  connect.timeout: 120s\n"
+                                + "\n"
+                                + "sink:\n"
+                                + "  type: values\n"
+                                + "\n"
+                                + "pipeline:\n"
+                                + "  parallelism: %d",
+                        INTER_CONTAINER_POSTGRES_ALIAS,
+                        5432,
+                        POSTGRES_TEST_USER,
+                        POSTGRES_TEST_PASSWORD,
+                        postgresInventoryDatabase.getDatabaseName(),
+                        slotName,
+                        parallelism);
+
+        Path postgresCdcJar = TestUtils.getResource("postgres-cdc-pipeline-connector.jar");
+        submitPipelineJob(pipelineJob, postgresCdcJar);
+
+        // Wait for create table events for all partition tables
+        waitUntilJobRunning(Duration.ofSeconds(30));
+        validateResult(
+                dbNameFormatter,
+                "CreateTableEvent{tableId=inventory.orders, schema=columns={`id` INT NOT NULL,`customer_id` INT NOT NULL,`order_date` DATE NOT NULL,`product_id` INT NOT NULL,`quantity` INT NOT NULL,`total_amount` DECIMAL(10, 2) NOT NULL,`status` STRING}, primaryKeys=id,order_date, options=()}",
+                "CreateTableEvent{tableId=inventory.inventory, schema=columns={`id` INT NOT NULL,`product_id` INT NOT NULL,`warehouse_location` STRING NOT NULL,`region` STRING NOT NULL,`stock_quantity` INT NOT NULL,`last_updated` TIMESTAMP_LTZ(6)}, primaryKeys=id,region, options=()}",
+                "CreateTableEvent{tableId=inventory.user_sessions, schema=columns={`id` INT NOT NULL,`user_id` BIGINT NOT NULL,`session_start` TIMESTAMP_LTZ(6),`session_end` TIMESTAMP_LTZ(6),`page_views` INT,`duration_minutes` INT}, primaryKeys=id,user_id, options=()}");
+        LOG.info("Multiple partition tables initialized successfully.");
+        // Test streaming changes across multiple partition tables
+        try (Connection conn =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER, postgresInventoryDatabase.getDatabaseName());
+                Statement stat = conn.createStatement()) {
+
+            // Changes to orders partition table
+            stat.execute(
+                    "INSERT INTO inventory.orders (customer_id, order_date, product_id, quantity, total_amount, status) "
+                            + "VALUES (110, '2024-06-01', 108, 1, 79.99, 'PENDING')");
+
+            // Changes to inventory partition table
+            stat.execute(
+                    "INSERT INTO inventory.inventory (product_id, warehouse_location, region, stock_quantity) "
+                            + "VALUES (108, 'Phoenix-WH', 'southwest', 200)");
+
+            // Changes to user_sessions partition table
+            stat.execute(
+                    "INSERT INTO inventory.user_sessions (user_id, session_start, page_views, duration_minutes) "
+                            + "VALUES (1006, '2024-06-01 09:00:00', 12, 20)");
+
+            // Verify at least one event from each partition table
+            waitUntilSpecificEvent(
+                    "DataChangeEvent{tableId=inventory.orders, before=[], after=[7, 110, 2024-06-01, 108, 1, 79.99, PENDING], op=INSERT, meta=()}");
+            waitUntilSpecificEvent(
+                    "DataChangeEvent{tableId=inventory.inventory, before=[], after=[7, 108, Phoenix-WH, southwest, 200");
+            waitUntilSpecificEvent(
+                    "DataChangeEvent{tableId=inventory.user_sessions, before=[], after=[6, 1006");
+
+        } catch (Exception e) {
+            LOG.error("Update multiple partition tables for CDC failed.", e);
+            throw new RuntimeException(e);
+        }
+    }
 }

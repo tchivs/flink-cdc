@@ -52,6 +52,8 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
 
     private int lsnCommitCheckpointsDelay;
 
+    private Properties partitionMapping;
+
     /** Creates a new {@link PostgresSourceConfig} for the given subtask {@code subtaskId}. */
     @Override
     public PostgresSourceConfig create(int subtaskId) {
@@ -133,7 +135,8 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
                 skipSnapshotBackfill,
                 scanNewlyAddedTableEnabled,
                 lsnCommitCheckpointsDelay,
-                assignUnboundedChunkFirst);
+                assignUnboundedChunkFirst,
+                partitionMapping);
     }
 
     /**
@@ -180,5 +183,13 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
     /** The lsn commit checkpoints delay for Postgres. */
     public void setLsnCommitCheckpointsDelay(int lsnCommitCheckpointsDelay) {
         this.lsnCommitCheckpointsDelay = lsnCommitCheckpointsDelay;
+    }
+
+    /**
+     * Configuration for partition table mapping. Format:
+     * parent.table.name=partition1,partition2,partition3
+     */
+    public void partitionProperties(Properties partitionTableMapping) {
+        this.partitionMapping = partitionTableMapping;
     }
 }

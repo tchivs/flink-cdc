@@ -38,6 +38,7 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
 
     private final int subtaskId;
     private final int lsnCommitCheckpointsDelay;
+    private final Properties partitionMapping;
 
     public PostgresSourceConfig(
             int subtaskId,
@@ -67,7 +68,8 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
             boolean skipSnapshotBackfill,
             boolean isScanNewlyAddedTableEnabled,
             int lsnCommitCheckpointsDelay,
-            boolean assignUnboundedChunkFirst) {
+            boolean assignUnboundedChunkFirst,
+            Properties partitionMapping) {
         super(
                 startupOptions,
                 databaseList,
@@ -97,6 +99,7 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
                 assignUnboundedChunkFirst);
         this.subtaskId = subtaskId;
         this.lsnCommitCheckpointsDelay = lsnCommitCheckpointsDelay;
+        this.partitionMapping = partitionMapping;
     }
 
     /**
@@ -115,6 +118,15 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
      */
     public int getLsnCommitCheckpointsDelay() {
         return this.lsnCommitCheckpointsDelay;
+    }
+
+    /**
+     * Returns {@code partitionTableMapping} value.
+     *
+     * @return the partition table mapping configuration
+     */
+    public Properties getPartitionMapping() {
+        return this.partitionMapping;
     }
 
     /**

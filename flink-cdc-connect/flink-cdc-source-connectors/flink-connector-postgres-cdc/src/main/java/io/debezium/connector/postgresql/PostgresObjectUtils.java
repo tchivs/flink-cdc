@@ -50,12 +50,13 @@ public class PostgresObjectUtils {
             PostgresValueConverter valueConverter)
             throws SQLException {
         PostgresSchema schema =
-                new PostgresSchema(
+                new PostgresPartitionSchema(
                         config,
                         typeRegistry,
                         connection.getDefaultValueConverter(),
                         topicSelector,
-                        valueConverter);
+                        valueConverter,
+                        connection);
         schema.refresh(connection, false);
         return schema;
     }
@@ -99,7 +100,6 @@ public class PostgresObjectUtils {
             PostgresConnectorConfig connectorConfig) {
         int maxRetries = connectorConfig.maxRetries();
         Duration retryDelay = connectorConfig.retryDelay();
-
         final Metronome metronome = Metronome.parker(retryDelay, Clock.SYSTEM);
         short retryCount = 0;
         while (retryCount <= maxRetries) {

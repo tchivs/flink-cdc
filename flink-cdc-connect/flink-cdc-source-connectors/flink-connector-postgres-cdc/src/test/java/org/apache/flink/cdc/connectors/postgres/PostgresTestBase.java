@@ -45,12 +45,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Random;
+import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -113,6 +108,16 @@ public abstract class PostgresTestBase extends AbstractTestBase {
     protected Connection getJdbcConnection(PostgreSQLContainer container) throws SQLException {
         return DriverManager.getConnection(
                 container.getJdbcUrl(), container.getUsername(), container.getPassword());
+    }
+
+    protected PostgresConnection getConnection(UniqueDatabase database) {
+        Map<String, String> properties = new HashMap<>();
+        properties.put("hostname", database.getHost());
+        properties.put("port", String.valueOf(database.getDatabasePort()));
+        properties.put("user", database.getUsername());
+        properties.put("password", database.getPassword());
+        properties.put("dbname", database.getDatabaseName());
+        return createConnection(properties);
     }
 
     public static Connection getJdbcConnection(PostgreSQLContainer container, String databaseName)

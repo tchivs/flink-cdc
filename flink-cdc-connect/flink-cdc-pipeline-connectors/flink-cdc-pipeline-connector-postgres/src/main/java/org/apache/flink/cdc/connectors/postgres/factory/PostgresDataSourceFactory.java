@@ -33,6 +33,7 @@ import org.apache.flink.cdc.connectors.postgres.source.PostgresDataSource;
 import org.apache.flink.cdc.connectors.postgres.source.PostgresSourceBuilder;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfigFactory;
 import org.apache.flink.cdc.connectors.postgres.table.PostgreSQLReadableMetadata;
+import org.apache.flink.cdc.connectors.postgres.utils.OptionUtils;
 import org.apache.flink.cdc.connectors.postgres.utils.PostgresSchemaUtils;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.data.RowData;
@@ -44,42 +45,11 @@ import javax.annotation.Nullable;
 
 import java.time.Duration;
 import java.time.ZoneId;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
+import java.util.*;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.cdc.connectors.base.utils.ObjectUtils.doubleCompare;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CHUNK_KEY_EVEN_DISTRIBUTION_FACTOR_LOWER_BOUND;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CHUNK_KEY_EVEN_DISTRIBUTION_FACTOR_UPPER_BOUND;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CHUNK_META_GROUP_SIZE;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CONNECTION_POOL_SIZE;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CONNECT_MAX_RETRIES;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CONNECT_TIMEOUT;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.DECODING_PLUGIN_NAME;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.HEARTBEAT_INTERVAL;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.HOSTNAME;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.METADATA_LIST;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PASSWORD;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PG_PORT;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_CLOSE_IDLE_READER_ENABLED;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_BACKFILL_SKIP;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_KEY_COLUMN;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_LSN_COMMIT_CHECKPOINTS_DELAY;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_SNAPSHOT_FETCH_SIZE;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_STARTUP_MODE;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SERVER_TIME_ZONE;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SLOT_NAME;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SPLIT_KEY_EVEN_DISTRIBUTION_FACTOR_LOWER_BOUND;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SPLIT_KEY_EVEN_DISTRIBUTION_FACTOR_UPPER_BOUND;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.TABLES;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.TABLES_EXCLUDE;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.USERNAME;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.*;
 import static org.apache.flink.cdc.debezium.table.DebeziumOptions.DEBEZIUM_OPTIONS_PREFIX;
 import static org.apache.flink.cdc.debezium.table.DebeziumOptions.getDebeziumProperties;
 import static org.apache.flink.cdc.debezium.utils.JdbcUrlUtils.PROPERTIES_PREFIX;
@@ -96,7 +66,8 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
     @Override
     public DataSource createDataSource(Context context) {
         FactoryHelper.createFactoryHelper(this, context)
-                .validateExcept(PROPERTIES_PREFIX, DEBEZIUM_OPTIONS_PREFIX);
+                .validateExcept(
+                        PROPERTIES_PREFIX, DEBEZIUM_OPTIONS_PREFIX, OptionUtils.PARTITION_TABLES);
 
         final Configuration config = context.getFactoryConfiguration();
         String hostname = config.get(HOSTNAME);
@@ -151,6 +122,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
                         .slotName(slotName)
                         .serverTimeZone(serverTimeZone.getId())
                         .debeziumProperties(getDebeziumProperties(configMap))
+                        .partitionProperties(OptionUtils.getPartitionProperties(configMap))
                         .splitSize(splitSize)
                         .splitMetaGroupSize(splitMetaGroupSize)
                         .distributionFactorUpper(distributionFactorUpper)
@@ -381,7 +353,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
                     dbName = currentDbName;
                 } else {
                     checkState(
-                            !dbName.equals(currentDbName),
+                            dbName.equals(currentDbName),
                             String.format(
                                     "The value of option %s all table names must have the same database name",
                                     TABLES.key()));

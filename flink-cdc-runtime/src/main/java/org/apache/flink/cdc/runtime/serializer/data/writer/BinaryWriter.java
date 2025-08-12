@@ -36,6 +36,9 @@ import org.apache.flink.cdc.runtime.serializer.NullableSerializerWrapper;
 import org.apache.flink.cdc.runtime.serializer.data.ArrayDataSerializer;
 import org.apache.flink.cdc.runtime.serializer.data.MapDataSerializer;
 
+import java.time.LocalDate;
+import java.util.Date;
+
 /**
  * Writer to write a composite data format, like row, array. 1. Invoke {@link #reset()}. 2. Write
  * each field by writeXX or setNullAt. (Same field can not be written repeatedly.) 3. Invoke {@link
@@ -100,7 +103,17 @@ public interface BinaryWriter {
             case INTEGER:
             case DATE:
             case TIME_WITHOUT_TIME_ZONE:
-                writer.writeInt(pos, (int) o);
+                if (o instanceof Integer) {
+                    writer.writeInt(pos, (int) o);
+                } else if (o instanceof Long) {
+                    writer.writeLong(pos, (long) o);
+                } else if (o instanceof Date) {
+                    writer.writeLong(pos, ((Date) o).getTime());
+                } else if (o instanceof LocalDate) {
+                    writer.writeLong(pos, ((LocalDate) o).toEpochDay());
+                } else {
+                    throw new UnsupportedOperationException("Not support type: " + type);
+                }
                 break;
             case BIGINT:
                 writer.writeLong(pos, (long) o);

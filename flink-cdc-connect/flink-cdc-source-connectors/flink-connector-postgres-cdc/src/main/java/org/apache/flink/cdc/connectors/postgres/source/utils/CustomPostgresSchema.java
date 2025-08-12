@@ -18,128 +18,73 @@
 package org.apache.flink.cdc.connectors.postgres.source.utils;
 
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
-import org.apache.flink.util.FlinkRuntimeException;
 
-import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.connector.postgresql.PostgresOffsetContext;
 import io.debezium.connector.postgresql.PostgresPartition;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
-import io.debezium.relational.history.TableChanges;
-import io.debezium.relational.history.TableChanges.TableChange;
 import io.debezium.schema.SchemaChangeEvent;
-import io.debezium.util.Clock;
 
 import java.sql.SQLException;
-import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.Objects;
 
-/** A CustomPostgresSchema similar to PostgresSchema with customization. */
-public class CustomPostgresSchema {
-
-    // cache the schema for each table
-    private final Map<TableId, TableChange> schemasByTableId = new HashMap<>();
-    private final PostgresConnection jdbcConnection;
-    private final PostgresConnectorConfig dbzConfig;
+/**
+ * A CustomPostgresSchema optimized for PostgreSQL versions 11 and above. This version uses standard
+ * schema reading without special partition handling. For PostgreSQL 10, use CustomPostgresSchemaV10
+ * instead.
+ */
+public class CustomPostgresSchema extends AbstractCustomPostgresSchema {
 
     public CustomPostgresSchema(
             PostgresConnection jdbcConnection, PostgresSourceConfig sourceConfig) {
-        this.jdbcConnection = jdbcConnection;
-        this.dbzConfig = sourceConfig.getDbzConnectorConfig();
+        super(jdbcConnection, sourceConfig);
     }
 
-    public TableChange getTableSchema(TableId tableId) {
-        // read schema from cache first
-        if (!schemasByTableId.containsKey(tableId)) {
-            try {
-                readTableSchema(Collections.singletonList(tableId));
-            } catch (SQLException e) {
-                throw new FlinkRuntimeException("Failed to read table schema", e);
+    @Override
+    protected void readSchemaWithVersionSpecificHandling(
+            Tables tables, List<TableId> targetTableIds) throws SQLException {
+        // Use cached schema reading for PostgreSQL 11+ to minimize database calls
+        Tables cachedTables =
+                PostgresSchemaCache.getInstance()
+                        .getOrLoadTables(
+                                jdbcConnection,
+                                dbzConfig.databaseName(),
+                                null, // Read all schemas
+                                dbzConfig.getTableFilters().dataCollectionFilter(),
+                                false // Don't force refresh
+                                );
+
+        // Copy relevant tables to the provided Tables object
+        for (TableId tableId : targetTableIds) {
+            Table table = cachedTables.forTable(tableId);
+            if (table != null) {
+                tables.overwriteTable(table);
             }
         }
-        return schemasByTableId.get(tableId);
     }
 
-    public Map<TableId, TableChange> getTableSchema(List<TableId> tableIds) {
-        // read schema from cache first
-        Map<TableId, TableChange> tableChanges = new HashMap();
-
-        List<TableId> unMatchTableIds = new ArrayList<>();
-        for (TableId tableId : tableIds) {
-            if (schemasByTableId.containsKey(tableId)) {
-                tableChanges.put(tableId, schemasByTableId.get(tableId));
-            } else {
-                unMatchTableIds.add(tableId);
-            }
-        }
-
-        if (!unMatchTableIds.isEmpty()) {
-            try {
-                readTableSchema(tableIds);
-            } catch (SQLException e) {
-                throw new FlinkRuntimeException("Failed to read table schema", e);
-            }
-            for (TableId tableId : unMatchTableIds) {
-                if (schemasByTableId.containsKey(tableId)) {
-                    tableChanges.put(tableId, schemasByTableId.get(tableId));
-                } else {
-                    throw new FlinkRuntimeException(
-                            String.format("Failed to read table schema of table %s", tableId));
-                }
-            }
-        }
-        return tableChanges;
+    @Override
+    protected Table handleMissingTable(TableId tableId, Tables tables) throws SQLException {
+        // For PostgreSQL 11+, just use individual table read
+        return readIndividualTable(tableId);
     }
 
-    private List<TableChange> readTableSchema(List<TableId> tableIds) throws SQLException {
-        List<TableChange> tableChanges = new ArrayList<>();
+    @Override
+    protected Table enhanceTableForVersion(Table table, TableId tableId) throws SQLException {
+        // PostgreSQL 11+ doesn't need special enhancements like PG10
+        return table;
+    }
 
-        final PostgresOffsetContext offsetContext =
-                PostgresOffsetContext.initialContext(dbzConfig, jdbcConnection, Clock.SYSTEM);
+    @Override
+    protected SchemaChangeEvent createSchemaChangeEvent(
+            PostgresPartition partition,
+            PostgresOffsetContext offsetContext,
+            Table table,
+            TableId tableId) {
 
-        PostgresPartition partition = new PostgresPartition(dbzConfig.getLogicalName());
-
-        Tables tables = new Tables();
-        try {
-            jdbcConnection.readSchema(
-                    tables,
-                    dbzConfig.databaseName(),
-                    null,
-                    dbzConfig.getTableFilters().dataCollectionFilter(),
-                    null,
-                    false);
-        } catch (SQLException e) {
-            throw new FlinkRuntimeException("Failed to read schema", e);
-        }
-
-        for (TableId tableId : tableIds) {
-            Table table = Objects.requireNonNull(tables.forTable(tableId));
-            // set the events to populate proper sourceInfo into offsetContext
-            offsetContext.event(tableId, Instant.now());
-
-            // TODO: check whether we always set isFromSnapshot = true
-            SchemaChangeEvent schemaChangeEvent =
-                    SchemaChangeEvent.ofCreate(
-                            partition,
-                            offsetContext,
-                            dbzConfig.databaseName(),
-                            tableId.schema(),
-                            null,
-                            table,
-                            true);
-
-            for (TableChanges.TableChange tableChange : schemaChangeEvent.getTableChanges()) {
-                this.schemasByTableId.put(tableId, tableChange);
-            }
-            tableChanges.add(this.schemasByTableId.get(tableId));
-        }
-        return tableChanges;
+        // Use basic schema change event for PostgreSQL 11+
+        return createBasicSchemaChangeEvent(partition, offsetContext, table, tableId);
     }
 }

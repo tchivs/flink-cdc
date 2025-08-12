@@ -150,6 +150,7 @@ public class PostgreSQLTableFactory implements DynamicTableSourceFactory {
                 slotName,
                 changelogMode,
                 getDebeziumProperties(context.getCatalogTable().getOptions()),
+                OptionUtils.getPartitionProperties(context.getCatalogTable().getOptions()),
                 enableParallelRead,
                 splitSize,
                 splitMetaGroupSize,

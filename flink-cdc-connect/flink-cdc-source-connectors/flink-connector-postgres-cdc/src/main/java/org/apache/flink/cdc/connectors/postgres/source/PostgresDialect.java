@@ -32,6 +32,9 @@ import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresScanFetchTa
 import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresSourceFetchTaskContext;
 import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresStreamFetchTask;
 import org.apache.flink.cdc.connectors.postgres.source.utils.CustomPostgresSchema;
+import org.apache.flink.cdc.connectors.postgres.source.utils.CustomPostgresSchemaV10;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresSchemaReader;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresVersionUtils;
 import org.apache.flink.cdc.connectors.postgres.source.utils.TableDiscoveryUtils;
 import org.apache.flink.util.FlinkRuntimeException;
 
@@ -55,6 +58,7 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static io.debezium.connector.postgresql.PostgresConnectorConfig.PLUGIN_NAME;
 import static io.debezium.connector.postgresql.PostgresConnectorConfig.SLOT_NAME;
@@ -69,8 +73,9 @@ public class PostgresDialect implements JdbcDataSourceDialect {
 
     private final PostgresSourceConfig sourceConfig;
     private transient Tables.TableFilter filters;
-    private transient CustomPostgresSchema schema;
+    private transient PostgresSchemaReader schema;
     @Nullable private PostgresStreamFetchTask streamFetchTask;
+    private boolean server11Version;
 
     public PostgresDialect(PostgresSourceConfig sourceConfig) {
         this.sourceConfig = sourceConfig;
@@ -79,23 +84,22 @@ public class PostgresDialect implements JdbcDataSourceDialect {
     @Override
     public JdbcConnection openJdbcConnection(JdbcSourceConfig sourceConfig) {
         PostgresSourceConfig postgresSourceConfig = (PostgresSourceConfig) sourceConfig;
-        PostgresConnectorConfig dbzConfig = postgresSourceConfig.getDbzConnectorConfig();
+        PostgresConnection jdbc = getPostgresConnection(sourceConfig, postgresSourceConfig);
+        // Use unified version utils for version detection
+        this.server11Version = PostgresVersionUtils.isServer11OrLater(jdbc);
+        return jdbc;
+    }
 
+    private PostgresConnection getPostgresConnection(
+            JdbcSourceConfig sourceConfig, PostgresSourceConfig postgresSourceConfig) {
+        PostgresConnectorConfig dbzConfig = postgresSourceConfig.getDbzConnectorConfig();
         PostgresConnection.PostgresValueConverterBuilder valueConverterBuilder =
                 newPostgresValueConverterBuilder(dbzConfig);
-        PostgresConnection jdbc =
-                new PostgresConnection(
-                        dbzConfig.getJdbcConfig(),
-                        valueConverterBuilder,
-                        CONNECTION_NAME,
-                        new JdbcConnectionFactory(sourceConfig, getPooledDataSourceFactory()));
-
-        try {
-            jdbc.connect();
-        } catch (Exception e) {
-            throw new FlinkRuntimeException(e);
-        }
-        return jdbc;
+        return new PostgresConnection(
+                dbzConfig.getJdbcConfig(),
+                valueConverterBuilder,
+                CONNECTION_NAME,
+                new JdbcConnectionFactory(sourceConfig, getPooledDataSourceFactory()));
     }
 
     public PostgresConnection openJdbcConnection() {
@@ -106,6 +110,7 @@ public class PostgresDialect implements JdbcDataSourceDialect {
             PostgresConnection jdbcConnection) {
         try {
             PostgresConnectorConfig pgConnectorConfig = sourceConfig.getDbzConnectorConfig();
+
             TopicSelector<TableId> topicSelector = PostgresTopicSelector.create(pgConnectorConfig);
             PostgresConnection.PostgresValueConverterBuilder valueConverterBuilder =
                     newPostgresValueConverterBuilder(pgConnectorConfig);
@@ -177,12 +182,28 @@ public class PostgresDialect implements JdbcDataSourceDialect {
     @Override
     public List<TableId> discoverDataCollections(JdbcSourceConfig sourceConfig) {
         try (JdbcConnection jdbc = openJdbcConnection(sourceConfig)) {
-            return new ArrayList<>(
-                    TableDiscoveryUtils.listTables(
-                            // there is always a single database provided
-                            sourceConfig.getDatabaseList().get(0),
-                            jdbc,
-                            sourceConfig.getTableFilters()));
+            // Use optimized table discovery with type information to avoid N+1 query pattern
+            if (jdbc instanceof PostgresConnection) {
+                Set<org.apache.flink.cdc.connectors.postgres.source.utils.TableInfo>
+                        tablesWithType =
+                                TableDiscoveryUtils.listTablesWithType(
+                                        // there is always a single database provided
+                                        sourceConfig.getDatabaseList().get(0),
+                                        (PostgresConnection) jdbc,
+                                        sourceConfig.getTableFilters());
+                return tablesWithType.stream()
+                        .map(
+                                org.apache.flink.cdc.connectors.postgres.source.utils.TableInfo
+                                        ::getTableId)
+                        .collect(java.util.stream.Collectors.toList());
+            } else {
+                // Fallback to original method for non-PostgresConnection
+                return new ArrayList<>(
+                        TableDiscoveryUtils.listTables(
+                                sourceConfig.getDatabaseList().get(0),
+                                jdbc,
+                                sourceConfig.getTableFilters()));
+            }
         } catch (SQLException e) {
             throw new FlinkRuntimeException("Error to discover tables: " + e.getMessage(), e);
         }
@@ -190,11 +211,23 @@ public class PostgresDialect implements JdbcDataSourceDialect {
 
     @Override
     public Map<TableId, TableChange> discoverDataCollectionSchemas(JdbcSourceConfig sourceConfig) {
-        final List<TableId> capturedTableIds = discoverDataCollections(sourceConfig);
-
         try (JdbcConnection jdbc = openJdbcConnection(sourceConfig)) {
-            // fetch table schemas
-            return queryTableSchema(jdbc, capturedTableIds);
+            // Use optimized discovery with type information to avoid redundant queries
+            if (jdbc instanceof PostgresConnection) {
+                Set<org.apache.flink.cdc.connectors.postgres.source.utils.TableInfo>
+                        tablesWithType =
+                                TableDiscoveryUtils.listTablesWithType(
+                                        sourceConfig.getDatabaseList().get(0),
+                                        (PostgresConnection) jdbc,
+                                        sourceConfig.getTableFilters());
+
+                // Fetch table schemas using type information
+                return queryTableSchemaWithTypeInfo(jdbc, tablesWithType);
+            } else {
+                // Fallback to original method for non-PostgresConnection
+                final List<TableId> capturedTableIds = discoverDataCollections(sourceConfig);
+                return queryTableSchema(jdbc, capturedTableIds);
+            }
         } catch (Exception e) {
             throw new FlinkRuntimeException(
                     "Error to discover table schemas: " + e.getMessage(), e);
@@ -209,7 +242,7 @@ public class PostgresDialect implements JdbcDataSourceDialect {
     @Override
     public TableChange queryTableSchema(JdbcConnection jdbc, TableId tableId) {
         if (schema == null) {
-            schema = new CustomPostgresSchema((PostgresConnection) jdbc, sourceConfig);
+            schema = createSchemaReader((PostgresConnection) jdbc);
         }
         return schema.getTableSchema(tableId);
     }
@@ -217,9 +250,36 @@ public class PostgresDialect implements JdbcDataSourceDialect {
     private Map<TableId, TableChange> queryTableSchema(
             JdbcConnection jdbc, List<TableId> tableIds) {
         if (schema == null) {
-            schema = new CustomPostgresSchema((PostgresConnection) jdbc, sourceConfig);
+            schema = createSchemaReader((PostgresConnection) jdbc);
         }
         return schema.getTableSchema(tableIds);
+    }
+
+    /**
+     * Query table schemas using pre-computed table type information to avoid redundant database
+     * queries.
+     */
+    private Map<TableId, TableChange> queryTableSchemaWithTypeInfo(
+            JdbcConnection jdbc,
+            Set<org.apache.flink.cdc.connectors.postgres.source.utils.TableInfo> tablesWithType) {
+        if (schema == null) {
+            schema = createSchemaReader((PostgresConnection) jdbc);
+        }
+        return schema.getTableSchema(tablesWithType);
+    }
+
+    /**
+     * Create the appropriate schema reader based on PostgreSQL version. Uses
+     * CustomPostgresSchemaV10 for PostgreSQL 10, and CustomPostgresSchema for versions 11+.
+     */
+    private PostgresSchemaReader createSchemaReader(PostgresConnection jdbcConnection) {
+        if (server11Version) {
+            // PostgreSQL 11+ - use the standard schema reader
+            return new CustomPostgresSchema(jdbcConnection, sourceConfig);
+        } else {
+            // PostgreSQL 10 - use the specialized schema reader
+            return new CustomPostgresSchemaV10(jdbcConnection, sourceConfig);
+        }
     }
 
     @Override
