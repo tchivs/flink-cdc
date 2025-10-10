@@ -21,16 +21,23 @@ import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConf
 import org.apache.flink.util.FlinkRuntimeException;
 
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
+import io.debezium.connector.postgresql.PostgresObjectUtils;
 import io.debezium.connector.postgresql.PostgresOffsetContext;
 import io.debezium.connector.postgresql.PostgresPartition;
+import io.debezium.connector.postgresql.PostgresSchema;
+import io.debezium.connector.postgresql.PostgresTopicSelector;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
-import io.debezium.relational.Tables;
 import io.debezium.relational.history.TableChanges;
 import io.debezium.relational.history.TableChanges.TableChange;
 import io.debezium.schema.SchemaChangeEvent;
+import io.debezium.schema.TopicSelector;
 import io.debezium.util.Clock;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.sql.SQLException;
 import java.time.Instant;
@@ -39,20 +46,64 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 
 /** A CustomPostgresSchema similar to PostgresSchema with customization. */
 public class CustomPostgresSchema {
+
+    private static final Logger LOG = LoggerFactory.getLogger(CustomPostgresSchema.class);
 
     // cache the schema for each table
     private final Map<TableId, TableChange> schemasByTableId = new HashMap<>();
     private final PostgresConnection jdbcConnection;
     private final PostgresConnectorConfig dbzConfig;
+    private PostgresSchema postgresSchema;
+
+    @Nullable private final PostgresPartitionRouter partitionRouter;
 
     public CustomPostgresSchema(
-            PostgresConnection jdbcConnection, PostgresSourceConfig sourceConfig) {
+            PostgresConnection jdbcConnection,
+            PostgresSourceConfig sourceConfig,
+            @Nullable PostgresPartitionRouter partitionRouter) {
         this.jdbcConnection = jdbcConnection;
         this.dbzConfig = sourceConfig.getDbzConnectorConfig();
+        this.partitionRouter = partitionRouter;
+        initializePostgresSchema();
+    }
+
+    private void initializePostgresSchema() {
+        try {
+            TopicSelector<TableId> topicSelector = PostgresTopicSelector.create(dbzConfig);
+            PostgresConnection.PostgresValueConverterBuilder valueConverterBuilder =
+                    PostgresObjectUtils.newPostgresValueConverterBuilder(dbzConfig);
+
+            // Always use PostgresPartitionRoutingSchema since it handles both routing and
+            // non-routing cases internally based on route.partition.events.to.parent config
+            this.postgresSchema =
+                    new PostgresPartitionRoutingSchema(
+                            jdbcConnection,
+                            dbzConfig,
+                            jdbcConnection.getTypeRegistry(),
+                            topicSelector,
+                            valueConverterBuilder.build(jdbcConnection.getTypeRegistry()));
+
+            // If partition routing is enabled and a router is provided, populate it with
+            // database-derived partition mappings for more accurate routing
+            if (partitionRouter != null) {
+                PostgresPartitionRoutingSchema routingSchema =
+                        (PostgresPartitionRoutingSchema) this.postgresSchema;
+                Map<TableId, TableId> childToParentMapping =
+                        routingSchema.getChildToParentMapping();
+
+                if (!childToParentMapping.isEmpty()) {
+                    partitionRouter.preloadPartitionMappingFromDatabase(childToParentMapping);
+                    LOG.info(
+                            "Injected {} database-derived partition mappings into PostgresPartitionRouter",
+                            childToParentMapping.size());
+                }
+            }
+        } catch (SQLException e) {
+            throw new FlinkRuntimeException("Failed to initialize PostgresSchema", e);
+        }
     }
 
     public TableChange getTableSchema(TableId tableId) {
@@ -69,7 +120,7 @@ public class CustomPostgresSchema {
 
     public Map<TableId, TableChange> getTableSchema(List<TableId> tableIds) {
         // read schema from cache first
-        Map<TableId, TableChange> tableChanges = new HashMap();
+        Map<TableId, TableChange> tableChanges = new HashMap<>();
 
         List<TableId> unMatchTableIds = new ArrayList<>();
         for (TableId tableId : tableIds) {
@@ -106,21 +157,14 @@ public class CustomPostgresSchema {
 
         PostgresPartition partition = new PostgresPartition(dbzConfig.getLogicalName());
 
-        Tables tables = new Tables();
-        try {
-            jdbcConnection.readSchema(
-                    tables,
-                    dbzConfig.databaseName(),
-                    null,
-                    dbzConfig.getTableFilters().dataCollectionFilter(),
-                    null,
-                    false);
-        } catch (SQLException e) {
-            throw new FlinkRuntimeException("Failed to read schema", e);
-        }
-
         for (TableId tableId : tableIds) {
-            Table table = Objects.requireNonNull(tables.forTable(tableId));
+            // Use postgresSchema.tableFor() which handles partition routing
+            Table table = postgresSchema.tableFor(tableId);
+            if (table == null) {
+                throw new FlinkRuntimeException(
+                        String.format("Failed to read table schema for table %s", tableId));
+            }
+
             // set the events to populate proper sourceInfo into offsetContext
             offsetContext.event(tableId, Instant.now());
 

@@ -63,6 +63,16 @@ public class PostgresDataSourceOptions {
                                     + "If there is a need to use a dot (.) in a regular expression to match any character, "
                                     + "it is necessary to escape the dot with a backslash."
                                     + "eg. db0.\\.*, db1.user_table_[0-9]+, db[1-2].[app|web]_order_\\.*");
+    public static final ConfigOption<String> PARTITION_TABLES =
+            ConfigOptions.key("partition.tables")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Table names of the PostgreSQL 10 partitioned tables to monitor. Regular expressions are supported. "
+                                    + "It is important to note that the dot (.) is treated as a delimiter for database and table names. "
+                                    + "If there is a need to use a dot (.) in a regular expression to match any character, "
+                                    + "it is necessary to escape the dot with a backslash."
+                                    + "eg. db0.\\.*, db1.user_table_[0-9]+, db[1-2].[app|web]_order_\\.*");
 
     public static final ConfigOption<String> DECODING_PLUGIN_NAME =
             ConfigOptions.key("decoding.plugin.name")
@@ -264,4 +274,14 @@ public class PostgresDataSourceOptions {
                             .defaultValue(false)
                             .withDescription(
                                     "Whether to assign the unbounded chunks first during snapshot reading phase. This might help reduce the risk of the TaskManager experiencing an out-of-memory (OOM) error when taking a snapshot of the largest unbounded chunk.  Defaults to false.");
+
+    public static final ConfigOption<Boolean> SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED =
+            ConfigOptions.key("scan.include-partitioned-tables.enabled")
+                    .booleanType()
+                    .defaultValue(Boolean.FALSE)
+                    .withDescription(
+                            "Enable reading from partitioned table via partition root.\n"
+                                    + "If enabled:\n"
+                                    + "(1) PUBLICATION must be created beforehand with parameter publish_via_partition_root=true\n"
+                                    + "(2) Table list (regex or predefined list) should only match the parent table name, if table list matches both parent and child tables, snapshot data will be read twice.");
 }

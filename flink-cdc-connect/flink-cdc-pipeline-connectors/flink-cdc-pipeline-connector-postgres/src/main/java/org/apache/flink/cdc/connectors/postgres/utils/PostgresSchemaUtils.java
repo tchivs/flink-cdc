@@ -153,22 +153,26 @@ public class PostgresSchemaUtils {
             io.debezium.relational.TableId tableId,
             PostgresSourceConfig sourceConfig,
             PostgresConnection jdbc) {
+        PostgresSchema postgresSchema = getPostgresSchema(sourceConfig, jdbc, true);
+        Table tableSchema = postgresSchema.tableFor(tableId);
+        return toSchema(tableSchema, sourceConfig.getDbzConnectorConfig(), jdbc.getTypeRegistry());
+    }
+
+    public static PostgresSchema getPostgresSchema(
+            PostgresSourceConfig sourceConfig, PostgresConnection jdbc, boolean lazyInit) {
         try {
             // fetch table schemas
             TopicSelector<io.debezium.relational.TableId> topicSelector =
                     PostgresTopicSelector.create(sourceConfig.getDbzConnectorConfig());
             PostgresConnection.PostgresValueConverterBuilder valueConverterBuilder =
                     newPostgresValueConverterBuilder(sourceConfig.getDbzConnectorConfig());
-            PostgresSchema postgresSchema =
-                    PostgresObjectUtils.newSchema(
-                            jdbc,
-                            sourceConfig.getDbzConnectorConfig(),
-                            jdbc.getTypeRegistry(),
-                            topicSelector,
-                            valueConverterBuilder.build(jdbc.getTypeRegistry()));
-            Table tableSchema = postgresSchema.tableFor(tableId);
-            return toSchema(
-                    tableSchema, sourceConfig.getDbzConnectorConfig(), jdbc.getTypeRegistry());
+            return PostgresObjectUtils.newSchema(
+                    jdbc,
+                    sourceConfig.getDbzConnectorConfig(),
+                    jdbc.getTypeRegistry(),
+                    topicSelector,
+                    valueConverterBuilder.build(jdbc.getTypeRegistry()),
+                    lazyInit);
         } catch (SQLException e) {
             throw new RuntimeException("Failed to initialize PostgresReplicationConnection", e);
         }
@@ -208,7 +212,7 @@ public class PostgresSchemaUtils {
 
     public static io.debezium.relational.TableId toDbzTableId(TableId tableId) {
         return new io.debezium.relational.TableId(
-                tableId.getSchemaName(), null, tableId.getTableName());
+                null, tableId.getSchemaName(), tableId.getTableName());
     }
 
     public static org.apache.flink.cdc.common.event.TableId toCdcTableId(

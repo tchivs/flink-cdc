@@ -33,6 +33,7 @@ import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConf
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfigFactory;
 import org.apache.flink.cdc.connectors.postgres.source.offset.PostgresOffsetFactory;
 import org.apache.flink.cdc.connectors.postgres.source.reader.PostgresPipelineRecordEmitter;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresPartitionRouter;
 import org.apache.flink.cdc.connectors.postgres.table.PostgreSQLReadableMetadata;
 import org.apache.flink.cdc.debezium.DebeziumDeserializationSchema;
 import org.apache.flink.cdc.debezium.event.DebeziumEventDeserializationSchema;
@@ -50,26 +51,28 @@ public class PostgresDataSource implements DataSource {
     private final PostgresSourceConfig postgresSourceConfig;
 
     private final List<PostgreSQLReadableMetadata> readableMetadataList;
+    private final PostgresPartitionRouter partitionSelector;
 
     public PostgresDataSource(PostgresSourceConfigFactory configFactory) {
-        this(configFactory, new ArrayList<>());
+        this(configFactory, new ArrayList<>(), null);
     }
 
     public PostgresDataSource(
             PostgresSourceConfigFactory configFactory,
-            List<PostgreSQLReadableMetadata> readableMetadataList) {
+            List<PostgreSQLReadableMetadata> readableMetadataList,
+            PostgresPartitionRouter partitionSelector) {
         this.configFactory = configFactory;
         this.postgresSourceConfig = configFactory.create(0);
         this.readableMetadataList = readableMetadataList;
+        this.partitionSelector = partitionSelector;
     }
 
     @Override
     public EventSourceProvider getEventSourceProvider() {
-        DebeziumEventDeserializationSchema deserializer =
-                new PostgresEventDeserializer(DebeziumChangelogMode.ALL, readableMetadataList);
-
         PostgresOffsetFactory postgresOffsetFactory = new PostgresOffsetFactory();
         PostgresDialect postgresDialect = new PostgresDialect(postgresSourceConfig);
+        DebeziumEventDeserializationSchema deserializer =
+                new PostgresEventDeserializer(DebeziumChangelogMode.ALL, readableMetadataList);
 
         PostgresSourceBuilder.PostgresIncrementalSource<Event> source =
                 new PostgresPipelineSource<>(
@@ -77,7 +80,8 @@ public class PostgresDataSource implements DataSource {
                         deserializer,
                         postgresOffsetFactory,
                         postgresDialect,
-                        postgresSourceConfig);
+                        postgresSourceConfig,
+                        partitionSelector);
 
         return FlinkSourceProvider.of(source);
     }
@@ -97,16 +101,19 @@ public class PostgresDataSource implements DataSource {
             extends PostgresSourceBuilder.PostgresIncrementalSource<T> {
         private final PostgresSourceConfig sourceConfig;
         private final PostgresDialect dataSourceDialect;
+        private final PostgresPartitionRouter partitionSelector;
 
         public PostgresPipelineSource(
                 PostgresSourceConfigFactory configFactory,
                 DebeziumDeserializationSchema<T> deserializationSchema,
                 PostgresOffsetFactory offsetFactory,
                 PostgresDialect dataSourceDialect,
-                PostgresSourceConfig sourceConfig) {
+                PostgresSourceConfig sourceConfig,
+                PostgresPartitionRouter partitionSelector) {
             super(configFactory, deserializationSchema, offsetFactory, dataSourceDialect);
             this.sourceConfig = sourceConfig;
             this.dataSourceDialect = dataSourceDialect;
+            this.partitionSelector = partitionSelector;
         }
 
         @Override
@@ -117,7 +124,8 @@ public class PostgresDataSource implements DataSource {
                     sourceReaderMetrics,
                     this.sourceConfig,
                     offsetFactory,
-                    this.dataSourceDialect);
+                    this.dataSourceDialect,
+                    this.partitionSelector);
         }
     }
 }

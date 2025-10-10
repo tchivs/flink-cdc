@@ -36,9 +36,17 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
 
     private static final long serialVersionUID = 1L;
 
+    /**
+     * Internal configuration key for routing partition events to their parent tables. This is used
+     * by PostgresPartitionRoutingSchema to enable partition routing logic.
+     */
+    public static final String ROUTE_PARTITION_EVENTS_TO_PARENT =
+            "route.partition.events.to.parent";
+
     private final int subtaskId;
     private final int lsnCommitCheckpointsDelay;
     private final boolean includePartitionedTables;
+    private final String partitionTables;
 
     public PostgresSourceConfig(
             int subtaskId,
@@ -69,7 +77,8 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
             boolean isScanNewlyAddedTableEnabled,
             int lsnCommitCheckpointsDelay,
             boolean assignUnboundedChunkFirst,
-            boolean includePartitionedTables) {
+            boolean includePartitionedTables,
+            String partitionTables) {
         super(
                 startupOptions,
                 databaseList,
@@ -100,6 +109,7 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
         this.subtaskId = subtaskId;
         this.lsnCommitCheckpointsDelay = lsnCommitCheckpointsDelay;
         this.includePartitionedTables = includePartitionedTables;
+        this.partitionTables = partitionTables;
     }
 
     /**
@@ -142,6 +152,11 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
     public String getJdbcUrl() {
         return String.format(
                 "jdbc:postgresql://%s:%d/%s", getHostname(), getPort(), getDatabaseList().get(0));
+    }
+
+    /** Returns the partition tables. */
+    public String getPartitionTables() {
+        return partitionTables;
     }
 
     @Override

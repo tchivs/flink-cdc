@@ -17,6 +17,7 @@
 
 package io.debezium.connector.postgresql;
 
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresPartitionRoutingSchema;
 import org.apache.flink.util.FlinkRuntimeException;
 
 import io.debezium.connector.postgresql.connection.PostgresConnection;
@@ -49,15 +50,21 @@ public class PostgresObjectUtils {
             TopicSelector<TableId> topicSelector,
             PostgresValueConverter valueConverter)
             throws SQLException {
-        PostgresSchema schema =
-                new PostgresSchema(
-                        config,
-                        typeRegistry,
-                        connection.getDefaultValueConverter(),
-                        topicSelector,
-                        valueConverter);
-        schema.refresh(connection, false);
-        return schema;
+        return new PostgresPartitionRoutingSchema(
+                connection, config, typeRegistry, topicSelector, valueConverter, false);
+    }
+
+    /** Create a new PostgresSchema with explicit lazy initialization flag for partition routing. */
+    public static PostgresSchema newSchema(
+            PostgresConnection connection,
+            PostgresConnectorConfig config,
+            TypeRegistry typeRegistry,
+            TopicSelector<TableId> topicSelector,
+            PostgresValueConverter valueConverter,
+            boolean lazyInit)
+            throws SQLException {
+        return new PostgresPartitionRoutingSchema(
+                connection, config, typeRegistry, topicSelector, valueConverter, lazyInit);
     }
 
     public static PostgresTaskContext newTaskContext(

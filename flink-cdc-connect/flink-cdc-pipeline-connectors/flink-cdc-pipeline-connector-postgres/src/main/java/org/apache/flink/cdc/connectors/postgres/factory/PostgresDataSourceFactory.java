@@ -32,6 +32,7 @@ import org.apache.flink.cdc.connectors.base.options.StartupOptions;
 import org.apache.flink.cdc.connectors.postgres.source.PostgresDataSource;
 import org.apache.flink.cdc.connectors.postgres.source.PostgresSourceBuilder;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfigFactory;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresPartitionRouter;
 import org.apache.flink.cdc.connectors.postgres.table.PostgreSQLReadableMetadata;
 import org.apache.flink.cdc.connectors.postgres.utils.PostgresSchemaUtils;
 import org.apache.flink.table.api.ValidationException;
@@ -64,8 +65,10 @@ import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSource
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.HEARTBEAT_INTERVAL;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.HOSTNAME;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.METADATA_LIST;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PARTITION_TABLES;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PASSWORD;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PG_PORT;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_CLOSE_IDLE_READER_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_BACKFILL_SKIP;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_KEY_COLUMN;
@@ -108,6 +111,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         String password = config.get(PASSWORD);
         String chunkKeyColumn = config.get(SCAN_INCREMENTAL_SNAPSHOT_CHUNK_KEY_COLUMN);
         String tables = config.get(TABLES);
+        String partitionTables = config.get(PARTITION_TABLES);
         ZoneId serverTimeZone = getServerTimeZone(config);
         String tablesExclude = config.get(TABLES_EXCLUDE);
         Duration heartbeatInterval = config.get(HEARTBEAT_INTERVAL);
@@ -139,6 +143,9 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         validateDistributionFactorLower(distributionFactorLower);
 
         Map<String, String> configMap = config.toMap();
+        boolean includePartitionedTables = config.get(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED);
+        java.util.Properties dbzProps = new java.util.Properties();
+        dbzProps.putAll(getDebeziumProperties(configMap));
         Optional<String> databaseName = getValidateDatabaseName(tables);
 
         PostgresSourceConfigFactory configFactory =
@@ -153,7 +160,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
                         .decodingPluginName(pluginName)
                         .slotName(slotName)
                         .serverTimeZone(serverTimeZone.getId())
-                        .debeziumProperties(getDebeziumProperties(configMap))
+                        .debeziumProperties(dbzProps)
                         .splitSize(splitSize)
                         .splitMetaGroupSize(splitMetaGroupSize)
                         .distributionFactorUpper(distributionFactorUpper)
@@ -169,11 +176,17 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
                         .skipSnapshotBackfill(skipSnapshotBackfill)
                         .lsnCommitCheckpointsDelay(lsnCommitCheckpointsDelay)
                         .assignUnboundedChunkFirst(isAssignUnboundedChunkFirst)
+                        // Enable enumerator to track and discover newly added tables/partitions
+                        .scanNewlyAddedTableEnabled(true)
+                        .includePartitionedTables(includePartitionedTables)
+                        .partitionTables(partitionTables)
                         .getConfigFactory();
 
+        // Always discover tables to validate user patterns, using a temporary wide-open config
         List<TableId> tableIds = PostgresSchemaUtils.listTables(configFactory.create(0), null);
-
-        Selectors selectors = new Selectors.SelectorsBuilder().includeTables(tables).build();
+        PostgresPartitionRouter postgresPartitionRouter =
+                new PostgresPartitionRouter(includePartitionedTables, tables, partitionTables);
+        Selectors selectors = postgresPartitionRouter.getSelectors();
         List<String> capturedTables = getTableList(tableIds, selectors);
         if (capturedTables.isEmpty()) {
             throw new IllegalArgumentException(
@@ -193,11 +206,10 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
             }
         }
         configFactory.tableList(capturedTables.toArray(new String[0]));
-
         String metadataList = config.get(METADATA_LIST);
         List<PostgreSQLReadableMetadata> readableMetadataList = listReadableMetadata(metadataList);
 
-        return new PostgresDataSource(configFactory, readableMetadataList);
+        return new PostgresDataSource(configFactory, readableMetadataList, postgresPartitionRouter);
     }
 
     private List<PostgreSQLReadableMetadata> listReadableMetadata(String metadataList) {
@@ -240,6 +252,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         Set<ConfigOption<?>> options = new HashSet<>();
         options.add(PG_PORT);
         options.add(TABLES_EXCLUDE);
+        options.add(PARTITION_TABLES);
         options.add(DECODING_PLUGIN_NAME);
         options.add(SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE);
         options.add(SCAN_SNAPSHOT_FETCH_SIZE);
@@ -257,6 +270,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         options.add(SCAN_LSN_COMMIT_CHECKPOINTS_DELAY);
         options.add(METADATA_LIST);
         options.add(SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED);
+        options.add(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED);
         return options;
     }
 
