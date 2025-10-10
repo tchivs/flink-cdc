@@ -32,6 +32,7 @@ import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresScanFetchTa
 import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresSourceFetchTaskContext;
 import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresStreamFetchTask;
 import org.apache.flink.cdc.connectors.postgres.source.utils.CustomPostgresSchema;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresPartitionRouter;
 import org.apache.flink.cdc.connectors.postgres.source.utils.TableDiscoveryUtils;
 import org.apache.flink.util.FlinkRuntimeException;
 
@@ -52,6 +53,7 @@ import io.debezium.schema.TopicSelector;
 import javax.annotation.Nullable;
 
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -70,9 +72,19 @@ public class PostgresDialect implements JdbcDataSourceDialect {
     private transient Tables.TableFilter filters;
     private transient CustomPostgresSchema schema;
     @Nullable private PostgresStreamFetchTask streamFetchTask;
+    @Nullable private final PostgresPartitionRouter selector;
 
     public PostgresDialect(PostgresSourceConfig sourceConfig) {
         this.sourceConfig = sourceConfig;
+        String tablesPattern = null;
+        if (sourceConfig.getTableList() != null && !sourceConfig.getTableList().isEmpty()) {
+            tablesPattern = String.join(",", sourceConfig.getTableList());
+        }
+        selector =
+                new PostgresPartitionRouter(
+                        sourceConfig.includePartitionedTables(),
+                        tablesPattern,
+                        sourceConfig.getPartitionTables());
     }
 
     @Override
@@ -194,8 +206,17 @@ public class PostgresDialect implements JdbcDataSourceDialect {
         final List<TableId> capturedTableIds = discoverDataCollections(sourceConfig);
 
         try (JdbcConnection jdbc = openJdbcConnection(sourceConfig)) {
-            // fetch table schemas
-            Map<TableId, TableChange> tableSchemas = queryTableSchema(jdbc, capturedTableIds);
+            // For partition tables, we need to get parent table schemas
+            // Route child tables to their parent tables
+            List<TableId> schemaTableIds = new ArrayList<>();
+            if (selector != null) {
+                selector.routeRepresentativeTables(capturedTableIds).forEach(schemaTableIds::add);
+            } else {
+                schemaTableIds = capturedTableIds;
+            }
+
+            // fetch table schemas for parent tables
+            Map<TableId, TableChange> tableSchemas = queryTableSchema(jdbc, schemaTableIds);
             return tableSchemas;
         } catch (Exception e) {
             throw new FlinkRuntimeException(
@@ -211,7 +232,7 @@ public class PostgresDialect implements JdbcDataSourceDialect {
     @Override
     public TableChange queryTableSchema(JdbcConnection jdbc, TableId tableId) {
         if (schema == null) {
-            schema = new CustomPostgresSchema((PostgresConnection) jdbc, sourceConfig);
+            schema = new CustomPostgresSchema((PostgresConnection) jdbc, sourceConfig, selector);
         }
         return schema.getTableSchema(tableId);
     }
@@ -219,7 +240,7 @@ public class PostgresDialect implements JdbcDataSourceDialect {
     private Map<TableId, TableChange> queryTableSchema(
             JdbcConnection jdbc, List<TableId> tableIds) {
         if (schema == null) {
-            schema = new CustomPostgresSchema((PostgresConnection) jdbc, sourceConfig);
+            schema = new CustomPostgresSchema((PostgresConnection) jdbc, sourceConfig, selector);
         }
         return schema.getTableSchema(tableIds);
     }
@@ -251,8 +272,20 @@ public class PostgresDialect implements JdbcDataSourceDialect {
         if (filters == null) {
             this.filters = sourceConfig.getTableFilters().dataCollectionFilter();
         }
-
-        return filters.isIncluded(tableId);
+        // If table is explicitly included by filters, accept
+        if (filters.isIncluded(tableId)) {
+            return true;
+        }
+        // Delegate to selector for partition-aware inclusion
+        if (selector != null) {
+            // Fast path: configured parent table
+            if (selector.isConfiguredParent(tableId)) {
+                return true;
+            }
+            PostgresSourceConfig cfg = (PostgresSourceConfig) sourceConfig;
+            return selector.isIncluded(cfg.getTableList(), tableId);
+        }
+        return false;
     }
 
     public String getSlotName() {

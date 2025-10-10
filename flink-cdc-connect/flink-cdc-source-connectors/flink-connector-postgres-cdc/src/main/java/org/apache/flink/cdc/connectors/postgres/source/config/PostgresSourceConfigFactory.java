@@ -53,6 +53,7 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
     private int lsnCommitCheckpointsDelay;
 
     private boolean includePartitionedTables;
+    private String partitionTables;
 
     /** Creates a new {@link PostgresSourceConfig} for the given subtask {@code subtaskId}. */
     @Override
@@ -88,6 +89,12 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
         props.setProperty("database.tcpKeepAlive", String.valueOf(true));
         props.setProperty("heartbeat.interval.ms", String.valueOf(heartbeatInterval.toMillis()));
         props.setProperty("include.schema.changes", String.valueOf(includeSchemaChanges));
+        // Postgres 10 route partition events to parent
+        // Enable routing whenever includePartitionedTables is true to ensure child schemas
+        // are handled even when partitionTables is not explicitly configured
+        props.setProperty(
+                PostgresSourceConfig.ROUTE_PARTITION_EVENTS_TO_PARENT,
+                String.valueOf(includePartitionedTables));
 
         if (schemaList != null) {
             props.setProperty("schema.include.list", String.join(",", schemaList));
@@ -136,7 +143,8 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
                 scanNewlyAddedTableEnabled,
                 lsnCommitCheckpointsDelay,
                 assignUnboundedChunkFirst,
-                includePartitionedTables);
+                includePartitionedTables,
+                partitionTables);
     }
 
     /**
@@ -188,5 +196,10 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
     /** Enable include partitioned table. */
     public void setIncludePartitionedTables(boolean includePartitionedTables) {
         this.includePartitionedTables = includePartitionedTables;
+    }
+
+    /** Whether include partitioned table. */
+    public void setPartitionTables(String partitionTables) {
+        this.partitionTables = partitionTables;
     }
 }

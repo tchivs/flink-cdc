@@ -49,12 +49,13 @@ import java.util.Optional;
 public class PostgresEventDeserializer extends DebeziumEventDeserializationSchema {
 
     private static final long serialVersionUID = 1L;
-    private List<PostgreSQLReadableMetadata> readableMetadataList;
+    private final List<PostgreSQLReadableMetadata> readableMetadataList;
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     public PostgresEventDeserializer(DebeziumChangelogMode changelogMode) {
         super(new PostgresSchemaDataTypeInference(), changelogMode);
+        this.readableMetadataList = Collections.emptyList();
     }
 
     public PostgresEventDeserializer(
@@ -87,7 +88,10 @@ public class PostgresEventDeserializer extends DebeziumEventDeserializationSchem
     @Override
     protected TableId getTableId(SourceRecord record) {
         String[] parts = record.topic().split("\\.");
-        return TableId.tableId(parts[1], parts[2]);
+        // topic format: server.schema.table
+        String schema = parts[1];
+        String table = parts[2];
+        return TableId.tableId(schema, table);
     }
 
     @Override

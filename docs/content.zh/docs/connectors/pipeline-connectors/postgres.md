@@ -104,6 +104,26 @@ pipeline:
       <td>连接 Postgres 数据库服务器时使用的密码。</td>
     </tr>
     <tr>
+      <td>database</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>String</td>
+      <td>
+        连接的 Postgres 数据库名称。设置该项后，<code>tables</code> 与 <code>partition.tables</code> 中的表模式可以省略数据库前缀（例如使用 <code>public.my_table</code> 而不是 <code>db.public.my_table</code>）。<br>
+        若同时在 <code>database</code> 与 <code>tables</code> 中提供了数据库名称，则两者必须一致。
+      </td>
+    </tr>
+    <tr>
+      <td>schema</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>String</td>
+      <td>
+        默认 Schema 名称。设置该项后，<code>tables</code> 与 <code>partition.tables</code> 中未显式带 schema 的项将自动补全为 <code>schema.table</code>（例如 <code>orders</code> 将补全为 <code>public.orders</code>）。<br>
+        若在 <code>tables</code> 中显式写了其他 schema，将按显式值匹配，不受该选项影响。
+      </td>
+    </tr>
+    <tr>
       <td>tables</td>
       <td>required</td>
       <td style="word-wrap: break-word;">(none)</td>
@@ -270,9 +290,98 @@ pipeline:
         此为实验性选项，默认值为 false。
       </td>
     </tr>
+    <tr>
+      <td>scan.include-partitioned-tables.enabled</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">false</td>
+      <td>Boolean</td>
+      <td>
+        启用 PostgreSQL 分区表的分区路由功能。<br>
+        <b>启用时：</b><br>
+        (1) 子分区表的事件将被路由到它们的父表。<br>
+        (2) 对于 PostgreSQL 11+：配合 PUBLICATION 中的 <code>publish_via_partition_root=true</code> 参数使用可获得更好的性能。<br>
+        (3) 对于 PostgreSQL 10：此选项通过从子分区加载模式（其中包含主键）来启用分区路由。<br>
+        (4) 使用 <code>partition.tables</code> 指定哪些父表应参与分区路由。<br>
+        <b>表列表注意事项：</b> 确保您的表匹配模式捕获您想要的表（PostgreSQL 11+ 使用父表，PostgreSQL 10 使用子表）。
+      </td>
+    </tr>
+    <tr>
+      <td>partition.tables</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>String</td>
+      <td>
+        用于将子分区表事件路由到父表的分区表模式。支持正则表达式。<br>
+        点号（.）用于分隔命名空间（数据库）、模式与表名；在正则表达式中需要使用反斜杠对点号进行转义。<br>
+        示例：<code>aia_test\.public\.orders_\d{6}</code><br>
+        注意：此选项需与 <code>scan.include-partitioned-tables.enabled</code> 一起使用。
+      </td>
+    </tr>
     </tbody>
 </table>
 </div>
+
+## 分区路由写法说明
+
+当 <code>scan.include-partitioned-tables.enabled</code> 为 true 时，可通过如下多种写法指定分区路由。右侧“子表模式”中仅表名部分作为正则匹配，命名空间与模式按字面量精确匹配。若模式中包含命名空间（catalog），在匹配时会被忽略（允许写，匹配时不强制要求）。
+
+- 冒号写法（显式 parent:child）
+  - 三段：<code>namespace.schema.parent:namespace.schema.child_regex</code>
+  - 两段：<code>schema.parent:schema.child_regex</code>
+  - 仅表名：<code>parent:child_regex</code>（路由时父表将继承子表的 schema）
+
+- 无冒号写法（仅子表正则）
+  - 三段：<code>namespace.schema.child_regex</code>
+  - 两段：<code>schema.child_regex</code>
+  - 仅表名：<code>child_regex</code>
+
+正则中的点号转义示例：
+
+```text
+aia_test\.public\.orders_\d{6}   # 匹配 namespace 相同、schema=public、表名 orders_YYYYMM
+public\.orders_\d{6}              # 匹配 schema=public、表名 orders_YYYYMM
+orders_\d{6}                      # 匹配任意 schema、表名 orders_YYYYMM（路由时继承子表的 schema）
+```
+
+选择器合成规则（最终生效的捕获列表）：
+
+- 最终 include 列表 = “子表正则集合” + “未被子表正则覆盖的剩余父表”。
+- 通过冒号左侧显式指定的父表，或根据子表正则推导出的父表（例如将 <code>orders_\d{6}</code> 推导为 <code>orders</code>，会去掉末尾下划线 <code>_</code>），不会重复追加到 include 列表中。
+- 若子表正则为“仅表名”（如 <code>orders_\d{6}</code>），则认为覆盖所有 schema 下的同名父表，这些父表将被排除。
+
+示例
+
+- 无冒号：
+
+```text
+tables: aia_test.public.orders,aia_test.public.orders_extend,aia_test.public.vouchers,aia_test.public.static_table
+partition.tables: aia_test.public.orders_\d{6},aia_test.public.orders_extend_\d{6},aia_test.public.vouchers_\d{6}
+```
+
+最终用于匹配的输出：
+
+```text
+aia_test.public.orders_\d{6},aia_test.public.orders_extend_\d{6},aia_test.public.vouchers_\d{6},aia_test.public.static_table
+```
+
+- 冒号：
+
+```text
+tables: aia_test.public.orders,aia_test.public.orders_extend,aia_test.public.vouchers,aia_test.public.static_table
+partition.tables: aia_test.public.orders:aia_test.public.orders_\d{6},aia_test.public.orders_extend:aia_test.public.orders_extend_\d{6},aia_test.public.vouchers:aia_test.public.vouchers_\d{6}
+```
+
+最终用于匹配的输出：
+
+```text
+aia_test.public.orders_\d{6},aia_test.public.orders_extend_\d{6},aia_test.public.vouchers_\d{6},aia_test.public.static_table
+```
+
+注意事项
+
+- 右侧子表模式仅表名部分作为正则；schema 必须字面量匹配。
+- 若父表仅提供表名，路由后会继承子表的 schema。
+- 模式中可包含命名空间（catalog），匹配时会忽略此前缀，建议按团队惯例保持一致以提升可读性。
 
 注意：
 1. 配置选项`tables`指定 Postgres CDC 需要采集的表，格式为`db.schema1.tabe1,db.schema2.table2`,其中所有的db需要为同一个db，这是因为postgres链接url中需要指定dbname，目前cdc只支持链接一个db。

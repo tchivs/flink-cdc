@@ -105,6 +105,26 @@ pipeline:
       <td>Password to use when connecting to the Postgres database server.</td>
     </tr>
     <tr>
+      <td>database</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>String</td>
+      <td>
+        Name of the PostgreSQL database to connect to. When set, you may omit the database prefix in <code>tables</code> and <code>partition.tables</code> (e.g., use <code>public.my_table</code> instead of <code>db.public.my_table</code>).<br>
+        If both this option and a database prefix in <code>tables</code> are provided, they must be consistent.
+      </td>
+    </tr>
+    <tr>
+      <td>schema</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>String</td>
+      <td>
+        Default schema name. When set, entries in <code>tables</code> and <code>partition.tables</code> that omit schema will be auto-qualified as <code>schema.table</code> (e.g., <code>orders</code> becomes <code>public.orders</code>).<br>
+        Explicit schema in patterns, if present, takes precedence and is left unchanged.
+      </td>
+    </tr>
+    <tr>
       <td>tables</td>
       <td>required</td>
       <td style="word-wrap: break-word;">(none)</td>
@@ -262,9 +282,99 @@ pipeline:
         Experimental option, defaults to false.
       </td>
     </tr>
+    <tr>
+      <td>scan.include-partitioned-tables.enabled</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">false</td>
+      <td>Boolean</td>
+      <td>
+        Enable partition table routing for PostgreSQL partitioned tables.<br>
+        <b>When enabled:</b><br>
+        (1) Child partition events will be routed to their parent tables.<br>
+        (2) For PostgreSQL 11+: Use with <code>publish_via_partition_root=true</code> in PUBLICATION for better performance.<br>
+        (3) For PostgreSQL 10: This option enables partition routing by loading schemas from child partitions (which contain primary keys).<br>
+        (4) Use <code>partition.tables</code> to specify which parent tables should participate in partition routing.<br>
+        <b>Table list considerations:</b> Ensure your table patterns match the tables you intend to capture (parent tables for PG11+, child tables for PG10).
+      </td>
+    </tr>
+    <tr>
+      <td>partition.tables</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>String</td>
+      <td>
+        Partition table patterns for routing child partition events to parent tables. Supports regular expressions.<br>
+        The dot (.) is treated as a delimiter for namespace, schema and table. Use backslash to escape dots in regex patterns.<br>
+        Example: <code>aia_test\.public\.orders_\d{6}</code><br>
+        Note: This option works in conjunction with <code>scan.include-partitioned-tables.enabled</code>.
+      </td>
+    </tr>
     </tbody>
 </table>
 </div>
+
+## Partition Routing Formats
+
+When <code>scan.include-partitioned-tables.enabled</code> is true, you can specify partition routing using the following formats. Only the table name part is treated as regex; namespace and schema are matched literally. Catalog segment (namespace) in patterns is allowed and ignored during matching if present.
+
+- Colon format (explicit parent:child)
+  - Three segments: <code>namespace.schema.parent:namespace.schema.child_regex</code>
+  - Two segments: <code>schema.parent:schema.child_regex</code>
+  - Table-only (parent inherits child schema at runtime): <code>parent:child_regex</code>
+
+- No-colon format (child-only patterns)
+  - Three segments: <code>namespace.schema.child_regex</code>
+  - Two segments: <code>schema.child_regex</code>
+  - Table-only: <code>child_regex</code>
+
+Escaping dots in regex:
+
+```text
+aia_test\.public\.orders_\d{6}   # match namespace=same, schema=public, table like orders_YYYYMM
+public\.orders_\d{6}              # match schema=public, table like orders_YYYYMM
+orders_\d{6}                      # match any schema, table like orders_YYYYMM (schema inherited at route time)
+```
+
+Selector composition (what actually gets captured):
+
+- The effective include list is: “child regex patterns” + “leftover parent tables not covered by those child patterns”.
+- Parents explicitly listed in colon format, or derived from the child regex (by stripping the trailing <code>_</code> before the regex, e.g., <code>orders_\d{6} -> orders</code>), are not re-added.
+ - Parents explicitly listed in colon format, or derived from the child regex (by stripping the trailing <code>_</code> before the regex, e.g., <code>orders_\d{6} -> orders</code>), are not re-added.
+ - For table-only child patterns (e.g., <code>orders_\d{6}</code>), parents with the same table name across any schema are considered covered and excluded.
+
+Examples
+
+- Input (no colon):
+
+```text
+tables: aia_test.public.orders,aia_test.public.orders_extend,aia_test.public.vouchers,aia_test.public.static_table
+partition.tables: aia_test.public.orders_\d{6},aia_test.public.orders_extend_\d{6},aia_test.public.vouchers_\d{6}
+```
+
+Output used for selection:
+
+```text
+aia_test.public.orders_\d{6},aia_test.public.orders_extend_\d{6},aia_test.public.vouchers_\d{6},aia_test.public.static_table
+```
+
+- Input (colon):
+
+```text
+tables: aia_test.public.orders,aia_test.public.orders_extend,aia_test.public.vouchers,aia_test.public.static_table
+partition.tables: aia_test.public.orders:aia_test.public.orders_\d{6},aia_test.public.orders_extend:aia_test.public.orders_extend_\d{6},aia_test.public.vouchers:aia_test.public.vouchers_\d{6}
+```
+
+Output used for selection:
+
+```text
+aia_test.public.orders_\d{6},aia_test.public.orders_extend_\d{6},aia_test.public.vouchers_\d{6},aia_test.public.static_table
+```
+
+Notes
+
+- Only the table name part of the right-hand side is treated as a regex; schema is literal.
+- If a parent is specified without schema, the router inherits the child’s schema at runtime.
+- Catalog (namespace) in patterns is optional and ignored during matching. Keep it consistent for readability.
 
 
 Note:
