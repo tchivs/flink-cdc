@@ -104,6 +104,26 @@ pipeline:
       <td>连接 Postgres 数据库服务器时使用的密码。</td>
     </tr>
     <tr>
+      <td>database</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>String</td>
+      <td>
+        连接的 Postgres 数据库名称。设置该项后，<code>tables</code> 与 <code>partition.tables</code> 中的表模式可以省略数据库前缀（例如使用 <code>public.my_table</code> 而不是 <code>db.public.my_table</code>）。<br>
+        若同时在 <code>database</code> 与 <code>tables</code> 中提供了数据库名称，则两者必须一致。
+      </td>
+    </tr>
+    <tr>
+      <td>schema</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>String</td>
+      <td>
+        默认 Schema 名称。设置该项后，<code>tables</code> 与 <code>partition.tables</code> 中未显式带 schema 的项将自动补全为 <code>schema.table</code>（例如 <code>orders</code> 将补全为 <code>public.orders</code>）。<br>
+        若在 <code>tables</code> 中显式写了其他 schema，将按显式值匹配，不受该选项影响。
+      </td>
+    </tr>
+    <tr>
       <td>tables</td>
       <td>required</td>
       <td style="word-wrap: break-word;">(none)</td>

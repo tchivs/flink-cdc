@@ -53,6 +53,18 @@ public class PostgresDataSourceOptions {
                     .withDescription(
                             "Password to use when connecting to the PostgreSQL database server.");
 
+    /**
+     * Optional database name to connect. When provided, the database prefix in 'tables' can be
+     * omitted (e.g. use 'public.my_table' instead of 'db.public.my_table'). If both this option and
+     * a database prefix in 'tables' are provided, they must be consistent.
+     */
+    public static final ConfigOption<String> DATABASE =
+            ConfigOptions.key("database")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Name of the PostgreSQL database to connect to. If set, the database prefix in 'tables' may be omitted. When present, any database specified in 'tables' must match this value.");
+
     public static final ConfigOption<String> TABLES =
             ConfigOptions.key("tables")
                     .stringType()
@@ -63,6 +75,17 @@ public class PostgresDataSourceOptions {
                                     + "If there is a need to use a dot (.) in a regular expression to match any character, "
                                     + "it is necessary to escape the dot with a backslash."
                                     + "eg. db0.\\.*, db1.user_table_[0-9]+, db[1-2].[app|web]_order_\\.*");
+
+    /**
+     * Optional default schema. When provided, entries in 'tables' and 'partition.tables' that omit
+     * schema will be qualified with this schema. For example, 'orders' becomes 'public.orders'.
+     */
+    public static final ConfigOption<String> SCHEMA =
+            ConfigOptions.key("schema")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Default schema name. When set, patterns in 'tables' and 'partition.tables' without schema will be auto-qualified with this schema (e.g., 'orders' -> 'public.orders').");
     public static final ConfigOption<String> PARTITION_TABLES =
             ConfigOptions.key("partition.tables")
                     .stringType()

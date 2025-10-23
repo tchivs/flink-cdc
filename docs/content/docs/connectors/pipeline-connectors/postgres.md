@@ -105,6 +105,26 @@ pipeline:
       <td>Password to use when connecting to the Postgres database server.</td>
     </tr>
     <tr>
+      <td>database</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>String</td>
+      <td>
+        Name of the PostgreSQL database to connect to. When set, you may omit the database prefix in <code>tables</code> and <code>partition.tables</code> (e.g., use <code>public.my_table</code> instead of <code>db.public.my_table</code>).<br>
+        If both this option and a database prefix in <code>tables</code> are provided, they must be consistent.
+      </td>
+    </tr>
+    <tr>
+      <td>schema</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>String</td>
+      <td>
+        Default schema name. When set, entries in <code>tables</code> and <code>partition.tables</code> that omit schema will be auto-qualified as <code>schema.table</code> (e.g., <code>orders</code> becomes <code>public.orders</code>).<br>
+        Explicit schema in patterns, if present, takes precedence and is left unchanged.
+      </td>
+    </tr>
+    <tr>
       <td>tables</td>
       <td>required</td>
       <td style="word-wrap: break-word;">(none)</td>
