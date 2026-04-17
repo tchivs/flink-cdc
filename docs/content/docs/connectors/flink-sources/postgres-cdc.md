@@ -576,6 +576,32 @@ $ ./bin/flink run \
 ```
 **Note:** Please refer to the doc [Restore the job from previous savepoint](https://nightlies.apache.org/flink/flink-docs-release-1.17/docs/deployment/cli/#command-line-interface) for more details.
 
+### PostgreSQL 10 Dynamic Child Partition Support
+
+PostgreSQL 10 does not support `PRIMARY KEY` on partitioned tables. The Flink CDC Postgres connector discovers child partitions by querying the `pg_inherits` catalog at startup and rewrites child table events to the parent table identity in the output.
+
+**Runtime-created child partitions** (created after the CDC job starts) are captured through a reconcile-and-restart cycle:
+
+1. A background monitor thread periodically queries the catalog for new child partitions
+2. When new children are detected, the current streaming session is stopped at a well-defined boundary
+3. The main thread adds missing child partitions to the publication via `ALTER PUBLICATION ADD TABLE`
+4. The reconciler computes an updated routing state from the latest catalog diff, using the current capture state as the baseline
+5. A new streaming session is built from the current replication/source offset with the updated partition mappings, and child partition events continue to be emitted as parent table events
+
+This session-restart approach ensures that routing mappings are never mutated in place, and the Debezium runtime objects are always rebuilt at a well-defined boundary.
+
+#### Requirements
+- PostgreSQL 10 only
+- `scan.include-partitioned-tables.enabled = true`
+- `decoding.plugin.name = pgoutput`
+- The publication must include the newly created child partition (this happens automatically)
+
+#### Limitations
+- Only child partitions under already-captured parent tables are discovered
+- Runtime discovery of entirely NEW parent tables is not supported
+- Changes written to a new child partition BEFORE it is reconciled into the publication will not be captured (no backfill)
+- A brief streaming interruption occurs during the session restart phase
+
 ### DataStream Source
 
 The Postgres CDC connector can also be a DataStream source. There are two modes for the DataStream source:

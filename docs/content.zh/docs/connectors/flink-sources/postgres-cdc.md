@@ -575,6 +575,32 @@ $ ./bin/flink run \
 ```
 **注意:** 请参考文档 [Restore the job from previous savepoint](https://nightlies.apache.org/flink/flink-docs-release-1.17/docs/deployment/cli/#command-line-interface) 了解更多详细信息。
 
+### PostgreSQL 10 动态子分区支持
+
+PostgreSQL 10 不支持分区表上的 `PRIMARY KEY`。Flink CDC Postgres 连接器在启动时通过查询 `pg_inherits` 系统目录发现子分区，并将子分区事件重写为父表标识后输出。
+
+**运行时创建的子分区**（CDC 作业启动后创建的）通过协调（reconcile）和重启（restart）流程来捕获：
+
+1. 后台监控线程定期查询系统目录以发现新增的子分区
+2. 检测到新子分区后，在明确的生命周期边界停止当前 streaming session
+3. 主线程通过 `ALTER PUBLICATION ADD TABLE` 将缺失的子分区补齐到 publication
+4. 协调器以当前 capture state 为基线，根据最新目录差异计算更新后的路由状态
+5. 使用当前 replication/source offset 和最新的分区映射构建新的 streaming session，子分区事件继续以父表事件身份输出
+
+这种 session 重启的方式确保了路由映射永远不会原地修改，Debezium 运行时对象始终在明确的生命周期边界 rebuilt。
+
+#### 前提条件
+- 仅适用于 PostgreSQL 10
+- `scan.include-partitioned-tables.enabled = true`
+- `decoding.plugin.name = pgoutput`
+- Publication 必须包含新创建的子分区（会自动处理）
+
+#### 限制
+- 仅能发现已捕获的父表下的子分区
+- 不支持运行时发现全新的父表
+- 在子分区被补齐到 publication 之前写入的数据不会被捕获（无回填）
+- 在 session 重启期间会有短暂的流式消费中断
+
 ### DataStream Source
 
 The Postgres CDC connector can also be a DataStream source. There are two modes for the DataStream source:

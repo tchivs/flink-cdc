@@ -525,6 +525,196 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
         result.getJobClient().get().cancel().get();
     }
 
+    @Test
+    public void testStartupFromCommittedOffsetSkipsHistoricalChanges() throws Exception {
+        setup(true);
+        initializePostgresTable(POSTGRES_CONTAINER, "inventory");
+
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "INSERT INTO inventory.products VALUES (default,'history_a','before slot',0.11);");
+            statement.execute(
+                    "INSERT INTO inventory.products VALUES (default,'history_b','before slot',0.12);");
+        }
+
+        String slotName = getSlotName();
+        String publicationName = "dbz_publication_" + new Random().nextInt(1000);
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    String.format(
+                            "CREATE PUBLICATION %s FOR TABLE inventory.products", publicationName));
+            statement.execute(
+                    String.format(
+                            "select pg_create_logical_replication_slot('%s','pgoutput');",
+                            slotName));
+        }
+
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "INSERT INTO inventory.products VALUES (default,'after_slot_a','after slot',0.21);");
+            statement.execute(
+                    "INSERT INTO inventory.products VALUES (default,'after_slot_b','after slot',0.22);");
+        }
+
+        String sourceDDL =
+                String.format(
+                        "CREATE TABLE debezium_source ("
+                                + " id INT NOT NULL,"
+                                + " name STRING,"
+                                + " description STRING,"
+                                + " weight DECIMAL(10,3),"
+                                + " PRIMARY KEY (id) NOT ENFORCED"
+                                + ") WITH ("
+                                + " 'connector' = 'postgres-cdc',"
+                                + " 'hostname' = '%s',"
+                                + " 'port' = '%s',"
+                                + " 'username' = '%s',"
+                                + " 'password' = '%s',"
+                                + " 'database-name' = '%s',"
+                                + " 'schema-name' = '%s',"
+                                + " 'table-name' = '%s',"
+                                + " 'scan.incremental.snapshot.enabled' = 'true',"
+                                + " 'decoding.plugin.name' = 'pgoutput',"
+                                + " 'slot.name' = '%s',"
+                                + " 'debezium.publication.name'  = '%s',"
+                                + " 'scan.lsn-commit.checkpoints-num-delay' = '0',"
+                                + " 'scan.startup.mode' = 'committed-offset'"
+                                + ")",
+                        POSTGRES_CONTAINER.getHost(),
+                        POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT),
+                        POSTGRES_CONTAINER.getUsername(),
+                        POSTGRES_CONTAINER.getPassword(),
+                        POSTGRES_CONTAINER.getDatabaseName(),
+                        "inventory",
+                        "products",
+                        slotName,
+                        publicationName);
+        String sinkDDL =
+                "CREATE TABLE sink "
+                        + " WITH ("
+                        + " 'connector' = 'values',"
+                        + " 'sink-insert-only' = 'false'"
+                        + ") LIKE debezium_source (EXCLUDING OPTIONS)";
+        tEnv.executeSql(sourceDDL);
+        tEnv.executeSql(sinkDDL);
+
+        TableResult result = tEnv.executeSql("INSERT INTO sink SELECT * FROM debezium_source");
+
+        Thread.sleep(5000L);
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "INSERT INTO inventory.products VALUES (default,'after_job_a','after job',0.31);");
+        }
+
+        waitForSinkResult(
+                "sink",
+                Arrays.asList(
+                        "112,after_slot_a,after slot,0.210",
+                        "113,after_slot_b,after slot,0.220",
+                        "114,after_job_a,after job,0.310"));
+
+        List<String> actual = TestValuesTableFactory.getResultsAsStrings("sink");
+        Assertions.assertThat(actual)
+                .containsExactlyInAnyOrder(
+                        "112,after_slot_a,after slot,0.210",
+                        "113,after_slot_b,after slot,0.220",
+                        "114,after_job_a,after job,0.310");
+        Assertions.assertThat(actual)
+                .noneMatch(row -> row.contains("history_a"))
+                .noneMatch(row -> row.contains("history_b"));
+
+        result.getJobClient().get().cancel().get();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true})
+    void testStartupFromLatestOffsetCapturesOnlyNewChanges(boolean parallelismSnapshot)
+            throws Exception {
+        setup(parallelismSnapshot);
+        initializePostgresTable(POSTGRES_CONTAINER, "inventory");
+
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "INSERT INTO inventory.products VALUES (default,'history_latest_a','before startup',0.41);");
+            statement.execute(
+                    "INSERT INTO inventory.products VALUES (default,'history_latest_b','before startup',0.42);");
+        }
+
+        String sourceDDL =
+                String.format(
+                        "CREATE TABLE debezium_source ("
+                                + " id INT NOT NULL,"
+                                + " name STRING,"
+                                + " description STRING,"
+                                + " weight DECIMAL(10,3),"
+                                + " PRIMARY KEY (id) NOT ENFORCED"
+                                + ") WITH ("
+                                + " 'connector' = 'postgres-cdc',"
+                                + " 'hostname' = '%s',"
+                                + " 'port' = '%s',"
+                                + " 'username' = '%s',"
+                                + " 'password' = '%s',"
+                                + " 'database-name' = '%s',"
+                                + " 'schema-name' = '%s',"
+                                + " 'table-name' = '%s',"
+                                + " 'scan.incremental.snapshot.enabled' = '%s',"
+                                + " 'decoding.plugin.name' = 'pgoutput', "
+                                + " 'slot.name' = '%s',"
+                                + " 'scan.startup.mode' = 'latest-offset'"
+                                + ")",
+                        POSTGRES_CONTAINER.getHost(),
+                        POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT),
+                        POSTGRES_CONTAINER.getUsername(),
+                        POSTGRES_CONTAINER.getPassword(),
+                        POSTGRES_CONTAINER.getDatabaseName(),
+                        "inventory",
+                        "products",
+                        parallelismSnapshot,
+                        getSlotName());
+        String sinkDDL =
+                "CREATE TABLE sink "
+                        + " WITH ("
+                        + " 'connector' = 'values',"
+                        + " 'sink-insert-only' = 'false'"
+                        + ") LIKE debezium_source (EXCLUDING OPTIONS)";
+        tEnv.executeSql(sourceDDL);
+        tEnv.executeSql(sinkDDL);
+
+        TableResult result = tEnv.executeSql("INSERT INTO sink SELECT * FROM debezium_source");
+        Thread.sleep(10000L);
+
+        List<String> startupResults = TestValuesTableFactory.getResultsAsStrings("sink");
+        Assertions.assertThat(startupResults)
+                .noneMatch(row -> row.contains("history_latest_a"))
+                .noneMatch(row -> row.contains("history_latest_b"));
+
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "INSERT INTO inventory.products VALUES (default,'latest_new','after startup',0.51);");
+            statement.execute(
+                    "UPDATE inventory.products SET description='after startup updated', weight='0.52' WHERE name='latest_new';");
+            statement.execute(
+                    "INSERT INTO inventory.products VALUES (default,'latest_delete','delete me',0.53);");
+            statement.execute("DELETE FROM inventory.products WHERE name='latest_delete';");
+        }
+
+        waitForSinkResult("sink", Arrays.asList("112,latest_new,after startup updated,0.520"));
+
+        List<String> actual = TestValuesTableFactory.getResultsAsStrings("sink");
+        Assertions.assertThat(actual)
+                .containsExactlyInAnyOrder("112,latest_new,after startup updated,0.520")
+                .noneMatch(row -> row.contains("history_latest_a"))
+                .noneMatch(row -> row.contains("history_latest_b"));
+
+        result.getJobClient().get().cancel().get();
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     void testExceptionForReplicaIdentity(boolean parallelismSnapshot) throws Exception {

@@ -39,10 +39,13 @@ import java.lang.reflect.Field;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.Statement;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
+import java.util.Random;
 import java.util.concurrent.ExecutionException;
+import java.util.function.Predicate;
 
 import static org.testcontainers.containers.PostgreSQLContainer.POSTGRESQL_PORT;
 
@@ -59,6 +62,236 @@ class PostgreSQLSavepointITCase extends PostgresTestBase {
     @Test
     void testSavepoint() throws Exception {
         testRestartFromSavepoint();
+    }
+
+    @Test
+    void testRestartFromSavepointWithLatestOffset() throws Exception {
+        initializePostgresTable(POSTGRES_CONTAINER, "inventory");
+
+        final String savepointDirectory = tempDir.toString();
+        String finishedSavePointPath = null;
+        final String slotName = getSlotName();
+        final String sourceDDL =
+                String.format(
+                        "CREATE TABLE debezium_source ("
+                                + " id INT NOT NULL,"
+                                + " name STRING,"
+                                + " description STRING,"
+                                + " weight DECIMAL(10,3),"
+                                + " PRIMARY KEY (id) NOT ENFORCED"
+                                + ") WITH ("
+                                + " 'connector' = 'postgres-cdc',"
+                                + " 'hostname' = '%s',"
+                                + " 'port' = '%s',"
+                                + " 'username' = '%s',"
+                                + " 'password' = '%s',"
+                                + " 'database-name' = '%s',"
+                                + " 'schema-name' = '%s',"
+                                + " 'table-name' = '%s',"
+                                + " 'scan.incremental.snapshot.enabled' = 'true',"
+                                + " 'decoding.plugin.name' = 'pgoutput',"
+                                + " 'slot.name' = '%s',"
+                                + " 'scan.startup.mode' = 'latest-offset'"
+                                + ")",
+                        POSTGRES_CONTAINER.getHost(),
+                        POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT),
+                        POSTGRES_CONTAINER.getUsername(),
+                        POSTGRES_CONTAINER.getPassword(),
+                        POSTGRES_CONTAINER.getDatabaseName(),
+                        "inventory",
+                        "products",
+                        slotName);
+        final String sinkDDL =
+                "CREATE TABLE sink ("
+                        + " id INT,"
+                        + " name STRING,"
+                        + " description STRING,"
+                        + " weight DECIMAL(10,3)"
+                        + ") WITH ("
+                        + " 'connector' = 'values',"
+                        + " 'sink-insert-only' = 'false'"
+                        + ")";
+
+        StreamExecutionEnvironment env = getStreamExecutionEnvironment(finishedSavePointPath, 1);
+        StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+        tEnv.executeSql(sourceDDL);
+        tEnv.executeSql(sinkDDL);
+
+        TableResult result = tEnv.executeSql("INSERT INTO sink SELECT * FROM debezium_source");
+        JobClient jobClient = result.getJobClient().get();
+
+        Thread.sleep(10000L);
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "INSERT INTO inventory.products VALUES (default,'latest_first','after startup',0.51);");
+        }
+
+        waitForRawResults(
+                "latest-offset first phase consumed",
+                rows -> rows.stream().anyMatch(row -> row.contains("latest_first")),
+                Duration.ofMinutes(2),
+                Duration.ofSeconds(1));
+
+        finishedSavePointPath = triggerSavepointWithRetry(jobClient, savepointDirectory);
+        jobClient.cancel().get();
+
+        env = getStreamExecutionEnvironment(finishedSavePointPath, 1);
+        tEnv = StreamTableEnvironment.create(env);
+        tEnv.executeSql(sourceDDL);
+        tEnv.executeSql(sinkDDL);
+
+        result = tEnv.executeSql("INSERT INTO sink SELECT * FROM debezium_source");
+        jobClient = result.getJobClient().get();
+
+        Thread.sleep(5000L);
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "INSERT INTO inventory.products VALUES (default,'latest_second','after restore',0.52);");
+        }
+
+        waitForRawResults(
+                "latest-offset restore phase consumed",
+                rows -> rows.stream().anyMatch(row -> row.contains("latest_second")),
+                Duration.ofMinutes(2),
+                Duration.ofSeconds(1));
+
+        List<String> actual = TestValuesTableFactory.getRawResultsAsStrings("sink");
+        Assertions.assertThat(actual.stream().filter(row -> row.contains("latest_first")).count())
+                .isEqualTo(1);
+        Assertions.assertThat(actual.stream().filter(row -> row.contains("latest_second")).count())
+                .isEqualTo(1);
+        Assertions.assertThat(actual)
+                .noneMatch(row -> row.contains("Small 2-wheel scooter"))
+                .noneMatch(row -> row.contains("car battery"));
+
+        jobClient.cancel().get();
+    }
+
+    @Test
+    void testRestartFromSavepointWithCommittedOffset() throws Exception {
+        initializePostgresTable(POSTGRES_CONTAINER, "inventory");
+
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "INSERT INTO inventory.products VALUES (default,'history_before_slot','before slot',0.11);");
+        }
+
+        final String slotName = getSlotName();
+        final String publicationName = "dbz_publication_savepoint_" + new Random().nextInt(1000);
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    String.format(
+                            "CREATE PUBLICATION %s FOR TABLE inventory.products", publicationName));
+            statement.execute(
+                    String.format(
+                            "select pg_create_logical_replication_slot('%s','pgoutput');",
+                            slotName));
+        }
+
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "INSERT INTO inventory.products VALUES (default,'committed_first','after slot',0.21);");
+        }
+
+        final String savepointDirectory = tempDir.toString();
+        String finishedSavePointPath = null;
+        final String sourceDDL =
+                String.format(
+                        "CREATE TABLE debezium_source ("
+                                + " id INT NOT NULL,"
+                                + " name STRING,"
+                                + " description STRING,"
+                                + " weight DECIMAL(10,3),"
+                                + " PRIMARY KEY (id) NOT ENFORCED"
+                                + ") WITH ("
+                                + " 'connector' = 'postgres-cdc',"
+                                + " 'hostname' = '%s',"
+                                + " 'port' = '%s',"
+                                + " 'username' = '%s',"
+                                + " 'password' = '%s',"
+                                + " 'database-name' = '%s',"
+                                + " 'schema-name' = '%s',"
+                                + " 'table-name' = '%s',"
+                                + " 'scan.incremental.snapshot.enabled' = 'true',"
+                                + " 'decoding.plugin.name' = 'pgoutput',"
+                                + " 'slot.name' = '%s',"
+                                + " 'debezium.publication.name' = '%s',"
+                                + " 'scan.lsn-commit.checkpoints-num-delay' = '0',"
+                                + " 'scan.startup.mode' = 'committed-offset'"
+                                + ")",
+                        POSTGRES_CONTAINER.getHost(),
+                        POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT),
+                        POSTGRES_CONTAINER.getUsername(),
+                        POSTGRES_CONTAINER.getPassword(),
+                        POSTGRES_CONTAINER.getDatabaseName(),
+                        "inventory",
+                        "products",
+                        slotName,
+                        publicationName);
+        final String sinkDDL =
+                "CREATE TABLE sink ("
+                        + " id INT,"
+                        + " name STRING,"
+                        + " description STRING,"
+                        + " weight DECIMAL(10,3)"
+                        + ") WITH ("
+                        + " 'connector' = 'values',"
+                        + " 'sink-insert-only' = 'false'"
+                        + ")";
+
+        StreamExecutionEnvironment env = getStreamExecutionEnvironment(finishedSavePointPath, 1);
+        StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+        tEnv.executeSql(sourceDDL);
+        tEnv.executeSql(sinkDDL);
+
+        TableResult result = tEnv.executeSql("INSERT INTO sink SELECT * FROM debezium_source");
+        JobClient jobClient = result.getJobClient().get();
+
+        waitForRawResults(
+                "committed-offset first phase consumed",
+                rows -> rows.stream().anyMatch(row -> row.contains("committed_first")),
+                Duration.ofMinutes(2),
+                Duration.ofSeconds(1));
+
+        finishedSavePointPath = triggerSavepointWithRetry(jobClient, savepointDirectory);
+        jobClient.cancel().get();
+
+        env = getStreamExecutionEnvironment(finishedSavePointPath, 1);
+        tEnv = StreamTableEnvironment.create(env);
+        tEnv.executeSql(sourceDDL);
+        tEnv.executeSql(sinkDDL);
+
+        result = tEnv.executeSql("INSERT INTO sink SELECT * FROM debezium_source");
+        jobClient = result.getJobClient().get();
+
+        Thread.sleep(5000L);
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "INSERT INTO inventory.products VALUES (default,'committed_second','after restore',0.22);");
+        }
+
+        waitForRawResults(
+                "committed-offset restore phase consumed",
+                rows -> rows.stream().anyMatch(row -> row.contains("committed_second")),
+                Duration.ofMinutes(2),
+                Duration.ofSeconds(1));
+
+        List<String> actual = TestValuesTableFactory.getRawResultsAsStrings("sink");
+        Assertions.assertThat(
+                        actual.stream().filter(row -> row.contains("committed_first")).count())
+                .isEqualTo(1);
+        Assertions.assertThat(
+                        actual.stream().filter(row -> row.contains("committed_second")).count())
+                .isEqualTo(1);
+        Assertions.assertThat(actual).noneMatch(row -> row.contains("history_before_slot"));
+
+        jobClient.cancel().get();
     }
 
     private void testRestartFromSavepoint() throws Exception {
@@ -231,5 +464,30 @@ class PostgreSQLSavepointITCase extends PostgresTestBase {
             }
         }
         return null;
+    }
+
+    private void waitForRawResults(
+            String conditionName,
+            Predicate<List<String>> condition,
+            Duration timeout,
+            Duration interval)
+            throws InterruptedException {
+        long start = System.currentTimeMillis();
+        while (true) {
+            List<String> rows;
+            try {
+                rows = TestValuesTableFactory.getRawResultsAsStrings("sink");
+            } catch (IllegalArgumentException e) {
+                rows = java.util.Collections.emptyList();
+            }
+            if (condition.test(rows)) {
+                return;
+            }
+            if (System.currentTimeMillis() - start > timeout.toMillis()) {
+                throw new AssertionError(
+                        "Timeout waiting for condition: " + conditionName + ", rows: " + rows);
+            }
+            Thread.sleep(interval.toMillis());
+        }
     }
 }
