@@ -25,13 +25,18 @@ import org.apache.flink.cdc.connectors.base.source.assigner.splitter.ChunkSplitt
 import org.apache.flink.cdc.connectors.base.source.assigner.state.ChunkSplitterState;
 import org.apache.flink.cdc.connectors.base.source.meta.offset.Offset;
 import org.apache.flink.cdc.connectors.base.source.meta.split.SourceSplitBase;
+import org.apache.flink.cdc.connectors.base.source.meta.split.StreamSplit;
 import org.apache.flink.cdc.connectors.base.source.reader.external.FetchTask;
 import org.apache.flink.cdc.connectors.base.source.reader.external.JdbcSourceFetchTaskContext;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
+import org.apache.flink.cdc.connectors.postgres.source.fetch.Pg10CaptureState;
+import org.apache.flink.cdc.connectors.postgres.source.fetch.Pg10StreamFetchTask;
 import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresScanFetchTask;
 import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresSourceFetchTaskContext;
 import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresStreamFetchTask;
 import org.apache.flink.cdc.connectors.postgres.source.utils.CustomPostgresSchema;
+import org.apache.flink.cdc.connectors.postgres.source.utils.Pg10PartitionMapper;
+import org.apache.flink.cdc.connectors.postgres.source.utils.Pg10PartitionReconciler;
 import org.apache.flink.cdc.connectors.postgres.source.utils.TableDiscoveryUtils;
 import org.apache.flink.util.FlinkRuntimeException;
 
@@ -70,9 +75,17 @@ public class PostgresDialect implements JdbcDataSourceDialect {
     private transient Tables.TableFilter filters;
     private transient CustomPostgresSchema schema;
     @Nullable private PostgresStreamFetchTask streamFetchTask;
+    private transient Pg10PartitionReconciler pg10PartitionReconciler;
 
     public PostgresDialect(PostgresSourceConfig sourceConfig) {
         this.sourceConfig = sourceConfig;
+    }
+
+    private Pg10PartitionReconciler getPg10PartitionReconciler() {
+        if (pg10PartitionReconciler == null) {
+            pg10PartitionReconciler = new Pg10PartitionReconciler();
+        }
+        return pg10PartitionReconciler;
     }
 
     @Override
@@ -176,17 +189,94 @@ public class PostgresDialect implements JdbcDataSourceDialect {
     @Override
     public List<TableId> discoverDataCollections(JdbcSourceConfig sourceConfig) {
         try (JdbcConnection jdbc = openJdbcConnection(sourceConfig)) {
-            boolean includePartitionedTables =
-                    ((PostgresSourceConfig) sourceConfig).includePartitionedTables();
-            return TableDiscoveryUtils.listTables(
-                    // there is always a single database provided
-                    sourceConfig.getDatabaseList().get(0),
-                    jdbc,
-                    sourceConfig.getTableFilters(),
-                    includePartitionedTables);
+            PostgresSourceConfig pgConfig = (PostgresSourceConfig) sourceConfig;
+            boolean includePartitionedTables = pgConfig.includePartitionedTables();
+            List<TableId> discoveredTables =
+                    TableDiscoveryUtils.listTables(
+                            sourceConfig.getDatabaseList().get(0),
+                            jdbc,
+                            sourceConfig.getTableFilters(),
+                            includePartitionedTables);
+
+            if (includePartitionedTables && isPg10(jdbc)) {
+                discoverAndValidatePartitionMappings(jdbc, pgConfig, discoveredTables);
+                synchronizeDialectPg10PartitionMappings(pgConfig);
+            }
+
+            return discoveredTables;
         } catch (SQLException e) {
             throw new FlinkRuntimeException("Error to discover tables: " + e.getMessage(), e);
         }
+    }
+
+    private boolean isPg10(JdbcConnection jdbc) throws SQLException {
+        int majorVersion = jdbc.connection().getMetaData().getDatabaseMajorVersion();
+        return majorVersion == 10;
+    }
+
+    private void discoverAndValidatePartitionMappings(
+            JdbcConnection jdbc, PostgresSourceConfig pgConfig, List<TableId> parentTables)
+            throws SQLException {
+        if (pgConfig.isPg10PartitionMappingInitialized()) {
+            return;
+        }
+
+        Map<TableId, List<TableId>> parentToChildren =
+                TableDiscoveryUtils.discoverPartitionedTableMappings(parentTables, jdbc, true);
+        pgConfig.setParentToChildrenMapping(parentToChildren);
+
+        if (!parentToChildren.isEmpty()) {
+            Map<TableId, TableId> childToParent =
+                    Pg10PartitionMapper.buildChildToParentMapping(parentToChildren);
+            pgConfig.setChildToParentMapping(childToParent);
+
+            String publicationName = pgConfig.getDbzProperties().getProperty("publication.name");
+            if (publicationName != null) {
+                List<TableId> allChildren =
+                        Pg10PartitionMapper.getAllChildTableIds(parentToChildren);
+                Pg10PartitionMapper.validatePublicationMembership(
+                        jdbc, publicationName, allChildren);
+            }
+        }
+
+        pgConfig.setPg10PartitionMappingInitialized(true);
+    }
+
+    private void synchronizeDialectPg10PartitionMappings(PostgresSourceConfig pgConfig) {
+        if (pgConfig == sourceConfig || !pgConfig.isPg10PartitionMappingInitialized()) {
+            return;
+        }
+
+        sourceConfig.setChildToParentMapping(pgConfig.getChildToParentMapping());
+        sourceConfig.setParentToChildrenMapping(pgConfig.getParentToChildrenMappingOrEmpty());
+        sourceConfig.setPg10PartitionMappingInitialized(true);
+    }
+
+    /**
+     * Reconciles PG10 partition mappings using the pure {@link Pg10PartitionReconciler}.
+     *
+     * <p>This method is side-effect free - it only reads the catalog and returns the diff.
+     */
+    public Pg10PartitionReconciler.Pg10ReconcileResult reconcilePg10PartitionMappings(
+            JdbcConnection jdbc, PostgresSourceConfig pgConfig, List<TableId> parentTables)
+            throws SQLException {
+        return getPg10PartitionReconciler()
+                .reconcile(
+                        jdbc,
+                        parentTables,
+                        pgConfig.getParentToChildrenMappingOrEmpty(),
+                        pgConfig.getChildToParentMappingOrEmpty());
+    }
+
+    public Pg10PartitionReconciler.Pg10ReconcileResult reconcilePg10PartitionMappings(
+            JdbcConnection jdbc, Pg10CaptureState captureState, List<TableId> parentTables)
+            throws SQLException {
+        return getPg10PartitionReconciler()
+                .reconcile(
+                        jdbc,
+                        parentTables,
+                        captureState.getParentToChildrenMapping(),
+                        captureState.getChildToParentMapping());
     }
 
     @Override
@@ -229,9 +319,17 @@ public class PostgresDialect implements JdbcDataSourceDialect {
         if (sourceSplitBase.isSnapshotSplit()) {
             return new PostgresScanFetchTask(sourceSplitBase.asSnapshotSplit());
         } else {
-            this.streamFetchTask = new PostgresStreamFetchTask(sourceSplitBase.asStreamSplit());
+            this.streamFetchTask = createStreamFetchTask(sourceSplitBase.asStreamSplit());
             return this.streamFetchTask;
         }
+    }
+
+    private PostgresStreamFetchTask createStreamFetchTask(StreamSplit streamSplit) {
+        if (sourceConfig.isPg10PartitionMappingInitialized()
+                && !sourceConfig.getParentToChildrenMappingOrEmpty().isEmpty()) {
+            return new Pg10StreamFetchTask(streamSplit);
+        }
+        return new PostgresStreamFetchTask(streamSplit);
     }
 
     @Override

@@ -25,7 +25,9 @@ import org.slf4j.LoggerFactory;
 
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -55,5 +57,12 @@ public class TableDiscoveryUtils {
                 capturedTables.stream().map(TableId::toString).collect(Collectors.joining(",")));
 
         return new ArrayList<>(capturedTables);
+    }
+
+    public static Map<TableId, List<TableId>> discoverPartitionedTableMappings(
+            Collection<TableId> parentTableIds, JdbcConnection jdbc, boolean filterByParent)
+            throws SQLException {
+        return Pg10PartitionMapper.discoverPartitionedTableMappings(
+                parentTableIds, jdbc, filterByParent);
     }
 }

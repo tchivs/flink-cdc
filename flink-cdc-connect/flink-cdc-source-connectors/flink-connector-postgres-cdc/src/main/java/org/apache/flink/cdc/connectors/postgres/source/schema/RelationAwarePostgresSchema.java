@@ -26,13 +26,43 @@ import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.schema.TopicSelector;
 
+import java.util.HashMap;
+import java.util.Map;
+
 /**
  * Extends PostgresSchema to dispatch Relation messages as schema change events via the event queue
  * and expose buildAndRegisterSchema as public.
+ *
+ * <p>Also supports a {@link Pg10NewPartitionListener} that is notified when a pgoutput Relation
+ * ('R') message arrives, including filtered runtime child relations. This allows PG10 partition
+ * detection to be driven by WAL events rather than by a polling thread, while schema events are
+ * still dispatched only for non-filtered tables.
  */
 public class RelationAwarePostgresSchema extends PostgresSchema {
 
+    private final Map<Integer, TableId> filteredRelationIdToTableId = new HashMap<>();
+
+    /**
+     * Listener invoked when a pgoutput Relation message is received for a table, including filtered
+     * runtime child relations.
+     *
+     * <p>In PG10 mode this is used to detect previously unknown child partitions arriving in the
+     * WAL stream, which triggers a streaming session restart to rebuild routing mappings.
+     * Implementations run synchronously on the Debezium WAL processing thread, so they must stay
+     * lightweight and must not perform JDBC or other blocking catalog work.
+     */
+    @FunctionalInterface
+    public interface Pg10NewPartitionListener {
+        /**
+         * Called when a Relation message for the given table is applied to the schema.
+         *
+         * @param tableId the table whose Relation message was just processed
+         */
+        void onRelationSeen(TableId tableId);
+    }
+
     private SchemaDispatcher dispatcher;
+    private volatile Pg10NewPartitionListener partitionListener;
 
     public RelationAwarePostgresSchema(
             PostgresConnectorConfig config,
@@ -47,12 +77,49 @@ public class RelationAwarePostgresSchema extends PostgresSchema {
         this.dispatcher = dispatcher;
     }
 
+    /**
+     * Sets the PG10 partition listener. The listener is called within the WAL processing thread
+     * whenever a Relation message arrives, including for filtered runtime child relations, so it
+     * must remain lightweight and JDBC-free. Setting to {@code null} removes the listener.
+     */
+    public void setPartitionListener(Pg10NewPartitionListener listener) {
+        this.partitionListener = listener;
+    }
+
     @Override
     public void applySchemaChangesForTable(int relationId, Table table) {
-        super.applySchemaChangesForTable(relationId, table);
-        if (dispatcher != null && !isFilteredOut(table.id())) {
+        if (isFilteredOut(table.id())) {
+            filteredRelationIdToTableId.put(relationId, table.id());
+            tables().overwriteTable(table);
+        } else {
+            super.applySchemaChangesForTable(relationId, table);
+        }
+        if (!isFilteredOut(table.id()) && dispatcher != null) {
             dispatcher.dispatch(table);
         }
+        Pg10NewPartitionListener listener = this.partitionListener;
+        if (listener != null) {
+            listener.onRelationSeen(table.id());
+        }
+    }
+
+    @Override
+    public Table tableFor(int relationId) {
+        Table table = super.tableFor(relationId);
+        if (table != null) {
+            return table;
+        }
+        TableId filteredTableId = filteredRelationIdToTableId.get(relationId);
+        return filteredTableId == null ? null : tables().forTable(filteredTableId);
+    }
+
+    @Override
+    public Table tableFor(TableId id) {
+        Table table = super.tableFor(id);
+        if (table != null) {
+            return table;
+        }
+        return filteredRelationIdToTableId.containsValue(id) ? tables().forTable(id) : null;
     }
 
     @Override

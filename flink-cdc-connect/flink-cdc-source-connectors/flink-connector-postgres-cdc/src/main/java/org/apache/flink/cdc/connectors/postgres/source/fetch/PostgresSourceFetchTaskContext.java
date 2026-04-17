@@ -70,6 +70,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import static io.debezium.connector.AbstractSourceInfo.SCHEMA_NAME_KEY;
 import static io.debezium.connector.AbstractSourceInfo.TABLE_NAME_KEY;
@@ -83,7 +90,7 @@ import static io.debezium.connector.postgresql.PostgresObjectUtils.newPostgresVa
 /** The context of {@link PostgresScanFetchTask} and {@link PostgresStreamFetchTask}. */
 public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
 
-    private static final String CONNECTION_NAME = "postgres-fetch-task-connection";
+    static final String CONNECTION_NAME = "postgres-fetch-task-connection";
 
     private static final Logger LOG = LoggerFactory.getLogger(PostgresSourceFetchTaskContext.class);
 
@@ -99,10 +106,14 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
     private EventMetadataProvider metadataProvider;
     private SnapshotChangeEventSourceMetrics<PostgresPartition> snapshotChangeEventSourceMetrics;
     private Snapshotter snapShotter;
+    private Map<TableId, TableId> childToParentMapping = Collections.emptyMap();
+    private Map<TableId, List<TableId>> parentToChildrenMapping = Collections.emptyMap();
+    private final Pg10FetchTaskContextCoordinator pg10Coordinator;
 
     public PostgresSourceFetchTaskContext(
             JdbcSourceConfig sourceConfig, PostgresDialect dataSourceDialect) {
         super(sourceConfig, dataSourceDialect);
+        this.pg10Coordinator = new Pg10FetchTaskContextCoordinator(this);
     }
 
     @Override
@@ -124,49 +135,11 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
     @Override
     public void configure(SourceSplitBase sourceSplitBase) {
         LOG.debug("Configuring PostgresSourceFetchTaskContext for split: {}", sourceSplitBase);
-        PostgresConnectorConfig dbzConfig = getDbzConnectorConfig();
-        if (sourceSplitBase instanceof SnapshotSplit) {
-            dbzConfig =
-                    new PostgresConnectorConfig(
-                            dbzConfig
-                                    .getConfig()
-                                    .edit()
-                                    .with(
-                                            "table.include.list",
-                                            getTableList(
-                                                    ((SnapshotSplit) sourceSplitBase).getTableId()))
-                                    .with(
-                                            SLOT_NAME.name(),
-                                            ((PostgresSourceConfig) sourceConfig)
-                                                    .getSlotNameForBackfillTask())
-                                    // drop slot for backfill stream split
-                                    .with(DROP_SLOT_ON_STOP.name(), true)
-                                    // Disable heartbeat event in snapshot split fetcher
-                                    .with(Heartbeat.HEARTBEAT_INTERVAL, 0)
-                                    .build());
-        } else {
+        PostgresSourceConfig pgSourceConfig = (PostgresSourceConfig) sourceConfig;
+        initializePartitionMappings(pgSourceConfig);
 
-            Configuration.Builder builder = dbzConfig.getConfig().edit();
-            if (isBackFillSplit(sourceSplitBase)) {
-                // when backfilled split, only current table schema should be scan
-                builder.with(
-                        "table.include.list",
-                        getTableList(
-                                sourceSplitBase
-                                        .asStreamSplit()
-                                        .getTableSchemas()
-                                        .keySet()
-                                        .iterator()
-                                        .next()));
-            }
-
-            dbzConfig =
-                    new PostgresConnectorConfig(
-                            builder
-                                    // never drop slot for stream split, which is also global split
-                                    .with(DROP_SLOT_ON_STOP.name(), false)
-                                    .build());
-        }
+        PostgresConnectorConfig dbzConfig =
+                createConfiguredConnectorConfig(sourceSplitBase, pgSourceConfig);
         setDbzConnectorConfig(dbzConfig);
         PostgresConnectorConfig.SnapshotMode snapshotMode =
                 PostgresConnectorConfig.SnapshotMode.parse(
@@ -267,7 +240,8 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
                                             break;
                                     }
                                 }),
-                        schemaNameAdjuster);
+                        schemaNameAdjuster,
+                        childToParentMapping);
         schema.setDispatcher(postgresDispatcher);
 
         ChangeEventSourceMetricsFactory<PostgresPartition> metricsFactory =
@@ -324,14 +298,24 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
 
     @Override
     public TableId getTableId(SourceRecord record) {
+        TableId tableId;
         if (record instanceof PostgresSchemaRecord) {
-            return ((PostgresSchemaRecord) record).getTable().id();
+            tableId = ((PostgresSchemaRecord) record).getTable().id();
+        } else {
+            Struct value = (Struct) record.value();
+            Struct source = value.getStruct(Envelope.FieldName.SOURCE);
+            String schemaName = source.getString(SCHEMA_NAME_KEY);
+            String tableName = source.getString(TABLE_NAME_KEY);
+            tableId = new TableId(null, schemaName, tableName);
         }
-        Struct value = (Struct) record.value();
-        Struct source = value.getStruct(Envelope.FieldName.SOURCE);
-        String schemaName = source.getString(SCHEMA_NAME_KEY);
-        String tableName = source.getString(TABLE_NAME_KEY);
-        return new TableId(null, schemaName, tableName);
+        return routeTableId(tableId);
+    }
+
+    public TableId routeTableId(TableId tableId) {
+        if (tableId == null || childToParentMapping.isEmpty()) {
+            return tableId;
+        }
+        return childToParentMapping.getOrDefault(tableId, tableId);
     }
 
     @Override
@@ -386,10 +370,282 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
                         sourceSplitBase.asStreamSplit().splitId());
     }
 
+    private void initializePartitionMappings(PostgresSourceConfig pgSourceConfig) {
+        this.childToParentMapping = pgSourceConfig.getChildToParentMappingOrEmpty();
+        this.parentToChildrenMapping = pgSourceConfig.getParentToChildrenMappingOrEmpty();
+    }
+
+    private PostgresConnectorConfig createConfiguredConnectorConfig(
+            SourceSplitBase sourceSplitBase, PostgresSourceConfig pgSourceConfig) {
+        return createConfiguredConnectorConfig(
+                sourceSplitBase, pgSourceConfig, childToParentMapping, parentToChildrenMapping);
+    }
+
+    PostgresConnectorConfig createConfiguredConnectorConfig(
+            SourceSplitBase sourceSplitBase, Pg10CaptureState captureState) {
+        PostgresSourceConfig pgSourceConfig = (PostgresSourceConfig) sourceConfig;
+        return createConfiguredConnectorConfig(
+                sourceSplitBase,
+                pgSourceConfig,
+                captureState.getChildToParentMapping(),
+                captureState.getParentToChildrenMapping());
+    }
+
+    private PostgresConnectorConfig createConfiguredConnectorConfig(
+            SourceSplitBase sourceSplitBase,
+            PostgresSourceConfig pgSourceConfig,
+            Map<TableId, TableId> childToParentMapping,
+            Map<TableId, List<TableId>> parentToChildrenMapping) {
+        PostgresConnectorConfig dbzConfig = getDbzConnectorConfig();
+        if (sourceSplitBase instanceof SnapshotSplit) {
+            return buildSnapshotSplitConfig(
+                    dbzConfig, (SnapshotSplit) sourceSplitBase, pgSourceConfig);
+        }
+
+        Configuration.Builder builder = dbzConfig.getConfig().edit();
+        if (isBackFillSplit(sourceSplitBase)) {
+            // when backfilled split, include both the parent table and its child partitions
+            // to ensure WAL events from children are captured during incremental snapshot
+            TableId backfillTableId =
+                    sourceSplitBase.asStreamSplit().getTableSchemas().keySet().iterator().next();
+            String includeList = getTableList(backfillTableId);
+            if (!childToParentMapping.isEmpty()) {
+                List<TableId> children =
+                        getAllChildrenForParent(
+                                backfillTableId, childToParentMapping, parentToChildrenMapping);
+                if (!children.isEmpty()) {
+                    includeList = appendChildTablesToIncludeList(includeList, children);
+                }
+            }
+            builder.with("table.include.list", includeList);
+        } else if (!childToParentMapping.isEmpty()) {
+            String includeList = dbzConfig.getConfig().getString("table.include.list");
+            builder.with(
+                    "table.include.list",
+                    appendChildTablesToIncludeList(includeList, childToParentMapping.keySet()));
+        }
+
+        return new PostgresConnectorConfig(
+                builder
+                        // never drop slot for stream split, which is also global split
+                        .with(DROP_SLOT_ON_STOP.name(), false)
+                        .build());
+    }
+
+    private PostgresConnectorConfig buildSnapshotSplitConfig(
+            PostgresConnectorConfig dbzConfig,
+            SnapshotSplit snapshotSplit,
+            PostgresSourceConfig pgSourceConfig) {
+        return new PostgresConnectorConfig(
+                dbzConfig
+                        .getConfig()
+                        .edit()
+                        .with("table.include.list", getTableList(snapshotSplit.getTableId()))
+                        .with(SLOT_NAME.name(), pgSourceConfig.getSlotNameForBackfillTask())
+                        // drop slot for backfill stream split
+                        .with(DROP_SLOT_ON_STOP.name(), true)
+                        // Disable heartbeat event in snapshot split fetcher
+                        .with(Heartbeat.HEARTBEAT_INTERVAL, 0)
+                        .build());
+    }
+
+    private ChangeEventQueue<DataChangeEvent> createQueue(PostgresConnectorConfig dbzConfig) {
+        return new ChangeEventQueue.Builder<DataChangeEvent>()
+                .pollInterval(dbzConfig.getPollInterval())
+                .maxBatchSize(dbzConfig.getMaxBatchSize())
+                .maxQueueSize(dbzConfig.getMaxQueueSize())
+                .maxQueueSizeInBytes(dbzConfig.getMaxQueueSizeInBytes())
+                .loggingContextSupplier(
+                        () -> taskContext.configureLoggingContext("postgres-cdc-connector-task"))
+                // do not buffer any element, we use signal event
+                // .buffering()
+                .build();
+    }
+
+    CDCPostgresDispatcher createDispatcher(
+            PostgresConnectorConfig dbzConfig,
+            TopicSelector<TableId> topicSelector,
+            RelationAwarePostgresSchema schema,
+            ChangeEventQueue<DataChangeEvent> queue,
+            EventMetadataProvider metadataProvider) {
+        return createDispatcher(
+                dbzConfig, topicSelector, schema, queue, metadataProvider, childToParentMapping);
+    }
+
+    CDCPostgresDispatcher createDispatcher(
+            PostgresConnectorConfig dbzConfig,
+            TopicSelector<TableId> topicSelector,
+            RelationAwarePostgresSchema schema,
+            ChangeEventQueue<DataChangeEvent> queue,
+            EventMetadataProvider metadataProvider,
+            Map<TableId, TableId> childToParentMapping) {
+        PostgresConnectorConfig finalDbzConfig = dbzConfig;
+        return new CDCPostgresDispatcher(
+                finalDbzConfig,
+                topicSelector,
+                schema,
+                queue,
+                finalDbzConfig.getTableFilters().dataCollectionFilter(),
+                DataChangeEvent::new,
+                metadataProvider,
+                new HeartbeatFactory<>(
+                        dbzConfig,
+                        topicSelector,
+                        schemaNameAdjuster,
+                        () ->
+                                new PostgresConnection(
+                                        finalDbzConfig.getJdbcConfig(),
+                                        PostgresConnection.CONNECTION_GENERAL),
+                        exception -> {
+                            String sqlErrorId = exception.getSQLState();
+                            switch (sqlErrorId) {
+                                case "57P01":
+                                    // Postgres error admin_shutdown, see
+                                    // https://www.postgresql.org/docs/12/errcodes-appendix.html
+                                    throw new DebeziumException(
+                                            "Could not execute heartbeat action query (Error: "
+                                                    + sqlErrorId
+                                                    + ")",
+                                            exception);
+                                case "57P03":
+                                    // Postgres error cannot_connect_now, see
+                                    // https://www.postgresql.org/docs/12/errcodes-appendix.html
+                                    throw new RetriableException(
+                                            "Could not execute heartbeat action query (Error: "
+                                                    + sqlErrorId
+                                                    + ")",
+                                            exception);
+                                default:
+                                    break;
+                            }
+                        }),
+                schemaNameAdjuster,
+                childToParentMapping);
+    }
+
     private String getTableList(TableId tableId) {
         if (tableId.schema() == null || tableId.schema().isEmpty()) {
             return tableId.table();
         }
         return tableId.schema() + "." + tableId.table();
+    }
+
+    private String appendChildTablesToIncludeList(
+            String includeList, Collection<TableId> childTables) {
+        if (childTables.isEmpty()) {
+            return includeList;
+        }
+
+        Set<String> includeEntries = new LinkedHashSet<>();
+        if (includeList != null && !includeList.trim().isEmpty()) {
+            String[] entries = includeList.split(",");
+            for (String entry : entries) {
+                String trimmed = entry.trim();
+                if (!trimmed.isEmpty()) {
+                    includeEntries.add(trimmed);
+                }
+            }
+        }
+
+        for (TableId childTable : childTables) {
+            includeEntries.add(getTableList(childTable));
+        }
+
+        return String.join(",", includeEntries);
+    }
+
+    private List<TableId> getAllChildrenForParent(TableId parentTableId) {
+        return getAllChildrenForParent(
+                parentTableId, childToParentMapping, parentToChildrenMapping);
+    }
+
+    private List<TableId> getAllChildrenForParent(
+            TableId parentTableId,
+            Map<TableId, TableId> childToParentMapping,
+            Map<TableId, List<TableId>> parentToChildrenMapping) {
+        if (!parentToChildrenMapping.isEmpty()) {
+            return new ArrayList<>(
+                    parentToChildrenMapping.getOrDefault(parentTableId, Collections.emptyList()));
+        }
+
+        List<TableId> children = new ArrayList<>();
+        for (Map.Entry<TableId, TableId> entry : childToParentMapping.entrySet()) {
+            if (parentTableId.equals(entry.getValue())) {
+                children.add(entry.getKey());
+            }
+        }
+        return children;
+    }
+
+    public Pg10StreamingSessionRuntime buildStreamingRuntime(
+            StreamSplit streamSplit,
+            Pg10CaptureState captureState,
+            PostgresOffsetContext startingOffsetContext) {
+        return pg10Coordinator.buildStreamingRuntime(
+                streamSplit, captureState, startingOffsetContext);
+    }
+
+    public void closeStreamingRuntime(Pg10StreamingSessionRuntime runtime) {
+        pg10Coordinator.closeStreamingRuntime(runtime);
+    }
+
+    /** Builds the initial Pg10CaptureState from the current source configuration. */
+    public Pg10CaptureState buildInitialCaptureState(SourceSplitBase split) {
+        return pg10Coordinator.buildInitialCaptureState(split);
+    }
+
+    public PostgresOffsetContext getRestartOffsetContext() {
+        return offsetContext;
+    }
+
+    public void setRestartOffsetContext(PostgresOffsetContext offsetContext) {
+        this.offsetContext = offsetContext;
+    }
+
+    /**
+     * Accepts a reconciled PG10 capture state for the next streaming session restart.
+     *
+     * <p>This acceptance boundary is where the runtime commits to the new routing mappings. The
+     * restart offset handoff must happen at the same point so the follow-up streaming session is
+     * rebuilt from the WAL position that was current when the new capture state was accepted.
+     */
+    public void acceptPg10CaptureStateForRestart(
+            Pg10CaptureState captureState,
+            PostgresOffsetContext restartOffsetContext,
+            StreamSplit streamSplit) {
+        pg10Coordinator.acceptPg10CaptureStateForRestart(
+                captureState, restartOffsetContext, streamSplit);
+    }
+
+    public void syncPg10CaptureState(Pg10CaptureState captureState, StreamSplit streamSplit) {
+        pg10Coordinator.syncPg10CaptureState(captureState, streamSplit);
+    }
+
+    /**
+     * Reconciles current catalog state and returns the next accepted capture state.
+     *
+     * <p>Uses the provided JDBC connection to avoid opening a duplicate connection. The caller is
+     * responsible for connection lifecycle management.
+     */
+    public java.util.Optional<Pg10CaptureState> maybePrepareNextCaptureState(
+            io.debezium.jdbc.JdbcConnection jdbc,
+            PostgresDialect postgresDialect,
+            Pg10CaptureState currentCaptureState,
+            List<TableId> parentTables,
+            Set<TableId> publishedButUnacceptedChildren) {
+        return pg10Coordinator.maybePrepareNextCaptureState(
+                jdbc,
+                postgresDialect,
+                currentCaptureState,
+                parentTables,
+                publishedButUnacceptedChildren);
+    }
+
+    void setChildToParentMapping(Map<TableId, TableId> childToParentMapping) {
+        this.childToParentMapping = childToParentMapping;
+    }
+
+    void setParentToChildrenMapping(Map<TableId, List<TableId>> parentToChildrenMapping) {
+        this.parentToChildrenMapping = parentToChildrenMapping;
     }
 }
