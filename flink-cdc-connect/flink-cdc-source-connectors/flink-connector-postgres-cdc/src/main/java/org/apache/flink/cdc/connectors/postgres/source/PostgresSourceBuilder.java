@@ -428,6 +428,7 @@ public class PostgresSourceBuilder<T> {
             // create source config for the given subtask (e.g. unique server id)
             PostgresSourceConfig sourceConfig =
                     (PostgresSourceConfig) configFactory.create(readerContext.getIndexOfSubtask());
+            ensurePartitionMappingForReader(sourceConfig);
             FutureCompletingBlockingQueue<RecordsWithSplitIds<SourceRecords>> elementsQueue =
                     new FutureCompletingBlockingQueue<>();
 
@@ -455,6 +456,15 @@ public class PostgresSourceBuilder<T> {
                     dataSourceDialect);
         }
 
+        private void ensurePartitionMappingForReader(PostgresSourceConfig sourceConfig) {
+            if (!sourceConfig.includePartitionedTables()
+                    || sourceConfig.getChildToParentMapping() != null) {
+                return;
+            }
+
+            ((PostgresDialect) dataSourceDialect).discoverDataCollections(sourceConfig);
+        }
+
         @Override
         protected RecordEmitter<SourceRecords, T, SourceSplitState> createRecordEmitter(
                 SourceConfig sourceConfig, SourceReaderMetrics sourceReaderMetrics) {
@@ -462,7 +472,8 @@ public class PostgresSourceBuilder<T> {
                     deserializationSchema,
                     sourceReaderMetrics,
                     sourceConfig.isIncludeSchemaChanges(),
-                    offsetFactory);
+                    offsetFactory,
+                    () -> ((PostgresSourceConfig) sourceConfig).getChildToParentMappingOrEmpty());
         }
 
         public static <T> PostgresSourceBuilder<T> builder() {

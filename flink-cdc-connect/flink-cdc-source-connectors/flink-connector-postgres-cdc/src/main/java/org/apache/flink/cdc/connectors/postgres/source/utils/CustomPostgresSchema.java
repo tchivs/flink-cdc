@@ -82,7 +82,7 @@ public class CustomPostgresSchema {
 
         if (!unMatchTableIds.isEmpty()) {
             try {
-                readTableSchema(tableIds);
+                readTableSchema(unMatchTableIds);
             } catch (SQLException e) {
                 throw new FlinkRuntimeException("Failed to read table schema", e);
             }
@@ -98,7 +98,7 @@ public class CustomPostgresSchema {
         return tableChanges;
     }
 
-    private List<TableChange> readTableSchema(List<TableId> tableIds) throws SQLException {
+    protected List<TableChange> readTableSchema(List<TableId> tableIds) throws SQLException {
         List<TableChange> tableChanges = new ArrayList<>();
 
         final PostgresOffsetContext offsetContext =

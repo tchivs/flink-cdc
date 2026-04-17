@@ -96,7 +96,7 @@ public class IncrementalSourceStreamFetcherTest extends PostgresTestBase {
         StreamSplit split = createStreamSplit(sourceConfig, dialect);
         PostgresStreamFetchTask fetchTask =
                 (PostgresStreamFetchTask) dialect.createFetchTask(split);
-        StoppableChangeEventSourceContext changeEventSourceContext =
+        PostgresStreamFetchTask.StoppableChangeEventSourceContext changeEventSourceContext =
                 fetchTask.getChangeEventSourceContext();
 
         fetcher.submitTask(fetchTask);

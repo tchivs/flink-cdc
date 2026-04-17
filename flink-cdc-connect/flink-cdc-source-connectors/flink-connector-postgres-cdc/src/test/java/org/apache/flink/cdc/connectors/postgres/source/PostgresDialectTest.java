@@ -18,6 +18,7 @@
 package org.apache.flink.cdc.connectors.postgres.source;
 
 import org.apache.flink.cdc.connectors.postgres.PostgresTestBase;
+import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfigFactory;
 import org.apache.flink.cdc.connectors.postgres.testutils.UniqueDatabase;
 
@@ -26,6 +27,7 @@ import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 
 /** Tests for {@link PostgresDialect}. */
 class PostgresDialectTest extends PostgresTestBase {
@@ -114,5 +116,33 @@ class PostgresDialectTest extends PostgresTestBase {
                         configFactoryOfInventoryPartitionedDatabase.create(0));
         Assertions.assertThat(tableIdsOfInventoryPartitionedDatabase.get(0))
                 .hasToString("inventory_partitioned.products");
+    }
+
+    @Test
+    void testDiscoverParentChildMappingsForPg10PartitionedTable() {
+        inventoryPartitionedDatabase.createAndInitialize();
+
+        PostgresSourceConfigFactory configFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "products", 10);
+        configFactory.setIncludePartitionedTables(true);
+        PostgresSourceConfig config = configFactory.create(0);
+        PostgresDialect dialect = new PostgresDialect(config);
+
+        List<TableId> discoveredTables = dialect.discoverDataCollections(config);
+
+        Assertions.assertThat(discoveredTables).hasSize(1);
+        Assertions.assertThat(discoveredTables.get(0))
+                .hasToString("inventory_partitioned.products");
+
+        Map<TableId, TableId> childToParentMapping = config.getChildToParentMapping();
+        if (childToParentMapping != null && !childToParentMapping.isEmpty()) {
+            TableId parentTable = new TableId(null, "inventory_partitioned", "products");
+            TableId childUk = new TableId(null, "inventory_partitioned", "products_uk");
+            TableId childUs = new TableId(null, "inventory_partitioned", "products_us");
+
+            Assertions.assertThat(childToParentMapping).containsEntry(childUk, parentTable);
+            Assertions.assertThat(childToParentMapping).containsEntry(childUs, parentTable);
+        }
     }
 }

@@ -32,6 +32,7 @@ import io.debezium.heartbeat.HeartbeatFactory;
 import io.debezium.pipeline.DataChangeEvent;
 import io.debezium.pipeline.source.spi.EventMetadataProvider;
 import io.debezium.pipeline.spi.ChangeEventCreator;
+import io.debezium.pipeline.spi.ChangeRecordEmitter;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.schema.DataCollectionFilters;
@@ -40,6 +41,7 @@ import io.debezium.schema.TopicSelector;
 import io.debezium.util.SchemaNameAdjuster;
 import org.apache.kafka.connect.source.SourceRecord;
 
+import java.util.Collections;
 import java.util.Map;
 
 /** Postgres Dispatcher for cdc source with watermark. */
@@ -47,6 +49,7 @@ public class CDCPostgresDispatcher extends PostgresEventDispatcher<TableId>
         implements WatermarkDispatcher, SchemaDispatcher {
     private final String topic;
     private final ChangeEventQueue<DataChangeEvent> queue;
+    private final Map<TableId, TableId> childToParentMapping;
 
     public CDCPostgresDispatcher(
             PostgresConnectorConfig connectorConfig,
@@ -57,7 +60,8 @@ public class CDCPostgresDispatcher extends PostgresEventDispatcher<TableId>
             ChangeEventCreator changeEventCreator,
             EventMetadataProvider metadataProvider,
             HeartbeatFactory heartbeatFactory,
-            SchemaNameAdjuster schemaNameAdjuster) {
+            SchemaNameAdjuster schemaNameAdjuster,
+            Map<TableId, TableId> childToParentMapping) {
         super(
                 connectorConfig,
                 topicSelector,
@@ -70,6 +74,8 @@ public class CDCPostgresDispatcher extends PostgresEventDispatcher<TableId>
                 schemaNameAdjuster);
         this.topic = topicSelector.getPrimaryTopic();
         this.queue = queue;
+        this.childToParentMapping =
+                childToParentMapping == null ? Collections.emptyMap() : childToParentMapping;
     }
 
     @Override
@@ -87,12 +93,47 @@ public class CDCPostgresDispatcher extends PostgresEventDispatcher<TableId>
 
     @Override
     public void dispatch(Table table) {
-        PostgresSchemaRecord schemaRecord = new PostgresSchemaRecord(table);
+        PostgresSchemaRecord schemaRecord = new PostgresSchemaRecord(routeTable(table));
         try {
             queue.enqueue(new DataChangeEvent(schemaRecord));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException(e);
         }
+    }
+
+    @Override
+    public boolean dispatchDataChangeEvent(
+            io.debezium.connector.postgresql.PostgresPartition partition,
+            TableId dataCollectionId,
+            ChangeRecordEmitter<io.debezium.connector.postgresql.PostgresPartition>
+                    changeRecordEmitter)
+            throws InterruptedException {
+        return super.dispatchDataChangeEvent(
+                partition, routeTableId(dataCollectionId), changeRecordEmitter);
+    }
+
+    private TableId routeTableId(TableId tableId) {
+        if (tableId == null || childToParentMapping.isEmpty()) {
+            return tableId;
+        }
+        return childToParentMapping.getOrDefault(tableId, tableId);
+    }
+
+    private Table routeTable(Table table) {
+        if (table == null) {
+            return null;
+        }
+        if (childToParentMapping.isEmpty()) {
+            return table;
+        }
+        TableId parentTableId = routeTableId(table.id());
+        if (parentTableId == null) {
+            return table;
+        }
+        if (parentTableId.equals(table.id())) {
+            return table;
+        }
+        return table.edit().tableId(parentTableId).create();
     }
 }

@@ -50,17 +50,21 @@ import javax.annotation.Nullable;
 import java.util.HashMap;
 import java.util.Map;
 
-/** A {@link FetchTask} implementation for Postgres to read streaming changes. */
+/**
+ * A {@link FetchTask} implementation for Postgres to read streaming changes.
+ *
+ * <p>This is the base class for standard (non-PG10) streaming. For PG10 partitioned table support
+ * with dynamic child partition discovery, see {@link Pg10StreamFetchTask}.
+ */
 public class PostgresStreamFetchTask implements FetchTask<SourceSplitBase> {
     private static final Logger LOG = LoggerFactory.getLogger(PostgresStreamFetchTask.class);
 
     private final StreamSplit split;
-    private final StoppableChangeEventSourceContext changeEventSourceContext;
     private volatile boolean taskRunning = false;
     private volatile boolean stopped = false;
+    private volatile StoppableChangeEventSourceContext changeEventSourceContext;
 
     private StreamSplitReadTask streamSplitReadTask;
-
     private Long lastCommitLsn;
 
     public PostgresStreamFetchTask(StreamSplit streamSplit) {
@@ -82,31 +86,43 @@ public class PostgresStreamFetchTask implements FetchTask<SourceSplitBase> {
         PostgresSourceFetchTaskContext sourceFetchContext =
                 (PostgresSourceFetchTaskContext) context;
         taskRunning = true;
-        streamSplitReadTask =
-                new StreamSplitReadTask(
-                        sourceFetchContext.getDbzConnectorConfig(),
-                        sourceFetchContext.getSnapShotter(),
-                        sourceFetchContext.getConnection(),
-                        sourceFetchContext.getEventDispatcher(),
-                        sourceFetchContext.getWaterMarkDispatcher(),
-                        sourceFetchContext.getErrorHandler(),
-                        sourceFetchContext.getTaskContext().getClock(),
-                        sourceFetchContext.getDatabaseSchema(),
-                        sourceFetchContext.getTaskContext(),
-                        sourceFetchContext.getReplicationConnection(),
-                        split);
+        try {
+            StoppableChangeEventSourceContext sessionContext =
+                    new StoppableChangeEventSourceContext();
+            changeEventSourceContext = sessionContext;
 
-        streamSplitReadTask.execute(
-                changeEventSourceContext,
-                sourceFetchContext.getPartition(),
-                sourceFetchContext.getOffsetContext());
+            streamSplitReadTask =
+                    createStreamSplitReadTask(
+                            sourceFetchContext.getDbzConnectorConfig(),
+                            sourceFetchContext.getSnapShotter(),
+                            sourceFetchContext.getConnection(),
+                            sourceFetchContext.getEventDispatcher(),
+                            sourceFetchContext.getWaterMarkDispatcher(),
+                            sourceFetchContext.getErrorHandler(),
+                            sourceFetchContext.getTaskContext().getClock(),
+                            sourceFetchContext.getDatabaseSchema(),
+                            sourceFetchContext.getTaskContext(),
+                            sourceFetchContext.getReplicationConnection(),
+                            split);
+
+            streamSplitReadTask.execute(
+                    sessionContext,
+                    sourceFetchContext.getPartition(),
+                    sourceFetchContext.getOffsetContext());
+        } finally {
+            taskRunning = false;
+        }
     }
 
     @Override
     public void close() {
         LOG.debug("stopping StreamFetchTask for split: {}", split);
-        if (streamSplitReadTask != null) {
-            ((StoppableChangeEventSourceContext) (streamSplitReadTask.context))
+        StoppableChangeEventSourceContext currentContext = changeEventSourceContext;
+        if (currentContext != null) {
+            currentContext.stopChangeEventSource();
+        }
+        if (streamSplitReadTask != null && streamSplitReadTask.context != null) {
+            ((StoppableChangeEventSourceContext) streamSplitReadTask.context)
                     .stopChangeEventSource();
         }
         stopped = true;
@@ -164,9 +180,73 @@ public class PostgresStreamFetchTask implements FetchTask<SourceSplitBase> {
         }
     }
 
+    // ---- Protected methods for subclass access ----
+
+    /** Returns whether this task has been stopped. */
+    protected boolean isStopped() {
+        return stopped;
+    }
+
+    /** Sets the task running state. */
+    protected void setTaskRunning(boolean running) {
+        this.taskRunning = running;
+    }
+
+    /** Sets the current change event source context (used by PG10 subclass for session restart). */
+    protected void setChangeEventSourceContext(StoppableChangeEventSourceContext context) {
+        this.changeEventSourceContext = context;
+    }
+
+    /** Sets the stream split read task (used by PG10 subclass). */
+    protected void setStreamSplitReadTask(StreamSplitReadTask task) {
+        this.streamSplitReadTask = task;
+    }
+
+    /** Factory method to create a StreamSplitReadTask. Can be used by subclasses. */
+    protected StreamSplitReadTask createStreamSplitReadTask(
+            PostgresConnectorConfig connectorConfig,
+            Snapshotter snapshotter,
+            PostgresConnection connection,
+            PostgresEventDispatcher<TableId> eventDispatcher,
+            WatermarkDispatcher watermarkDispatcher,
+            ErrorHandler errorHandler,
+            Clock clock,
+            PostgresSchema schema,
+            PostgresTaskContext taskContext,
+            ReplicationConnection replicationConnection,
+            StreamSplit streamSplit) {
+        return new StreamSplitReadTask(
+                connectorConfig,
+                snapshotter,
+                connection,
+                eventDispatcher,
+                watermarkDispatcher,
+                errorHandler,
+                clock,
+                schema,
+                taskContext,
+                replicationConnection,
+                streamSplit);
+    }
+
     @VisibleForTesting
     StoppableChangeEventSourceContext getChangeEventSourceContext() {
         return changeEventSourceContext;
+    }
+
+    /** Stoppable implementation of {@link ChangeEventSource.ChangeEventSourceContext}. */
+    public static class StoppableChangeEventSourceContext
+            implements ChangeEventSource.ChangeEventSourceContext {
+        private volatile boolean running = true;
+
+        public void stopChangeEventSource() {
+            running = false;
+        }
+
+        @Override
+        public boolean isRunning() {
+            return running;
+        }
     }
 
     /** A {@link ChangeEventSource} implementation for Postgres to read streaming changes. */

@@ -22,11 +22,14 @@ import org.apache.flink.cdc.connectors.base.options.StartupOptions;
 
 import io.debezium.config.Configuration;
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
+import io.debezium.relational.TableId;
 
 import javax.annotation.Nullable;
 
 import java.time.Duration;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 
 import static io.debezium.connector.postgresql.PostgresConnectorConfig.SLOT_NAME;
@@ -40,6 +43,9 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
     private final int lsnCommitCheckpointsDelay;
     private final boolean includePartitionedTables;
     private final boolean includeDatabaseInTableId;
+    private Map<TableId, TableId> childToParentMapping;
+    private Map<TableId, List<TableId>> parentToChildrenMapping;
+    private boolean pg10PartitionMappingInitialized;
 
     public PostgresSourceConfig(
             int subtaskId,
@@ -155,5 +161,50 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
     /** Returns whether to include database in the generated Table ID. */
     public boolean isIncludeDatabaseInTableId() {
         return includeDatabaseInTableId;
+    }
+
+    /** Returns the child→parent partition mapping discovered for PG10. */
+    public Map<TableId, TableId> getChildToParentMapping() {
+        return childToParentMapping;
+    }
+
+    /** Returns the child→parent partition mapping, or an empty map if it is absent. */
+    public Map<TableId, TableId> getChildToParentMappingOrEmpty() {
+        return childToParentMapping == null ? Collections.emptyMap() : childToParentMapping;
+    }
+
+    /**
+     * Sets the child→parent partition mapping.
+     *
+     * <p>Note: The provided map may be unmodifiable (e.g., from {@code Pg10CaptureState}). Callers
+     * must not attempt to mutate the map after setting it.
+     */
+    public void setChildToParentMapping(Map<TableId, TableId> childToParentMapping) {
+        this.childToParentMapping = childToParentMapping;
+    }
+
+    /**
+     * Sets the parent→children partition mapping.
+     *
+     * <p>Note: The provided map may be unmodifiable (e.g., from {@code Pg10CaptureState}). Callers
+     * must not attempt to mutate the map after setting it.
+     */
+    public void setParentToChildrenMapping(Map<TableId, List<TableId>> parentToChildrenMapping) {
+        this.parentToChildrenMapping = parentToChildrenMapping;
+    }
+
+    /** Returns the parent→children partition mapping, or an empty map if it is absent. */
+    public Map<TableId, List<TableId>> getParentToChildrenMappingOrEmpty() {
+        return parentToChildrenMapping == null ? Collections.emptyMap() : parentToChildrenMapping;
+    }
+
+    /** Returns whether the PG10 partition mapping has been initialized. */
+    public boolean isPg10PartitionMappingInitialized() {
+        return pg10PartitionMappingInitialized;
+    }
+
+    /** Sets whether the PG10 partition mapping has been initialized. */
+    public void setPg10PartitionMappingInitialized(boolean pg10PartitionMappingInitialized) {
+        this.pg10PartitionMappingInitialized = pg10PartitionMappingInitialized;
     }
 }
