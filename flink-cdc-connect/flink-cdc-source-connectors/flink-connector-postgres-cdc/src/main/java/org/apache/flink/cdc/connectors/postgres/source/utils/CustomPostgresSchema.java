@@ -37,9 +37,11 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /** A CustomPostgresSchema similar to PostgresSchema with customization. */
 public class CustomPostgresSchema {
@@ -105,6 +107,7 @@ public class CustomPostgresSchema {
                 PostgresOffsetContext.initialContext(dbzConfig, jdbcConnection, Clock.SYSTEM);
 
         PostgresPartition partition = new PostgresPartition(dbzConfig.getLogicalName());
+        Set<TableId> requestedTableIds = new LinkedHashSet<>(tableIds);
 
         Tables tables = new Tables();
         try {
@@ -112,7 +115,7 @@ public class CustomPostgresSchema {
                     tables,
                     dbzConfig.databaseName(),
                     null,
-                    dbzConfig.getTableFilters().dataCollectionFilter(),
+                    requestedTableIds::contains,
                     null,
                     false);
         } catch (SQLException e) {

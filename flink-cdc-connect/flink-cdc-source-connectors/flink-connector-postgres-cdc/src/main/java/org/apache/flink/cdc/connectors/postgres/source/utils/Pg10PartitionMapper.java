@@ -69,11 +69,7 @@ public class Pg10PartitionMapper {
                 if (parentList.length() > 0) {
                     parentList.append(",");
                 }
-                String tableName =
-                        parentId.schema() != null
-                                ? parentId.schema() + "." + parentId.table()
-                                : parentId.table();
-                parentList.append("'").append(tableName).append("'::regclass");
+                parentList.append(toRegclassLiteral(parentId));
             }
             query =
                     String.format(
@@ -183,12 +179,34 @@ public class Pg10PartitionMapper {
     private static TableId parseTableId(String tableIdString) {
         int dotIndex = tableIdString.lastIndexOf('.');
         if (dotIndex > 0) {
-            String schema = tableIdString.substring(0, dotIndex);
-            String table = tableIdString.substring(dotIndex + 1);
+            String schema = stripOptionalQuotes(tableIdString.substring(0, dotIndex));
+            String table = stripOptionalQuotes(tableIdString.substring(dotIndex + 1));
             return new TableId(null, schema, table);
         } else {
-            return new TableId(null, "public", tableIdString);
+            return new TableId(null, "public", stripOptionalQuotes(tableIdString));
         }
+    }
+
+    private static String toRegclassLiteral(TableId tableId) {
+        if (tableId.schema() != null) {
+            return String.format(
+                    "'%s.%s'::regclass",
+                    quoteIdentifier(tableId.schema()), quoteIdentifier(tableId.table()));
+        }
+        return String.format("'%s'::regclass", quoteIdentifier(tableId.table()));
+    }
+
+    private static String quoteIdentifier(String identifier) {
+        return '"' + identifier.replace("\"", "\"\"") + '"';
+    }
+
+    private static String stripOptionalQuotes(String identifier) {
+        if (identifier.length() >= 2
+                && identifier.charAt(0) == '"'
+                && identifier.charAt(identifier.length() - 1) == '"') {
+            return identifier.substring(1, identifier.length() - 1).replace("\"\"", "\"");
+        }
+        return identifier;
     }
 
     /** Exception thrown when partition publication validation fails. */

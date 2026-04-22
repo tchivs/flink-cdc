@@ -19,6 +19,8 @@ package org.apache.flink.cdc.connectors.postgres.source.utils;
 
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.relational.TableId;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -38,6 +40,8 @@ import java.util.stream.Collectors;
  * adding new tables to publications.
  */
 public final class Pg10PublicationManager {
+
+    private static final Logger LOG = LoggerFactory.getLogger(Pg10PublicationManager.class);
 
     /**
      * Identifies child partitions that are NOT in the publication. Unlike {@link
@@ -89,13 +93,18 @@ public final class Pg10PublicationManager {
                 }
             }
         }
+
+        LOG.info(
+                "PG10 child added to publication [publication={}, tables={}, childCount={}].",
+                publicationName,
+                tableIds,
+                tableIds.size());
     }
 
     /**
      * Validates that all child partitions are members of the specified publication.
      *
-     * @throws Pg10PartitionMapper.PartitionPublicationValidationException if any child partition is
-     *     missing
+     * <p>Throws a partition publication validation exception when any child partition is missing.
      */
     public static void validatePublicationMembership(
             JdbcConnection jdbc, String publicationName, Collection<TableId> childTableIds)
