@@ -580,15 +580,16 @@ $ ./bin/flink run \
 
 PostgreSQL 10 does not support `PRIMARY KEY` on partitioned tables. The Flink CDC Postgres connector discovers child partitions by querying the `pg_inherits` catalog at startup and rewrites child table events to the parent table identity in the output.
 
-**Runtime-created child partitions** (created after the CDC job starts) are captured through a reconcile-and-restart cycle:
+**Runtime-created child partitions** (created after the CDC job starts) are captured through a reconcile-and-restart cycle. PostgreSQL 10 still requires **catalog/publication polling** in addition to the WAL relation listener, because `pgoutput` can only emit `Relation` metadata for a child table after that child has been added to the publication.
 
-1. A background monitor thread periodically queries the catalog for new child partitions
-2. When new children are detected, the current streaming session is stopped at a well-defined boundary
-3. The main thread adds missing child partitions to the publication via `ALTER PUBLICATION ADD TABLE`
+1. A background monitor thread periodically polls the catalog/publication for new child partitions
+2. Missing child partitions are added to the publication via `ALTER PUBLICATION ADD TABLE`
+3. Once a new child becomes visible, either a WAL `Relation` message or the publication poller requests a restart
 4. The reconciler computes an updated routing state from the latest catalog diff, using the current capture state as the baseline
-5. A new streaming session is built from the current replication/source offset with the updated partition mappings, and child partition events continue to be emitted as parent table events
+5. A new streaming session is built from the current committed restart boundary with the updated partition mappings, and child partition events continue to be emitted as parent table events
+6. If `scan.pg10.child-partition.backfill.enabled = true`, the connector also prepares a **bounded compensating backfill** for newly accepted child partitions
 
-This session-restart approach ensures that routing mappings are never mutated in place, and the Debezium runtime objects are always rebuilt at a well-defined boundary.
+This session-restart approach ensures that routing mappings are never mutated in place, and the Debezium runtime objects are always rebuilt at a well-defined boundary. In other words, **session restart is still expected PG10 behavior**, not an exceptional recovery path.
 
 #### Requirements
 - PostgreSQL 10 only
@@ -599,8 +600,11 @@ This session-restart approach ensures that routing mappings are never mutated in
 #### Limitations
 - Only child partitions under already-captured parent tables are discovered
 - Runtime discovery of entirely NEW parent tables is not supported
-- Changes written to a new child partition BEFORE it is reconciled into the publication will not be captured (no backfill)
-- A brief streaming interruption occurs during the session restart phase
+- Polling remains required even with the WAL relation listener, because publication membership must be refreshed before `pgoutput` can expose the child table
+- A brief streaming interruption still occurs during the session restart phase
+- Writes that happened before `ALTER PUBLICATION ADD TABLE` are **not** reconstructed from unpublished WAL
+- Optional PG10 compensation reads a bounded snapshot for newly accepted children anchored to the accepted restart boundary; it helps close the publication gap but is **not** WAL-perfect recovery magic or a stronger restart-boundary guarantee than the bounded compensation implementation
+- If PG10 compensation is disabled, behavior remains the old post-acceptance-only semantics
 
 ### DataStream Source
 
