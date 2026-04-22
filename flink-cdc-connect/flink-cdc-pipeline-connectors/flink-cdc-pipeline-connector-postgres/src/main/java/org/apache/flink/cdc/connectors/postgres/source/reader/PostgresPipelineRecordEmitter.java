@@ -88,7 +88,8 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
                 debeziumDeserializationSchema,
                 sourceReaderMetrics,
                 sourceConfig.isIncludeSchemaChanges(),
-                offsetFactory);
+                offsetFactory,
+                sourceConfig::getChildToParentMappingOrEmpty);
         this.sourceConfig = sourceConfig;
         this.includeDatabaseInTableId = sourceConfig.isIncludeDatabaseInTableId();
         this.postgresDialect = postgresDialect;

@@ -139,6 +139,8 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         validateIntegerOption(SCAN_SNAPSHOT_FETCH_SIZE, fetchSize, 1);
         validateIntegerOption(CONNECTION_POOL_SIZE, connectionPoolSize, 1);
         validateIntegerOption(CONNECT_MAX_RETRIES, connectMaxRetries, 0);
+        validatePositiveDuration(HEARTBEAT_INTERVAL, heartbeatInterval);
+        validatePositiveDuration(CONNECT_TIMEOUT, connectTimeout);
         validateDistributionFactorUpper(distributionFactorUpper);
         validateDistributionFactorLower(distributionFactorLower);
 
@@ -346,6 +348,14 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
                         0.0d,
                         1.0d,
                         distributionFactorLower));
+    }
+
+    private void validatePositiveDuration(ConfigOption<Duration> option, Duration optionValue) {
+        checkState(
+                optionValue.toMillis() > 0,
+                String.format(
+                        "The value of option '%s' must be greater than 0 ms, but is %s",
+                        option.key(), optionValue));
     }
 
     /**

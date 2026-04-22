@@ -21,19 +21,28 @@ import org.apache.flink.cdc.common.annotation.Internal;
 import org.apache.flink.cdc.common.configuration.ConfigOption;
 import org.apache.flink.cdc.common.configuration.Configuration;
 import org.apache.flink.cdc.common.factories.Factory;
+import org.apache.flink.cdc.common.source.EventSourceProvider;
+import org.apache.flink.cdc.common.source.FlinkSourceProvider;
 import org.apache.flink.cdc.common.source.SupportedMetadataColumn;
+import org.apache.flink.cdc.connectors.base.source.IncrementalSource;
 import org.apache.flink.cdc.connectors.postgres.PostgresTestBase;
 import org.apache.flink.cdc.connectors.postgres.source.DatabaseNameMetadataColumn;
 import org.apache.flink.cdc.connectors.postgres.source.OpTsMetadataColumn;
 import org.apache.flink.cdc.connectors.postgres.source.PostgresDataSource;
+import org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions;
+import org.apache.flink.cdc.connectors.postgres.source.PostgresSourceBuilder;
 import org.apache.flink.cdc.connectors.postgres.source.SchemaNameMetadataColumn;
 import org.apache.flink.cdc.connectors.postgres.source.TableNameMetadataColumn;
+import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
+import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfigFactory;
 import org.apache.flink.table.api.ValidationException;
+import org.apache.flink.util.FlinkRuntimeException;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -243,6 +252,55 @@ public class PostgresDataSourceFactoryTest extends PostgresTestBase {
     }
 
     @Test
+    public void testRejectNonPositiveHeartbeatInterval() {
+        Map<String, String> options = baseOptions();
+        options.put(PostgresDataSourceOptions.HEARTBEAT_INTERVAL.key(), "0 ms");
+
+        PostgresDataSourceFactory factory = new PostgresDataSourceFactory();
+        Factory.Context context = new MockContext(Configuration.fromMap(options));
+
+        assertThatThrownBy(() -> factory.createDataSource(context))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(PostgresDataSourceOptions.HEARTBEAT_INTERVAL.key())
+                .hasMessageContaining("greater than 0 ms");
+    }
+
+    @Test
+    public void testRejectNonPositiveConnectTimeout() {
+        Map<String, String> options = baseOptions();
+        options.put(PostgresDataSourceOptions.CONNECT_TIMEOUT.key(), "0 ms");
+
+        PostgresDataSourceFactory factory = new PostgresDataSourceFactory();
+        Factory.Context context = new MockContext(Configuration.fromMap(options));
+
+        assertThatThrownBy(() -> factory.createDataSource(context))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(PostgresDataSourceOptions.CONNECT_TIMEOUT.key())
+                .hasMessageContaining("greater than 0 ms");
+    }
+
+    @Test
+    public void testEventSourceProviderUsesResolvedRuntimeConfig() {
+        Map<String, String> options = baseOptions();
+        options.put(PostgresDataSourceOptions.HEARTBEAT_INTERVAL.key(), "12 s");
+        options.put(PostgresDataSourceOptions.CONNECT_TIMEOUT.key(), "45 s");
+
+        PostgresDataSourceFactory factory = new PostgresDataSourceFactory();
+        Factory.Context context = new MockContext(Configuration.fromMap(options));
+        PostgresDataSource dataSource = (PostgresDataSource) factory.createDataSource(context);
+
+        EventSourceProvider provider = dataSource.getEventSourceProvider();
+        assertThat(provider).isInstanceOf(FlinkSourceProvider.class);
+
+        PostgresSourceConfig sourceConfig =
+                extractConfigFromProvider((FlinkSourceProvider) provider);
+        assertThat(sourceConfig.getDbzProperties().getProperty("heartbeat.interval.ms"))
+                .isEqualTo(String.valueOf(java.time.Duration.ofSeconds(12).toMillis()));
+        assertThat(sourceConfig.getConnectTimeout()).isEqualTo(java.time.Duration.ofSeconds(45));
+        assertThat(sourceConfig.getTableList()).isEqualTo(Arrays.asList("inventory.products"));
+    }
+
+    @Test
     public void testPrefixRequireOption() {
         Map<String, String> options = new HashMap<>();
         options.put(HOSTNAME.key(), POSTGRES_CONTAINER.getHost());
@@ -358,6 +416,32 @@ public class PostgresDataSourceFactoryTest extends PostgresTestBase {
         @Override
         public ClassLoader getClassLoader() {
             return this.getClassLoader();
+        }
+    }
+
+    private Map<String, String> baseOptions() {
+        Map<String, String> options = new HashMap<>();
+        options.put(HOSTNAME.key(), POSTGRES_CONTAINER.getHost());
+        options.put(
+                PG_PORT.key(), String.valueOf(POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT)));
+        options.put(USERNAME.key(), TEST_USER);
+        options.put(PASSWORD.key(), TEST_PASSWORD);
+        options.put(TABLES.key(), POSTGRES_CONTAINER.getDatabaseName() + ".inventory.prod\\.*");
+        options.put(SLOT_NAME.key(), slotName);
+        return options;
+    }
+
+    private static PostgresSourceConfig extractConfigFromProvider(FlinkSourceProvider provider) {
+        Object source = provider.getSource();
+        assertThat(source).isInstanceOf(PostgresSourceBuilder.PostgresIncrementalSource.class);
+        try {
+            Field configFactoryField = IncrementalSource.class.getDeclaredField("configFactory");
+            configFactoryField.setAccessible(true);
+            PostgresSourceConfigFactory configFactory =
+                    (PostgresSourceConfigFactory) configFactoryField.get(source);
+            return configFactory.create(0);
+        } catch (NoSuchFieldException | IllegalAccessException e) {
+            throw new FlinkRuntimeException(e);
         }
     }
 }
