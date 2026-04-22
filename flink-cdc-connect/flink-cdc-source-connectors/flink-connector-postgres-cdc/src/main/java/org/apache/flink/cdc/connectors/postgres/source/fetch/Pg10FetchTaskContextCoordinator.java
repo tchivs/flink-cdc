@@ -39,6 +39,7 @@ import io.debezium.connector.postgresql.spi.Snapshotter;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.source.spi.EventMetadataProvider;
 import io.debezium.relational.TableId;
+import io.debezium.relational.history.TableChanges;
 import io.debezium.schema.TopicSelector;
 
 import java.sql.SQLException;
@@ -139,10 +140,48 @@ final class Pg10FetchTaskContextCoordinator {
     }
 
     Pg10CaptureState buildInitialCaptureState(SourceSplitBase split) {
+        if (split.isStreamSplit()) {
+            StreamSplit streamSplit = split.asStreamSplit();
+            if (streamSplit.isPg10RoutingStateInitialized()) {
+                Pg10CaptureState restoredCaptureState =
+                        Pg10CaptureState.of(
+                                streamSplit.getPg10ChildToParentMapping(),
+                                streamSplit.getPg10ParentToChildrenMapping());
+                validateRestoredCaptureState(streamSplit, restoredCaptureState);
+                syncPg10CaptureState(restoredCaptureState, streamSplit);
+                return restoredCaptureState;
+            }
+        }
+
         PostgresSourceConfig pgSourceConfig = (PostgresSourceConfig) context.getSourceConfig();
         return Pg10CaptureState.of(
                 pgSourceConfig.getChildToParentMappingOrEmpty(),
                 pgSourceConfig.getParentToChildrenMappingOrEmpty());
+    }
+
+    private void validateRestoredCaptureState(
+            StreamSplit streamSplit, Pg10CaptureState restoredCaptureState) {
+        if (!(context.getDataSourceDialect() instanceof PostgresDialect)
+                || context.getConnection() == null) {
+            return;
+        }
+
+        List<TableId> parentTables =
+                derivePg10ParentTables(
+                        streamSplit, restoredCaptureState, context.getSourceConfig());
+        if (parentTables.isEmpty()) {
+            parentTables.addAll(restoredCaptureState.getParentToChildrenMapping().keySet());
+        }
+
+        try {
+            ((PostgresDialect) context.getDataSourceDialect())
+                    .validateRestoredPg10CaptureState(
+                            context.getConnection(), restoredCaptureState, parentTables);
+        } catch (SQLException e) {
+            throw new FlinkRuntimeException(
+                    "Failed to validate restored PG10 capture state: parentTables=" + parentTables,
+                    e);
+        }
     }
 
     void acceptPg10CaptureStateForRestart(
@@ -187,6 +226,32 @@ final class Pg10FetchTaskContextCoordinator {
         return value == null ? null : ((Number) value).longValue();
     }
 
+    static List<TableId> derivePg10ParentTables(
+            StreamSplit streamSplit,
+            Pg10CaptureState captureState,
+            org.apache.flink.cdc.connectors.base.config.SourceConfig sourceConfig) {
+        LinkedHashMap<TableId, TableId> knownChildToParent = new LinkedHashMap<>();
+        if (sourceConfig instanceof PostgresSourceConfig) {
+            knownChildToParent.putAll(
+                    ((PostgresSourceConfig) sourceConfig).getChildToParentMappingOrEmpty());
+        }
+        if (captureState != null) {
+            knownChildToParent.putAll(captureState.getChildToParentMapping());
+        }
+
+        List<TableId> parentTables = new ArrayList<>();
+        for (TableId tableId : streamSplit.getTableSchemas().keySet()) {
+            if (!knownChildToParent.containsKey(tableId)) {
+                parentTables.add(tableId);
+            }
+        }
+
+        if (parentTables.isEmpty() && captureState != null) {
+            parentTables.addAll(captureState.getParentToChildrenMapping().keySet());
+        }
+        return parentTables;
+    }
+
     void syncPg10CaptureState(Pg10CaptureState captureState, StreamSplit streamSplit) {
         PostgresSourceConfig pgSourceConfig = (PostgresSourceConfig) context.getSourceConfig();
         pgSourceConfig.setChildToParentMapping(captureState.getChildToParentMapping());
@@ -199,6 +264,19 @@ final class Pg10FetchTaskContextCoordinator {
         PostgresConnectorConfig dbzConfig =
                 context.createConfiguredConnectorConfig(streamSplit, captureState);
         context.setDbzConnectorConfig(dbzConfig);
+    }
+
+    void cachePg10CompensationTableSchemas(Map<TableId, TableChanges.TableChange> tableSchemas) {
+        if (tableSchemas.isEmpty()) {
+            return;
+        }
+
+        PostgresSourceConfig pgSourceConfig = (PostgresSourceConfig) context.getSourceConfig();
+        Map<TableId, TableChanges.TableChange> mergedSchemas =
+                new LinkedHashMap<>(pgSourceConfig.getPg10CompensationTableSchemasOrEmpty());
+        mergedSchemas.putAll(tableSchemas);
+        pgSourceConfig.setPg10CompensationTableSchemas(mergedSchemas);
+        context.setCompensationTableSchemas(mergedSchemas);
     }
 
     Optional<Pg10CaptureState> maybePrepareNextCaptureState(

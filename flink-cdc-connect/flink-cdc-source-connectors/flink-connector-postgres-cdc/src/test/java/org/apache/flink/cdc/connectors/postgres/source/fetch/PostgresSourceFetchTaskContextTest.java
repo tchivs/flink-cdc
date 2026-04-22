@@ -18,7 +18,10 @@
 package org.apache.flink.cdc.connectors.postgres.source.fetch;
 
 import org.apache.flink.cdc.connectors.base.options.StartupOptions;
+import org.apache.flink.cdc.connectors.base.source.meta.split.FinishedSnapshotSplitInfo;
+import org.apache.flink.cdc.connectors.base.source.meta.split.SnapshotSplit;
 import org.apache.flink.cdc.connectors.base.source.meta.split.StreamSplit;
+import org.apache.flink.cdc.connectors.base.source.reader.external.IncrementalSourceStreamFetcher;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfigFactory;
 import org.apache.flink.cdc.connectors.postgres.source.offset.PostgresOffsetFactory;
@@ -28,13 +31,20 @@ import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.connector.postgresql.PostgresOffsetContext;
 import io.debezium.connector.postgresql.SourceInfo;
 import io.debezium.connector.postgresql.connection.Lsn;
+import io.debezium.data.Envelope;
 import io.debezium.pipeline.spi.OffsetContext;
 import io.debezium.relational.TableId;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.source.SourceRecord;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -42,6 +52,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import static io.debezium.connector.AbstractSourceInfo.SCHEMA_NAME_KEY;
+import static io.debezium.connector.AbstractSourceInfo.TABLE_NAME_KEY;
 import static io.debezium.connector.postgresql.Utils.lastKnownLsn;
 
 /** Unit test for {@link PostgresSourceFetchTaskContext}. */
@@ -214,6 +226,148 @@ class PostgresSourceFetchTaskContextTest {
                 .isEqualTo(100L);
     }
 
+    @Test
+    void shouldRoutePg10ChildSourceRecordToParentKeySpace() {
+        TableId parentTable = new TableId(null, "inventory", "products");
+        TableId childTable = new TableId(null, "inventory", "products_ca");
+
+        PostgresSourceConfig sourceConfig = createSourceConfig();
+        sourceConfig.setChildToParentMapping(Collections.singletonMap(childTable, parentTable));
+        sourceConfig.setParentToChildrenMapping(
+                Collections.singletonMap(parentTable, Collections.singletonList(childTable)));
+        sourceConfig.setPg10PartitionMappingInitialized(true);
+
+        PostgresSourceFetchTaskContext fetchTaskContext =
+                new PostgresSourceFetchTaskContext(sourceConfig, null);
+        fetchTaskContext.syncPg10CaptureState(
+                createCaptureState(parentTable, Collections.singletonList(childTable)),
+                createMinimalStreamSplit());
+
+        Assertions.assertThat(fetchTaskContext.getTableId(createDataChangeRecord(childTable, 1)))
+                .isEqualTo(parentTable);
+    }
+
+    @Test
+    void shouldKeyPg10CompensationFinishedSplitInfoByRoutedParentTable() {
+        TableId parentTable = new TableId(null, "inventory", "products");
+        TableId childTable = new TableId(null, "inventory", "products_ca");
+
+        PostgresSourceConfig sourceConfig = createSourceConfig();
+        sourceConfig.setChildToParentMapping(Collections.singletonMap(childTable, parentTable));
+        sourceConfig.setParentToChildrenMapping(
+                Collections.singletonMap(parentTable, Collections.singletonList(childTable)));
+        sourceConfig.setPg10PartitionMappingInitialized(true);
+
+        PostgresSourceFetchTaskContext fetchTaskContext =
+                new PostgresSourceFetchTaskContext(sourceConfig, null);
+        fetchTaskContext.syncPg10CaptureState(
+                createCaptureState(parentTable, Collections.singletonList(childTable)),
+                createMinimalStreamSplit());
+
+        SnapshotSplit finishedCompensationSplit =
+                new SnapshotSplit(
+                        childTable,
+                        "pg10-compensation-inventory.products_ca:0",
+                        org.apache.flink.table.types.logical.RowType.of(
+                                new org.apache.flink.table.types.logical.LogicalType[] {
+                                    new org.apache.flink.table.types.logical.IntType()
+                                },
+                                new String[] {"id"}),
+                        null,
+                        null,
+                        new PostgresOffsetFactory()
+                                .newOffset(Collections.singletonMap("lsn", "123")),
+                        Collections.emptyMap());
+
+        Assertions.assertThat(
+                        fetchTaskContext
+                                .createPg10CompensationFinishedSplitInfo(finishedCompensationSplit)
+                                .getTableId())
+                .isEqualTo(parentTable);
+    }
+
+    @Test
+    void shouldEvaluatePg10ChildPureStreamGateAgainstParentKeySpace() throws Exception {
+        TableId parentTable = new TableId(null, "inventory", "products");
+        TableId childTable = new TableId(null, "inventory", "products_ca");
+        PostgresOffsetFactory offsetFactory = new PostgresOffsetFactory();
+
+        PostgresSourceConfig sourceConfig = createSourceConfig();
+        sourceConfig.setChildToParentMapping(Collections.singletonMap(childTable, parentTable));
+        sourceConfig.setParentToChildrenMapping(
+                Collections.singletonMap(parentTable, Collections.singletonList(childTable)));
+        sourceConfig.setPg10PartitionMappingInitialized(true);
+
+        PostgresSourceFetchTaskContext fetchTaskContext =
+                new PostgresSourceFetchTaskContext(sourceConfig, null) {
+                    @Override
+                    public boolean supportsSplitKeyOptimization() {
+                        return false;
+                    }
+
+                    @Override
+                    public boolean isRecordBetween(
+                            SourceRecord record, Object[] splitStart, Object[] splitEnd) {
+                        Integer key = ((Struct) record.key()).getInt32("id");
+                        int lowerBound =
+                                splitStart == null ? Integer.MIN_VALUE : (Integer) splitStart[0];
+                        int upperBound =
+                                splitEnd == null ? Integer.MAX_VALUE : (Integer) splitEnd[0];
+                        return key >= lowerBound && key < upperBound;
+                    }
+                };
+        fetchTaskContext.syncPg10CaptureState(
+                createCaptureState(parentTable, Collections.singletonList(childTable)),
+                createMinimalStreamSplit());
+
+        SnapshotSplit finishedCompensationSplit =
+                new SnapshotSplit(
+                        childTable,
+                        "pg10-compensation-inventory.products_ca:0",
+                        org.apache.flink.table.types.logical.RowType.of(
+                                new org.apache.flink.table.types.logical.LogicalType[] {
+                                    new org.apache.flink.table.types.logical.IntType()
+                                },
+                                new String[] {"id"}),
+                        null,
+                        null,
+                        offsetFactory.newOffset(Collections.singletonMap("lsn", "100")),
+                        Collections.emptyMap());
+        FinishedSnapshotSplitInfo compensationFinishedSplitInfo =
+                fetchTaskContext.createPg10CompensationFinishedSplitInfo(finishedCompensationSplit);
+
+        StreamSplit streamSplit =
+                new StreamSplit(
+                        StreamSplit.STREAM_SPLIT_ID,
+                        offsetFactory.createInitialOffset(),
+                        offsetFactory.createNoStoppingOffset(),
+                        Collections.singletonList(compensationFinishedSplitInfo),
+                        Collections.emptyMap(),
+                        1);
+        IncrementalSourceStreamFetcher fetcher =
+                new IncrementalSourceStreamFetcher(fetchTaskContext, 0);
+
+        Field currentStreamSplitField =
+                IncrementalSourceStreamFetcher.class.getDeclaredField("currentStreamSplit");
+        currentStreamSplitField.setAccessible(true);
+        currentStreamSplitField.set(fetcher, streamSplit);
+
+        Method configureFilter =
+                IncrementalSourceStreamFetcher.class.getDeclaredMethod("configureFilter");
+        configureFilter.setAccessible(true);
+        configureFilter.invoke(fetcher);
+
+        Method shouldEmit =
+                IncrementalSourceStreamFetcher.class.getDeclaredMethod(
+                        "shouldEmit", SourceRecord.class);
+        shouldEmit.setAccessible(true);
+
+        SourceRecord childPureStreamRecord = createDataChangeRecord(childTable, 20, "150");
+
+        Assertions.assertThat(compensationFinishedSplitInfo.getTableId()).isEqualTo(parentTable);
+        Assertions.assertThat((Boolean) shouldEmit.invoke(fetcher, childPureStreamRecord)).isTrue();
+    }
+
     private PostgresOffsetContext loadOffsetContext(Long lsn, Long lastCommitLsn) {
         return loadOffsetContext(lsn, null, lastCommitLsn);
     }
@@ -230,6 +384,54 @@ class PostgresSourceFetchTaskContextTest {
         }
         offsetValues.put(PostgresOffsetContext.LAST_COMMIT_LSN_KEY, lastCommitLsn);
         return offsetLoader.load(offsetValues);
+    }
+
+    private SourceRecord createDataChangeRecord(TableId tableId, int id) {
+        return createDataChangeRecord(tableId, id, "123");
+    }
+
+    private SourceRecord createDataChangeRecord(TableId tableId, int id, String lsn) {
+        Schema sourceSchema =
+                SchemaBuilder.struct()
+                        .field(SCHEMA_NAME_KEY, Schema.STRING_SCHEMA)
+                        .field(TABLE_NAME_KEY, Schema.STRING_SCHEMA)
+                        .field(Envelope.FieldName.TIMESTAMP, Schema.OPTIONAL_INT64_SCHEMA)
+                        .build();
+        Struct source =
+                new Struct(sourceSchema)
+                        .put(SCHEMA_NAME_KEY, tableId.schema())
+                        .put(TABLE_NAME_KEY, tableId.table())
+                        .put(Envelope.FieldName.TIMESTAMP, 0L);
+
+        Schema keySchema = SchemaBuilder.struct().field("id", Schema.INT32_SCHEMA).build();
+        Struct key = new Struct(keySchema).put("id", id);
+
+        Schema afterSchema = SchemaBuilder.struct().field("id", Schema.INT32_SCHEMA).build();
+        Struct after = new Struct(afterSchema).put("id", id);
+
+        Schema valueSchema =
+                SchemaBuilder.struct()
+                        .field(Envelope.FieldName.SOURCE, sourceSchema)
+                        .field(Envelope.FieldName.OPERATION, Schema.STRING_SCHEMA)
+                        .field(Envelope.FieldName.AFTER, afterSchema)
+                        .field(Envelope.FieldName.TIMESTAMP, Schema.OPTIONAL_INT64_SCHEMA)
+                        .build();
+        Struct value =
+                new Struct(valueSchema)
+                        .put(Envelope.FieldName.SOURCE, source)
+                        .put(Envelope.FieldName.OPERATION, Envelope.Operation.CREATE.code())
+                        .put(Envelope.FieldName.AFTER, after)
+                        .put(Envelope.FieldName.TIMESTAMP, 0L);
+
+        return new SourceRecord(
+                Collections.singletonMap("server", "test"),
+                Collections.singletonMap(SourceInfo.LSN_KEY, lsn),
+                "test-topic",
+                null,
+                keySchema,
+                key,
+                valueSchema,
+                value);
     }
 
     private PostgresSourceConfig createSourceConfig() {

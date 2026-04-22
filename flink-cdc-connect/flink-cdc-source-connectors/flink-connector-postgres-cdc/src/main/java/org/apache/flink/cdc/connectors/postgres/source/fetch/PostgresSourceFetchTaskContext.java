@@ -20,6 +20,7 @@ package org.apache.flink.cdc.connectors.postgres.source.fetch;
 import org.apache.flink.cdc.connectors.base.WatermarkDispatcher;
 import org.apache.flink.cdc.connectors.base.config.JdbcSourceConfig;
 import org.apache.flink.cdc.connectors.base.source.meta.offset.Offset;
+import org.apache.flink.cdc.connectors.base.source.meta.split.FinishedSnapshotSplitInfo;
 import org.apache.flink.cdc.connectors.base.source.meta.split.SnapshotSplit;
 import org.apache.flink.cdc.connectors.base.source.meta.split.SourceSplitBase;
 import org.apache.flink.cdc.connectors.base.source.meta.split.StreamSplit;
@@ -33,6 +34,7 @@ import org.apache.flink.cdc.connectors.postgres.source.schema.PostgresSchemaReco
 import org.apache.flink.cdc.connectors.postgres.source.schema.RelationAwarePostgresSchema;
 import org.apache.flink.cdc.connectors.postgres.source.utils.ChunkUtils;
 import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.util.FlinkRuntimeException;
 
 import io.debezium.DebeziumException;
 import io.debezium.config.Configuration;
@@ -62,6 +64,7 @@ import io.debezium.relational.Column;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
+import io.debezium.relational.history.TableChanges;
 import io.debezium.schema.TopicSelector;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.RetriableException;
@@ -73,6 +76,7 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -108,6 +112,8 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
     private Snapshotter snapShotter;
     private Map<TableId, TableId> childToParentMapping = Collections.emptyMap();
     private Map<TableId, List<TableId>> parentToChildrenMapping = Collections.emptyMap();
+    private Map<TableId, TableChanges.TableChange> compensationTableSchemas =
+            Collections.emptyMap();
     private final Pg10FetchTaskContextCoordinator pg10Coordinator;
 
     public PostgresSourceFetchTaskContext(
@@ -173,7 +179,9 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
         this.partition = new PostgresPartition(dbzConfig.getLogicalName());
         this.taskContext = PostgresObjectUtils.newTaskContext(dbzConfig, schema, topicSelector);
 
-        if (replicationConnection == null) {
+        if (shouldDeferPg10StreamingReplicationConnection(sourceSplitBase)) {
+            closeReplicationConnectionQuietly();
+        } else if (replicationConnection == null) {
             replicationConnection =
                     createReplicationConnection(
                             this.taskContext,
@@ -330,6 +338,36 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
         }
         if (replicationConnection != null) {
             replicationConnection.close();
+            replicationConnection = null;
+        }
+    }
+
+    private boolean shouldDeferPg10StreamingReplicationConnection(SourceSplitBase sourceSplitBase) {
+        if (!sourceSplitBase.isStreamSplit()) {
+            return false;
+        }
+
+        StreamSplit streamSplit = sourceSplitBase.asStreamSplit();
+        if (streamSplit.isPg10RoutingStateInitialized()) {
+            return true;
+        }
+
+        PostgresSourceConfig pgSourceConfig = (PostgresSourceConfig) sourceConfig;
+        return pgSourceConfig.isPg10PartitionMappingInitialized()
+                && !pgSourceConfig.getParentToChildrenMappingOrEmpty().isEmpty();
+    }
+
+    private void closeReplicationConnectionQuietly() {
+        if (replicationConnection == null) {
+            return;
+        }
+
+        try {
+            replicationConnection.close();
+        } catch (Exception e) {
+            LOG.warn("Failed to close stale replication connection before PG10 runtime rebuild", e);
+        } finally {
+            replicationConnection = null;
         }
     }
 
@@ -373,6 +411,7 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
     private void initializePartitionMappings(PostgresSourceConfig pgSourceConfig) {
         this.childToParentMapping = pgSourceConfig.getChildToParentMappingOrEmpty();
         this.parentToChildrenMapping = pgSourceConfig.getParentToChildrenMappingOrEmpty();
+        this.compensationTableSchemas = pgSourceConfig.getPg10CompensationTableSchemasOrEmpty();
     }
 
     private PostgresConnectorConfig createConfiguredConnectorConfig(
@@ -530,6 +569,69 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
         return tableId.schema() + "." + tableId.table();
     }
 
+    public SnapshotSplit createPg10CompensationSnapshotSplit(TableId childTableId) {
+        TableChanges.TableChange tableChange = compensationTableSchemas.get(childTableId);
+        if (tableChange == null) {
+            throw new FlinkRuntimeException(
+                    String.format(
+                            "Missing PG10 compensation schema for child partition '%s'",
+                            childTableId));
+        }
+
+        Table table = tableChange.getTable();
+        RowType splitType = getSplitType(table);
+        return new SnapshotSplit(
+                childTableId,
+                String.format("pg10-compensation-%s:0", childTableId),
+                splitType,
+                null,
+                null,
+                null,
+                Collections.singletonMap(childTableId, tableChange));
+    }
+
+    public FinishedSnapshotSplitInfo createPg10CompensationFinishedSplitInfo(
+            SnapshotSplit snapshotSplit) {
+        if (!snapshotSplit.isSnapshotReadFinished()) {
+            throw new FlinkRuntimeException(
+                    String.format(
+                            "PG10 compensation snapshot split '%s' has no high watermark",
+                            snapshotSplit.splitId()));
+        }
+
+        return new FinishedSnapshotSplitInfo(
+                routeTableId(snapshotSplit.getTableId()),
+                snapshotSplit.splitId(),
+                snapshotSplit.getSplitStart(),
+                snapshotSplit.getSplitEnd(),
+                snapshotSplit.getHighWatermark(),
+                new org.apache.flink.cdc.connectors.postgres.source.offset.PostgresOffsetFactory());
+    }
+
+    public Map<TableId, TableChanges.TableChange> discoverCompensationTableSchemas(
+            Collection<TableId> childTableIds) {
+        if (childTableIds.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        try (io.debezium.jdbc.JdbcConnection jdbc =
+                dataSourceDialect.openJdbcConnection(sourceConfig)) {
+            Map<TableId, TableChanges.TableChange> discoveredSchemas = new LinkedHashMap<>();
+            for (TableId childTableId : childTableIds) {
+                discoveredSchemas.put(
+                        childTableId,
+                        ((PostgresDialect) dataSourceDialect).queryTableSchema(jdbc, childTableId));
+            }
+            return discoveredSchemas;
+        } catch (Exception e) {
+            throw new FlinkRuntimeException(
+                    String.format(
+                            "Failed to discover PG10 compensation schemas for child partitions %s",
+                            childTableIds),
+                    e);
+        }
+    }
+
     private String appendChildTablesToIncludeList(
             String includeList, Collection<TableId> childTables) {
         if (childTables.isEmpty()) {
@@ -589,7 +691,7 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
         pg10Coordinator.closeStreamingRuntime(runtime);
     }
 
-    /** Builds the initial Pg10CaptureState from the current source configuration. */
+    /** Builds the initial Pg10CaptureState, preferring restored stream-split routing state. */
     public Pg10CaptureState buildInitialCaptureState(SourceSplitBase split) {
         return pg10Coordinator.buildInitialCaptureState(split);
     }
@@ -621,6 +723,34 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
         pg10Coordinator.syncPg10CaptureState(captureState, streamSplit);
     }
 
+    public void cachePg10CompensationTableSchemas(
+            Map<TableId, TableChanges.TableChange> tableSchemas) {
+        pg10Coordinator.cachePg10CompensationTableSchemas(tableSchemas);
+    }
+
+    public void cachePg10CompensationFinishedSplitInfos(
+            Collection<FinishedSnapshotSplitInfo> finishedSplitInfos) {
+        if (finishedSplitInfos.isEmpty()) {
+            return;
+        }
+
+        PostgresSourceConfig pgSourceConfig = (PostgresSourceConfig) sourceConfig;
+        Map<String, FinishedSnapshotSplitInfo> mergedInfos = new LinkedHashMap<>();
+        for (FinishedSnapshotSplitInfo existingInfo :
+                pgSourceConfig.getPg10CompensationFinishedSplitInfosOrEmpty()) {
+            mergedInfos.put(existingInfo.getSplitId(), existingInfo);
+        }
+        for (FinishedSnapshotSplitInfo finishedSplitInfo : finishedSplitInfos) {
+            mergedInfos.put(finishedSplitInfo.getSplitId(), finishedSplitInfo);
+        }
+        pgSourceConfig.setPg10CompensationFinishedSplitInfos(new ArrayList<>(mergedInfos.values()));
+    }
+
+    public PostgresSourceFetchTaskContext createPg10CompensationFetchContext() {
+        return new PostgresSourceFetchTaskContext(
+                (JdbcSourceConfig) sourceConfig, (PostgresDialect) dataSourceDialect);
+    }
+
     /**
      * Reconciles current catalog state and returns the next accepted capture state.
      *
@@ -647,5 +777,10 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
 
     void setParentToChildrenMapping(Map<TableId, List<TableId>> parentToChildrenMapping) {
         this.parentToChildrenMapping = parentToChildrenMapping;
+    }
+
+    void setCompensationTableSchemas(
+            Map<TableId, TableChanges.TableChange> compensationTableSchemas) {
+        this.compensationTableSchemas = compensationTableSchemas;
     }
 }
