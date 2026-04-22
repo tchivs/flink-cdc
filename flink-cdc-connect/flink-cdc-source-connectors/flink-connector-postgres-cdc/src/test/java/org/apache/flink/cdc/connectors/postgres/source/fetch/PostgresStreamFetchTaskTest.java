@@ -17,6 +17,17 @@
 
 package org.apache.flink.cdc.connectors.postgres.source.fetch;
 
+import org.apache.flink.cdc.connectors.base.options.StartupOptions;
+import org.apache.flink.cdc.connectors.base.source.meta.split.FinishedSnapshotSplitInfo;
+import org.apache.flink.cdc.connectors.base.source.meta.split.SnapshotSplit;
+import org.apache.flink.cdc.connectors.base.source.meta.split.StreamSplit;
+import org.apache.flink.cdc.connectors.base.source.meta.wartermark.WatermarkEvent;
+import org.apache.flink.cdc.connectors.base.source.meta.wartermark.WatermarkKind;
+import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
+import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfigFactory;
+import org.apache.flink.cdc.connectors.postgres.source.offset.PostgresOffset;
+import org.apache.flink.cdc.connectors.postgres.source.offset.PostgresOffsetFactory;
+import org.apache.flink.cdc.connectors.postgres.source.utils.Pg10PartitionReconciler;
 import org.apache.flink.cdc.connectors.postgres.testutils.TestHelper;
 
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
@@ -24,17 +35,21 @@ import io.debezium.connector.postgresql.PostgresOffsetContext;
 import io.debezium.connector.postgresql.SourceInfo;
 import io.debezium.connector.postgresql.connection.Lsn;
 import io.debezium.connector.postgresql.connection.ReplicationConnection;
+import io.debezium.pipeline.DataChangeEvent;
 import io.debezium.relational.TableId;
+import org.apache.kafka.connect.source.SourceRecord;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
 import java.lang.reflect.Method;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -52,10 +67,10 @@ class PostgresStreamFetchTaskTest {
     void testCaptureStateIsImmutable() {
         TableId parent = new TableId(null, "schema", "parent");
         TableId child1 = new TableId(null, "schema", "child1");
-        Map<TableId, TableId> childToParent = new java.util.HashMap<>();
+        Map<TableId, TableId> childToParent = new HashMap<>();
         childToParent.put(child1, parent);
-        Map<TableId, java.util.List<TableId>> parentToChildren = new java.util.HashMap<>();
-        parentToChildren.put(parent, java.util.Collections.singletonList(child1));
+        Map<TableId, java.util.List<TableId>> parentToChildren = new HashMap<>();
+        parentToChildren.put(parent, Collections.singletonList(child1));
 
         Pg10CaptureState state = Pg10CaptureState.of(childToParent, parentToChildren);
 
@@ -101,17 +116,17 @@ class PostgresStreamFetchTaskTest {
                                 parentProducts, Arrays.asList(childUk, childCa, childAu)));
 
         Map<TableId, TableId> newChildrenFromFirstRestart =
-                new java.util.HashMap<>(afterCa.getChildToParentMapping());
+                new HashMap<>(afterCa.getChildToParentMapping());
         newChildrenFromFirstRestart.keySet().removeAll(original.getChildToParentMapping().keySet());
 
         Map<TableId, TableId> newChildrenFromStaleSecondRestart =
-                new java.util.HashMap<>(afterAu.getChildToParentMapping());
+                new HashMap<>(afterAu.getChildToParentMapping());
         newChildrenFromStaleSecondRestart
                 .keySet()
                 .removeAll(original.getChildToParentMapping().keySet());
 
         Map<TableId, TableId> newChildrenFromSecondRestart =
-                new java.util.HashMap<>(afterAu.getChildToParentMapping());
+                new HashMap<>(afterAu.getChildToParentMapping());
         newChildrenFromSecondRestart.keySet().removeAll(afterCa.getChildToParentMapping().keySet());
 
         Assertions.assertThat(newChildrenFromFirstRestart).containsOnlyKeys(childCa);
@@ -456,6 +471,349 @@ class PostgresStreamFetchTaskTest {
                 .isFalse();
     }
 
+    @Test
+    void testShouldStartPollerOnlyWhenPublicationConfigAndPg10StatePresent() {
+        PostgresSourceConfig config = createSourceConfig(true);
+        TableId parent = new TableId(null, "inventory", "products");
+        TableId child = new TableId(null, "inventory", "products_ca");
+        Pg10CaptureState captureState =
+                Pg10CaptureState.of(
+                        Collections.singletonMap(child, parent),
+                        Collections.singletonMap(parent, Collections.singletonList(child)));
+
+        Assertions.assertThat(
+                        Pg10StreamFetchTask.shouldStartPg10PublicationPoller(
+                                config, "dbz_publication", captureState))
+                .isTrue();
+        Assertions.assertThat(
+                        Pg10StreamFetchTask.shouldStartPg10PublicationPoller(
+                                config, "   ", captureState))
+                .isFalse();
+        Assertions.assertThat(
+                        Pg10StreamFetchTask.shouldStartPg10PublicationPoller(
+                                config,
+                                "dbz_publication",
+                                Pg10CaptureState.of(
+                                        Collections.emptyMap(), Collections.emptyMap())))
+                .isFalse();
+
+        PostgresSourceConfig disabledPartitionConfig = createSourceConfig(false);
+        Assertions.assertThat(
+                        Pg10StreamFetchTask.shouldStartPg10PublicationPoller(
+                                disabledPartitionConfig, "dbz_publication", captureState))
+                .isFalse();
+    }
+
+    @Test
+    void testResolvePublicationPollIntervalUsesConfiguredStartupFastPollWindow() {
+        PostgresSourceConfigFactory configFactory = new PostgresSourceConfigFactory();
+        configFactory.hostname("localhost");
+        configFactory.port(5432);
+        configFactory.database("inventory");
+        configFactory.username("postgres");
+        configFactory.password("postgres");
+        configFactory.startupOptions(StartupOptions.initial());
+        configFactory.setIncludePartitionedTables(true);
+        configFactory.setPg10PublicationPollInterval(Duration.ofSeconds(15));
+        configFactory.setPg10StartupFastPollInterval(Duration.ofSeconds(2));
+        configFactory.setPg10StartupFastPollDuration(Duration.ofSeconds(20));
+        PostgresSourceConfig config = configFactory.create(0);
+
+        Assertions.assertThat(
+                        Pg10StreamFetchTask.resolvePg10PublicationPollIntervalMillis(config, 0L))
+                .isEqualTo(Duration.ofSeconds(2).toMillis());
+        Assertions.assertThat(
+                        Pg10StreamFetchTask.resolvePg10PublicationPollIntervalMillis(
+                                config, Duration.ofSeconds(5).toMillis()))
+                .isEqualTo(Duration.ofSeconds(2).toMillis());
+        Assertions.assertThat(
+                        Pg10StreamFetchTask.resolvePg10PublicationPollIntervalMillis(
+                                config, Duration.ofSeconds(20).toMillis()))
+                .isEqualTo(Duration.ofSeconds(15).toMillis());
+    }
+
+    @Test
+    void testResolvePublicationPollIntervalFallsBackToSteadyPollWhenStartupFastPollDisabled() {
+        PostgresSourceConfigFactory configFactory = new PostgresSourceConfigFactory();
+        configFactory.hostname("localhost");
+        configFactory.port(5432);
+        configFactory.database("inventory");
+        configFactory.username("postgres");
+        configFactory.password("postgres");
+        configFactory.startupOptions(StartupOptions.initial());
+        configFactory.setPg10PublicationPollInterval(Duration.ofSeconds(9));
+        configFactory.setPg10StartupFastPollInterval(Duration.ofSeconds(1));
+        configFactory.setPg10StartupFastPollDuration(Duration.ZERO);
+        PostgresSourceConfig config = configFactory.create(0);
+
+        Assertions.assertThat(
+                        Pg10StreamFetchTask.resolvePg10PublicationPollIntervalMillis(config, 0L))
+                .isEqualTo(Duration.ofSeconds(9).toMillis());
+    }
+
+    @Test
+    void testResolvePublicationPollIntervalRejectsNonPositiveSteadyInterval() {
+        PostgresSourceConfigFactory configFactory = createBasePollConfigFactory();
+        configFactory.setPg10PublicationPollInterval(Duration.ZERO);
+        PostgresSourceConfig config = configFactory.create(0);
+
+        Assertions.assertThatThrownBy(
+                        () ->
+                                Pg10StreamFetchTask.resolvePg10PublicationPollIntervalMillis(
+                                        config, 0L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("greater than 0 ms")
+                .hasMessageContaining("PT0S");
+    }
+
+    @Test
+    void testResolvePublicationPollIntervalRejectsNonPositiveStartupFastInterval() {
+        PostgresSourceConfigFactory configFactory = createBasePollConfigFactory();
+        configFactory.setPg10PublicationPollInterval(Duration.ofSeconds(9));
+        configFactory.setPg10StartupFastPollInterval(Duration.ZERO);
+        configFactory.setPg10StartupFastPollDuration(Duration.ofSeconds(5));
+        PostgresSourceConfig config = configFactory.create(0);
+
+        Assertions.assertThatThrownBy(
+                        () ->
+                                Pg10StreamFetchTask.resolvePg10PublicationPollIntervalMillis(
+                                        config, 0L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("greater than 0 ms")
+                .hasMessageContaining("PT0S");
+    }
+
+    @Test
+    void testPollerRestartGateOnlyUsesConfirmedPublishedChildren() {
+        TableId childCa = new TableId(null, "inventory", "products_ca");
+        TableId childAu = new TableId(null, "inventory", "products_au");
+        AtomicBoolean refreshRequested = new AtomicBoolean(false);
+
+        Assertions.assertThat(
+                        Pg10StreamFetchTask.getConfirmedPublishedButUnacceptedChildren(
+                                Arrays.asList(childCa, childAu),
+                                Collections.singletonList(childAu)))
+                .containsExactly(childCa);
+        Assertions.assertThat(
+                        Pg10StreamFetchTask.shouldTriggerFallbackRestartAfterPublicationRefresh(
+                                Pg10StreamFetchTask.getConfirmedPublishedButUnacceptedChildren(
+                                        Collections.singletonList(childAu),
+                                        Collections.singletonList(childAu)),
+                                refreshRequested))
+                .isFalse();
+        Assertions.assertThat(
+                        Pg10StreamFetchTask.shouldTriggerFallbackRestartAfterPublicationRefresh(
+                                Pg10StreamFetchTask.getConfirmedPublishedButUnacceptedChildren(
+                                        Arrays.asList(childCa, childAu),
+                                        Collections.singletonList(childAu)),
+                                refreshRequested))
+                .isTrue();
+    }
+
+    @Test
+    void testFreshlyDiscoveredChildrenExcludeExistingRestartGateMembers() {
+        TableId childCa = new TableId(null, "inventory", "products_ca");
+        TableId childAu = new TableId(null, "inventory", "products_au");
+
+        Assertions.assertThat(
+                        Pg10StreamFetchTask.getFreshlyDiscoveredChildren(
+                                Arrays.asList(childCa, childAu), Collections.singleton(childAu)))
+                .containsExactly(childCa);
+        Assertions.assertThat(
+                        Pg10StreamFetchTask.getFreshlyDiscoveredChildren(
+                                Collections.singletonList(childAu), Collections.singleton(childAu)))
+                .isEmpty();
+    }
+
+    @Test
+    void testAcceptedNewChildrenOnlyIncludeFreshlyAcceptedRuntimeChildren() throws Exception {
+        TableId parent = new TableId(null, "inventory", "products");
+        TableId existingChild = new TableId(null, "inventory", "products_uk");
+        TableId acceptedNewChild = new TableId(null, "inventory", "products_ca");
+        TableId stillUnacceptedChild = new TableId(null, "inventory", "products_au");
+
+        Pg10CaptureState previousCaptureState =
+                Pg10CaptureState.of(
+                        Collections.singletonMap(existingChild, parent),
+                        Collections.singletonMap(parent, Collections.singletonList(existingChild)));
+        Pg10CaptureState acceptedCaptureState =
+                Pg10CaptureState.of(
+                        new LinkedHashMap<TableId, TableId>() {
+                            {
+                                put(existingChild, parent);
+                                put(acceptedNewChild, parent);
+                            }
+                        },
+                        Collections.singletonMap(
+                                parent, Arrays.asList(existingChild, acceptedNewChild)));
+        Pg10PartitionReconciler.Pg10ReconcileResult reconcileResult =
+                Pg10PartitionReconciler.Pg10ReconcileResult.from(
+                        previousCaptureState.getParentToChildrenMapping(),
+                        previousCaptureState.getChildToParentMapping(),
+                        Collections.singletonMap(
+                                parent,
+                                Arrays.asList(
+                                        existingChild, acceptedNewChild, stillUnacceptedChild)),
+                        new LinkedHashMap<TableId, TableId>() {
+                            {
+                                put(existingChild, parent);
+                                put(acceptedNewChild, parent);
+                                put(stillUnacceptedChild, parent);
+                            }
+                        });
+
+        Method method =
+                Pg10StreamFetchTask.class.getDeclaredMethod(
+                        "getAcceptedNewChildren",
+                        Pg10CaptureState.class,
+                        Pg10CaptureState.class,
+                        Pg10PartitionReconciler.Pg10ReconcileResult.class);
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        List<TableId> acceptedNewChildren =
+                (List<TableId>)
+                        method.invoke(
+                                new Pg10StreamFetchTask(createMinimalStreamSplit()),
+                                previousCaptureState,
+                                acceptedCaptureState,
+                                reconcileResult);
+
+        Assertions.assertThat(acceptedNewChildren).containsExactly(acceptedNewChild);
+    }
+
+    @Test
+    void testMarkPg10CompensationSplitFinishedUsesRestartBoundaryAsHighWatermark()
+            throws Exception {
+        TableId childCa = new TableId(null, "inventory", "products_ca");
+        SnapshotSplit compensationSnapshotSplit =
+                new SnapshotSplit(
+                        childCa,
+                        "pg10-compensation-inventory.products_ca:0",
+                        org.apache.flink.table.types.logical.RowType.of(
+                                new org.apache.flink.table.types.logical.LogicalType[] {
+                                    new org.apache.flink.table.types.logical.IntType()
+                                },
+                                new String[] {"id"}),
+                        null,
+                        null,
+                        null,
+                        Collections.emptyMap());
+        PostgresOffset restartBoundary =
+                PostgresOffset.of(Collections.singletonMap(SourceInfo.LSN_KEY, "12345"));
+
+        Method method =
+                Pg10StreamFetchTask.class.getDeclaredMethod(
+                        "markPg10CompensationSplitFinished",
+                        SnapshotSplit.class,
+                        PostgresOffset.class);
+        method.setAccessible(true);
+
+        SnapshotSplit finishedSplit =
+                (SnapshotSplit)
+                        method.invoke(
+                                new Pg10StreamFetchTask(createMinimalStreamSplit()),
+                                compensationSnapshotSplit,
+                                restartBoundary);
+
+        Assertions.assertThat(finishedSplit.isSnapshotReadFinished()).isTrue();
+        Assertions.assertThat(finishedSplit.getHighWatermark()).isEqualTo(restartBoundary);
+        FinishedSnapshotSplitInfo finishedSplitInfo =
+                new FinishedSnapshotSplitInfo(
+                        finishedSplit.getTableId(),
+                        finishedSplit.splitId(),
+                        finishedSplit.getSplitStart(),
+                        finishedSplit.getSplitEnd(),
+                        finishedSplit.getHighWatermark(),
+                        new PostgresOffsetFactory());
+        Assertions.assertThat(finishedSplitInfo.getHighWatermark()).isEqualTo(restartBoundary);
+    }
+
+    @Test
+    void testDrainPg10CompensationQueueCollectsAllBatchesWithoutForwardingEndWatermark()
+            throws Exception {
+        PostgresSourceFetchTaskContext sourceFetchContext =
+                Mockito.mock(PostgresSourceFetchTaskContext.class);
+        PostgresSourceFetchTaskContext compensationContext =
+                Mockito.mock(PostgresSourceFetchTaskContext.class);
+        PostgresScanFetchTask compensationFetchTask = Mockito.mock(PostgresScanFetchTask.class);
+        io.debezium.connector.base.ChangeEventQueue<DataChangeEvent> sourceQueue =
+                Mockito.mock(io.debezium.connector.base.ChangeEventQueue.class);
+        io.debezium.connector.base.ChangeEventQueue<DataChangeEvent> compensationQueue =
+                Mockito.mock(io.debezium.connector.base.ChangeEventQueue.class);
+
+        SourceRecord record1 = Mockito.mock(SourceRecord.class);
+        SourceRecord record2 = Mockito.mock(SourceRecord.class);
+        SourceRecord record3 = Mockito.mock(SourceRecord.class);
+        SourceRecord endWatermarkRecord =
+                WatermarkEvent.create(
+                        Collections.singletonMap("server", "test"),
+                        "test-topic",
+                        "pg10-compensation-inventory.products_ca:0",
+                        WatermarkKind.END,
+                        PostgresOffset.of(Collections.singletonMap(SourceInfo.LSN_KEY, 123L)));
+
+        Mockito.when(sourceFetchContext.getQueue()).thenReturn(sourceQueue);
+        Mockito.when(compensationContext.getQueue()).thenReturn(compensationQueue);
+        Mockito.when(compensationQueue.poll())
+                .thenReturn(
+                        Collections.singletonList(new DataChangeEvent(record1)),
+                        Arrays.asList(
+                                new DataChangeEvent(record2),
+                                new DataChangeEvent(record3),
+                                new DataChangeEvent(endWatermarkRecord)));
+        Mockito.when(compensationFetchTask.getSplit())
+                .thenReturn(
+                        new SnapshotSplit(
+                                new TableId(null, "inventory", "products_ca"),
+                                "pg10-compensation-inventory.products_ca:0",
+                                org.apache.flink.table.types.logical.RowType.of(
+                                        new org.apache.flink.table.types.logical.LogicalType[] {
+                                            new org.apache.flink.table.types.logical.IntType()
+                                        },
+                                        new String[] {"id"}),
+                                null,
+                                null,
+                                null,
+                                Collections.emptyMap()));
+
+        Method method =
+                Pg10StreamFetchTask.class.getDeclaredMethod(
+                        "drainPg10CompensationQueue",
+                        PostgresSourceFetchTaskContext.class,
+                        PostgresSourceFetchTaskContext.class,
+                        PostgresScanFetchTask.class);
+        method.setAccessible(true);
+
+        long forwardedRecordCount =
+                (long)
+                        method.invoke(
+                                new Pg10StreamFetchTask(createMinimalStreamSplit()),
+                                sourceFetchContext,
+                                compensationContext,
+                                compensationFetchTask);
+
+        Assertions.assertThat(forwardedRecordCount).isEqualTo(3L);
+        Mockito.verify(compensationQueue, Mockito.times(2)).poll();
+        Mockito.verify(sourceQueue).enqueue(Mockito.argThat(event -> event.getRecord() == record1));
+        Mockito.verify(sourceQueue).enqueue(Mockito.argThat(event -> event.getRecord() == record2));
+        Mockito.verify(sourceQueue).enqueue(Mockito.argThat(event -> event.getRecord() == record3));
+        Mockito.verify(sourceQueue, Mockito.times(3)).enqueue(Mockito.any(DataChangeEvent.class));
+        Mockito.verify(sourceQueue, Mockito.never())
+                .enqueue(Mockito.argThat(event -> event.getRecord() == endWatermarkRecord));
+    }
+
+    private static StreamSplit createMinimalStreamSplit() {
+        PostgresOffsetFactory offsetFactory = new PostgresOffsetFactory();
+        return new StreamSplit(
+                StreamSplit.STREAM_SPLIT_ID,
+                offsetFactory.createInitialOffset(),
+                offsetFactory.createNoStoppingOffset(),
+                Collections.emptyList(),
+                Collections.emptyMap(),
+                0);
+    }
+
     private static boolean waitForRestartGateOrCompletedAttempt(
             Future<Boolean> relationAttempt,
             Future<Boolean> pollerAttempt,
@@ -469,5 +827,29 @@ class PostgresStreamFetchTaskTest {
             Thread.sleep(10L);
         }
         return false;
+    }
+
+    private static PostgresSourceConfig createSourceConfig(boolean includePartitionedTables) {
+        PostgresSourceConfigFactory configFactory = new PostgresSourceConfigFactory();
+        configFactory.hostname("localhost");
+        configFactory.port(5432);
+        configFactory.database("inventory");
+        configFactory.username("postgres");
+        configFactory.password("postgres");
+        configFactory.startupOptions(StartupOptions.initial());
+        configFactory.setIncludePartitionedTables(includePartitionedTables);
+        return configFactory.create(0);
+    }
+
+    private static PostgresSourceConfigFactory createBasePollConfigFactory() {
+        PostgresSourceConfigFactory configFactory = new PostgresSourceConfigFactory();
+        configFactory.hostname("localhost");
+        configFactory.port(5432);
+        configFactory.database("inventory");
+        configFactory.username("postgres");
+        configFactory.password("postgres");
+        configFactory.startupOptions(StartupOptions.initial());
+        configFactory.setIncludePartitionedTables(true);
+        return configFactory;
     }
 }

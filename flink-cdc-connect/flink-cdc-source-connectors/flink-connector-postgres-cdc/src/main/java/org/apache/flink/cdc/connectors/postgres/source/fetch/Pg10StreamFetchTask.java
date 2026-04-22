@@ -17,9 +17,12 @@
 
 package org.apache.flink.cdc.connectors.postgres.source.fetch;
 
+import org.apache.flink.cdc.connectors.base.source.meta.split.FinishedSnapshotSplitInfo;
+import org.apache.flink.cdc.connectors.base.source.meta.split.SnapshotSplit;
 import org.apache.flink.cdc.connectors.base.source.meta.split.StreamSplit;
 import org.apache.flink.cdc.connectors.postgres.source.PostgresDialect;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
+import org.apache.flink.cdc.connectors.postgres.source.offset.PostgresOffset;
 import org.apache.flink.cdc.connectors.postgres.source.schema.RelationAwarePostgresSchema;
 import org.apache.flink.cdc.connectors.postgres.source.utils.Pg10PartitionReconciler;
 import org.apache.flink.cdc.connectors.postgres.source.utils.Pg10PublicationManager;
@@ -29,10 +32,13 @@ import io.debezium.connector.postgresql.PostgresOffsetContext;
 import io.debezium.connector.postgresql.SourceInfo;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.connection.ReplicationConnection;
+import io.debezium.pipeline.DataChangeEvent;
 import io.debezium.relational.TableId;
+import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -43,6 +49,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+
+import static org.apache.flink.cdc.connectors.base.source.meta.wartermark.WatermarkEvent.isEndWatermarkEvent;
 
 /**
  * PG10-specific streaming fetch task that supports dynamic child partition discovery and session
@@ -57,9 +65,9 @@ import java.util.concurrent.atomic.AtomicReference;
  *   <li>A <b>Relation message listener</b> that detects new child partitions in the WAL stream with
  *       zero latency, leveraging the pgoutput protocol guarantee that a Relation ('R') message is
  *       sent before any DML for a new table.
- *   <li>A <b>lightweight publication poller</b> (30s interval) that adds newly created child
- *       partitions to the publication via ALTER PUBLICATION ADD TABLE — a prerequisite for pgoutput
- *       to send Relation messages for those tables.
+ *   <li>A <b>lightweight publication poller</b> with configurable steady/startup intervals that
+ *       adds newly created child partitions to the publication via ALTER PUBLICATION ADD TABLE — a
+ *       prerequisite for pgoutput to send Relation messages for those tables.
  * </ul>
  *
  * <p>For non-PG10 scenarios, use the base {@link PostgresStreamFetchTask} directly.
@@ -67,7 +75,18 @@ import java.util.concurrent.atomic.AtomicReference;
 public class Pg10StreamFetchTask extends PostgresStreamFetchTask {
 
     private static final Logger LOG = LoggerFactory.getLogger(Pg10StreamFetchTask.class);
-    private static final long PG10_PUBLICATION_POLL_INTERVAL_MILLIS = 30_000L;
+    private static final String PG10_CHILD_DISCOVERED_LOG =
+            "PG10 child discovered [splitId={}, publication={}, children={}, childCount={}, acceptedChildCount={}].";
+    private static final String PG10_RELATION_RESTART_REQUESTED_LOG =
+            "PG10 relation-triggered restart requested [splitId={}, child={}, publishedButUnacceptedChildren={}].";
+    private static final String PG10_POLL_RESTART_REQUESTED_LOG =
+            "PG10 poll-triggered restart requested [splitId={}, publication={}, child={}, confirmedChildren={}, childCount={}].";
+    private static final String PG10_COMPENSATION_BACKFILL_STARTED_LOG =
+            "PG10 compensation backfill started [splitId={}, child={}, restartBoundary={}].";
+    private static final String PG10_COMPENSATION_BACKFILL_COMPLETED_LOG =
+            "PG10 compensation backfill completed [splitId={}, child={}, forwardedRecordCount={}, restartBoundary={}].";
+    private static final String PG10_COMPENSATION_BACKFILL_SKIPPED_LOG =
+            "PG10 compensation backfill skipped [splitId={}, acceptedChildren={}, childCount={}, reason={}].";
 
     private volatile Pg10CaptureState currentCaptureState;
     private volatile PostgresOffsetContext currentOffsetContext;
@@ -231,7 +250,10 @@ public class Pg10StreamFetchTask extends PostgresStreamFetchTask {
         PostgresSourceConfig pgSourceConfig =
                 (PostgresSourceConfig) sourceFetchContext.getSourceConfig();
         List<TableId> parentTables =
-                new ArrayList<>(getSplit().asStreamSplit().getTableSchemas().keySet());
+                Pg10FetchTaskContextCoordinator.derivePg10ParentTables(
+                        getSplit().asStreamSplit(),
+                        captureState,
+                        sourceFetchContext.getSourceConfig());
 
         // Use a single JDBC connection for reconciliation. Publication mutation remains
         // poller-owned.
@@ -257,12 +279,27 @@ public class Pg10StreamFetchTask extends PostgresStreamFetchTask {
                                 parentTables,
                                 publishedButUnacceptedChildren);
                 if (nextCaptureState.isPresent()) {
-                    this.currentCaptureState = nextCaptureState.get();
+                    Pg10CaptureState acceptedCaptureState = nextCaptureState.get();
+                    List<TableId> acceptedNewChildren =
+                            getAcceptedNewChildren(
+                                    captureState, acceptedCaptureState, reconcileResult);
+                    maybePreparePg10CompensationBackfill(
+                            sourceFetchContext,
+                            pgSourceConfig,
+                            acceptedNewChildren,
+                            restartOffsetContext);
+                    this.currentCaptureState = acceptedCaptureState;
                     removeAcceptedChildrenFromRestartGate(
                             this.currentCaptureState.getChildToParentMapping());
                     this.currentOffsetContext = restartOffsetContext;
                     sourceFetchContext.acceptPg10CaptureStateForRestart(
                             currentCaptureState, currentOffsetContext, getSplit().asStreamSplit());
+                    LOG.info(
+                            "PG10 accepted runtime child partitions [split={}, trigger={}, acceptedChildren={}, acceptedChildCount={}].",
+                            getSplit().splitId(),
+                            Optional.ofNullable(restartTriggerSource.get()).orElse("unknown"),
+                            acceptedNewChildren,
+                            acceptedNewChildren.size());
                     LOG.info(
                             "Restarting PG10 streaming session after {}-triggered detection "
                                     + "of new child partitions: {}",
@@ -283,6 +320,163 @@ public class Pg10StreamFetchTask extends PostgresStreamFetchTask {
         }
 
         return false;
+    }
+
+    private void maybePreparePg10CompensationBackfill(
+            PostgresSourceFetchTaskContext sourceFetchContext,
+            PostgresSourceConfig pgSourceConfig,
+            List<TableId> acceptedNewChildren,
+            PostgresOffsetContext restartOffsetContext) {
+        if (acceptedNewChildren.isEmpty()) {
+            LOG.debug(
+                    PG10_COMPENSATION_BACKFILL_SKIPPED_LOG,
+                    getSplit().splitId(),
+                    acceptedNewChildren,
+                    acceptedNewChildren.size(),
+                    "no-accepted-runtime-children");
+            return;
+        }
+
+        if (!pgSourceConfig.isPg10ChildPartitionBackfillEnabled()) {
+            LOG.info(
+                    PG10_COMPENSATION_BACKFILL_SKIPPED_LOG,
+                    getSplit().splitId(),
+                    acceptedNewChildren,
+                    acceptedNewChildren.size(),
+                    "disabled");
+            return;
+        }
+
+        Map<TableId, io.debezium.relational.history.TableChanges.TableChange> compensationSchemas =
+                sourceFetchContext.discoverCompensationTableSchemas(acceptedNewChildren);
+        sourceFetchContext.cachePg10CompensationTableSchemas(compensationSchemas);
+        PostgresOffset restartBoundary = PostgresOffset.of(restartOffsetContext.getOffset());
+
+        List<FinishedSnapshotSplitInfo> compensationFinishedSplitInfos = new ArrayList<>();
+        for (TableId childTableId : acceptedNewChildren) {
+            SnapshotSplit compensationSnapshotSplit =
+                    sourceFetchContext.createPg10CompensationSnapshotSplit(childTableId);
+            LOG.info(
+                    PG10_COMPENSATION_BACKFILL_STARTED_LOG,
+                    getSplit().splitId(),
+                    childTableId,
+                    restartBoundary);
+            long forwardedRecordCount =
+                    emitPg10CompensationSnapshot(
+                            sourceFetchContext, compensationSnapshotSplit, restartOffsetContext);
+            SnapshotSplit finishedCompensationSplit =
+                    markPg10CompensationSplitFinished(compensationSnapshotSplit, restartBoundary);
+            compensationFinishedSplitInfos.add(
+                    sourceFetchContext.createPg10CompensationFinishedSplitInfo(
+                            finishedCompensationSplit));
+            LOG.info(
+                    PG10_COMPENSATION_BACKFILL_COMPLETED_LOG,
+                    getSplit().splitId(),
+                    childTableId,
+                    forwardedRecordCount,
+                    restartBoundary);
+        }
+        sourceFetchContext.cachePg10CompensationFinishedSplitInfos(compensationFinishedSplitInfos);
+        LOG.info(
+                "Prepared bounded PG10 compensating backfill metadata for accepted runtime child partitions {} anchored to accepted restart boundary {}. "
+                        + "This bounded compensation helps close the publication gap for newly accepted children, but it is not a WAL-perfect reconstruction of publication-invisible history or a stronger restart-boundary guarantee than implemented.",
+                acceptedNewChildren,
+                restartBoundary);
+    }
+
+    private long emitPg10CompensationSnapshot(
+            PostgresSourceFetchTaskContext sourceFetchContext,
+            SnapshotSplit compensationSnapshotSplit,
+            PostgresOffsetContext restartOffsetContext) {
+        PostgresSourceFetchTaskContext compensationContext =
+                sourceFetchContext.createPg10CompensationFetchContext();
+        PostgresScanFetchTask compensationFetchTask =
+                new PostgresScanFetchTask(compensationSnapshotSplit);
+        try {
+            compensationContext.configure(compensationSnapshotSplit);
+            compensationContext.setRestartOffsetContext(restartOffsetContext);
+            compensationFetchTask.execute(compensationContext);
+            return drainPg10CompensationQueue(
+                    sourceFetchContext, compensationContext, compensationFetchTask);
+        } catch (Exception e) {
+            throw new FlinkRuntimeException(
+                    String.format(
+                            "Failed to execute PG10 bounded compensating backfill for child "
+                                    + "partition '%s'",
+                            compensationSnapshotSplit.getTableId()),
+                    e);
+        } finally {
+            try {
+                compensationContext.close();
+            } catch (Exception e) {
+                LOG.debug(
+                        "Ignored exception while closing PG10 compensation fetch context for '{}'",
+                        compensationSnapshotSplit.getTableId(),
+                        e);
+            }
+        }
+    }
+
+    private long drainPg10CompensationQueue(
+            PostgresSourceFetchTaskContext sourceFetchContext,
+            PostgresSourceFetchTaskContext compensationContext,
+            PostgresScanFetchTask compensationFetchTask)
+            throws InterruptedException {
+        boolean reachedEnd = false;
+        long forwardedRecordCount = 0L;
+        while (!reachedEnd) {
+            List<DataChangeEvent> batch = compensationContext.getQueue().poll();
+            for (DataChangeEvent event : batch) {
+                SourceRecord record = event.getRecord();
+                if (isEndWatermarkEvent(record)) {
+                    reachedEnd = true;
+                    continue;
+                }
+                sourceFetchContext.getQueue().enqueue(new DataChangeEvent(record));
+                forwardedRecordCount++;
+            }
+
+            if (!reachedEnd && !compensationFetchTask.isRunning() && batch.isEmpty()) {
+                throw new FlinkRuntimeException(
+                        String.format(
+                                "PG10 compensation snapshot '%s' finished without end watermark event",
+                                compensationFetchTask.getSplit()));
+            }
+        }
+        return forwardedRecordCount;
+    }
+
+    private List<TableId> getAcceptedNewChildren(
+            Pg10CaptureState previousCaptureState,
+            Pg10CaptureState acceptedCaptureState,
+            Pg10PartitionReconciler.Pg10ReconcileResult reconcileResult) {
+        LinkedHashSet<TableId> acceptedChildren =
+                new LinkedHashSet<>(acceptedCaptureState.getChildToParentMapping().keySet());
+        acceptedChildren.removeAll(previousCaptureState.getChildToParentMapping().keySet());
+        if (acceptedChildren.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<TableId> orderedAcceptedChildren = new ArrayList<>();
+        for (TableId childTableId : reconcileResult.getNewChildren()) {
+            if (acceptedChildren.contains(childTableId)) {
+                orderedAcceptedChildren.add(childTableId);
+            }
+        }
+        return orderedAcceptedChildren;
+    }
+
+    private SnapshotSplit markPg10CompensationSplitFinished(
+            SnapshotSplit snapshotSplit,
+            org.apache.flink.cdc.connectors.postgres.source.offset.PostgresOffset highWatermark) {
+        return new SnapshotSplit(
+                snapshotSplit.getTableId(),
+                snapshotSplit.splitId(),
+                snapshotSplit.getSplitKeyType(),
+                snapshotSplit.getSplitStart(),
+                snapshotSplit.getSplitEnd(),
+                highWatermark,
+                snapshotSplit.getTableSchemas());
     }
 
     /**
@@ -316,11 +510,7 @@ public class Pg10StreamFetchTask extends PostgresStreamFetchTask {
                             tableId,
                             captureState.getChildToParentMapping(),
                             publishedButUnacceptedChildren)) {
-                        LOG.info(
-                                "Relation message detected published-but-unaccepted PG10 child "
-                                        + "partition '{}'. Triggering session restart.",
-                                tableId);
-                        requestRestart(
+                        if (requestRestart(
                                 tableId,
                                 "relation",
                                 currentOffsetContext,
@@ -330,7 +520,13 @@ public class Pg10StreamFetchTask extends PostgresStreamFetchTask {
                                 relationRestartTrigger,
                                 restartTriggerSource,
                                 frozenRestartOffset,
-                                replicationConnectionToClose);
+                                replicationConnectionToClose)) {
+                            LOG.info(
+                                    PG10_RELATION_RESTART_REQUESTED_LOG,
+                                    getSplit().splitId(),
+                                    tableId,
+                                    publishedButUnacceptedChildren);
+                        }
                     }
                 });
     }
@@ -413,7 +609,7 @@ public class Pg10StreamFetchTask extends PostgresStreamFetchTask {
         return value == null ? null : ((Number) value).longValue();
     }
 
-    /** Starts a lightweight publication poller (30s) for publication maintenance only. */
+    /** Starts a lightweight publication poller for publication maintenance only. */
     private Thread startPg10PublicationPoller(
             PostgresSourceFetchTaskContext sourceFetchContext,
             StoppableChangeEventSourceContext sessionContext,
@@ -427,11 +623,8 @@ public class Pg10StreamFetchTask extends PostgresStreamFetchTask {
         PostgresSourceConfig pgSourceConfig =
                 (PostgresSourceConfig) sourceFetchContext.getSourceConfig();
         String publicationName = pgSourceConfig.getDbzProperties().getProperty("publication.name");
-        if (!pgSourceConfig.includePartitionedTables()
-                || publicationName == null
-                || publicationName.trim().isEmpty()
-                || currentCaptureState == null
-                || currentCaptureState.getParentToChildrenMapping().isEmpty()) {
+        if (!shouldStartPg10PublicationPoller(
+                pgSourceConfig, publicationName, currentCaptureState)) {
             return null;
         }
 
@@ -484,11 +677,18 @@ public class Pg10StreamFetchTask extends PostgresStreamFetchTask {
         PostgresSourceConfig pgSourceConfig =
                 (PostgresSourceConfig) sourceFetchContext.getSourceConfig();
         List<TableId> parentTables =
-                new ArrayList<>(getSplit().asStreamSplit().getTableSchemas().keySet());
+                Pg10FetchTaskContextCoordinator.derivePg10ParentTables(
+                        getSplit().asStreamSplit(),
+                        currentCaptureState,
+                        sourceFetchContext.getSourceConfig());
+        long pollerStartedAtNanos = System.nanoTime();
 
         while (!isStopped() && sessionContext.isRunning()) {
             try {
-                Thread.sleep(PG10_PUBLICATION_POLL_INTERVAL_MILLIS);
+                Thread.sleep(
+                        resolvePg10PublicationPollIntervalMillis(
+                                pgSourceConfig,
+                                elapsedMillisSince(pollerStartedAtNanos, System.nanoTime())));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
@@ -506,17 +706,22 @@ public class Pg10StreamFetchTask extends PostgresStreamFetchTask {
                 Pg10PartitionReconciler.Pg10ReconcileResult reconcileResult =
                         postgresDialect.reconcilePg10PartitionMappings(
                                 jdbcConnection, acceptedCaptureState, parentTables);
+                List<TableId> freshlyDiscoveredChildren =
+                        getFreshlyDiscoveredChildren(
+                                reconcileResult.getNewChildren(), publishedButUnacceptedChildren);
+                if (!freshlyDiscoveredChildren.isEmpty()) {
+                    LOG.info(
+                            PG10_CHILD_DISCOVERED_LOG,
+                            getSplit().splitId(),
+                            publicationName,
+                            freshlyDiscoveredChildren,
+                            freshlyDiscoveredChildren.size(),
+                            acceptedCaptureState.getChildToParentMapping().size());
+                }
                 List<TableId> missingPublicationChildren =
                         Pg10PublicationManager.findMissingPublicationChildren(
                                 jdbcConnection, publicationName, reconcileResult.getNewChildren());
                 if (!missingPublicationChildren.isEmpty()) {
-                    LOG.info(
-                            "Publication poller discovered new PG10 child partitions {}. "
-                                    + "Adding to publication '{}'. "
-                                    + "A fallback restart will be requested after publication "
-                                    + "visibility is confirmed.",
-                            missingPublicationChildren,
-                            publicationName);
                     Pg10PublicationManager.addTablesToPublication(
                             jdbcConnection, publicationName, missingPublicationChildren);
                 } else if (!reconcileResult.getNewChildren().isEmpty()) {
@@ -528,17 +733,16 @@ public class Pg10StreamFetchTask extends PostgresStreamFetchTask {
                             publicationName);
                 }
                 overwritePublishedButUnacceptedChildren(reconcileResult.getNewChildren());
+                List<TableId> confirmedPublishedButUnacceptedChildren =
+                        determineConfirmedPublishedButUnacceptedChildren(
+                                jdbcConnection,
+                                publicationName,
+                                reconcileResult.getNewChildren(),
+                                missingPublicationChildren);
                 if (shouldTriggerFallbackRestartAfterPublicationRefresh(
-                        reconcileResult.getNewChildren(), refreshRequested)) {
-                    TableId triggerTable = reconcileResult.getNewChildren().get(0);
-                    LOG.info(
-                            "Publication poller confirmed published-but-unaccepted PG10 child "
-                                    + "partitions {} in publication '{}'. Triggering fallback "
-                                    + "restart from target '{}'.",
-                            reconcileResult.getNewChildren(),
-                            publicationName,
-                            triggerTable);
-                    requestRestart(
+                        confirmedPublishedButUnacceptedChildren, refreshRequested)) {
+                    TableId triggerTable = confirmedPublishedButUnacceptedChildren.get(0);
+                    if (requestRestart(
                             triggerTable,
                             "poller",
                             currentOffsetContext,
@@ -548,7 +752,15 @@ public class Pg10StreamFetchTask extends PostgresStreamFetchTask {
                             restartTriggerTable,
                             restartTriggerSource,
                             frozenRestartOffset,
-                            replicationConnectionToClose);
+                            replicationConnectionToClose)) {
+                        LOG.info(
+                                PG10_POLL_RESTART_REQUESTED_LOG,
+                                getSplit().splitId(),
+                                publicationName,
+                                triggerTable,
+                                confirmedPublishedButUnacceptedChildren,
+                                confirmedPublishedButUnacceptedChildren.size());
+                    }
                     return;
                 }
             } catch (Exception e) {
@@ -562,9 +774,109 @@ public class Pg10StreamFetchTask extends PostgresStreamFetchTask {
     }
 
     @org.apache.flink.cdc.common.annotation.VisibleForTesting
+    static boolean shouldStartPg10PublicationPoller(
+            PostgresSourceConfig pgSourceConfig,
+            String publicationName,
+            Pg10CaptureState captureState) {
+        return pgSourceConfig.includePartitionedTables()
+                && publicationName != null
+                && !publicationName.trim().isEmpty()
+                && captureState != null
+                && !captureState.getParentToChildrenMapping().isEmpty();
+    }
+
+    @org.apache.flink.cdc.common.annotation.VisibleForTesting
+    static long resolvePg10PublicationPollIntervalMillis(
+            PostgresSourceConfig pgSourceConfig, long elapsedSinceSessionStartMillis) {
+        long steadyPollIntervalMillis =
+                sanitizePollIntervalMillis(pgSourceConfig.getPg10PublicationPollInterval());
+        long startupFastPollDurationMillis =
+                Math.max(0L, pgSourceConfig.getPg10StartupFastPollDuration().toMillis());
+        if (startupFastPollDurationMillis == 0L
+                || elapsedSinceSessionStartMillis >= startupFastPollDurationMillis) {
+            return steadyPollIntervalMillis;
+        }
+
+        long startupFastPollIntervalMillis =
+                sanitizePollIntervalMillis(pgSourceConfig.getPg10StartupFastPollInterval());
+        return Math.min(startupFastPollIntervalMillis, steadyPollIntervalMillis);
+    }
+
+    @org.apache.flink.cdc.common.annotation.VisibleForTesting
     static boolean shouldTriggerFallbackRestartAfterPublicationRefresh(
             List<TableId> publishedButUnacceptedChildren, AtomicBoolean refreshRequested) {
         return !publishedButUnacceptedChildren.isEmpty() && !refreshRequested.get();
+    }
+
+    @org.apache.flink.cdc.common.annotation.VisibleForTesting
+    static List<TableId> getConfirmedPublishedButUnacceptedChildren(
+            List<TableId> newlyDiscoveredChildren, List<TableId> missingPublicationChildren) {
+        if (newlyDiscoveredChildren.isEmpty()) {
+            return Collections.emptyList();
+        }
+        if (missingPublicationChildren.isEmpty()) {
+            return newlyDiscoveredChildren;
+        }
+
+        LinkedHashSet<TableId> confirmedChildren = new LinkedHashSet<>(newlyDiscoveredChildren);
+        confirmedChildren.removeAll(missingPublicationChildren);
+        return confirmedChildren.isEmpty()
+                ? Collections.emptyList()
+                : new ArrayList<>(confirmedChildren);
+    }
+
+    @org.apache.flink.cdc.common.annotation.VisibleForTesting
+    static List<TableId> getFreshlyDiscoveredChildren(
+            List<TableId> newlyDiscoveredChildren, Set<TableId> publishedButUnacceptedChildren) {
+        if (newlyDiscoveredChildren.isEmpty()) {
+            return Collections.emptyList();
+        }
+        if (publishedButUnacceptedChildren.isEmpty()) {
+            return newlyDiscoveredChildren;
+        }
+
+        LinkedHashSet<TableId> freshlyDiscoveredChildren =
+                new LinkedHashSet<>(newlyDiscoveredChildren);
+        freshlyDiscoveredChildren.removeAll(publishedButUnacceptedChildren);
+        return freshlyDiscoveredChildren.isEmpty()
+                ? Collections.emptyList()
+                : new ArrayList<>(freshlyDiscoveredChildren);
+    }
+
+    private List<TableId> determineConfirmedPublishedButUnacceptedChildren(
+            PostgresConnection jdbcConnection,
+            String publicationName,
+            List<TableId> newlyDiscoveredChildren,
+            List<TableId> initialMissingPublicationChildren)
+            throws Exception {
+        if (newlyDiscoveredChildren.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        if (initialMissingPublicationChildren.isEmpty()) {
+            return newlyDiscoveredChildren;
+        }
+
+        List<TableId> remainingMissingPublicationChildren =
+                Pg10PublicationManager.findMissingPublicationChildren(
+                        jdbcConnection, publicationName, newlyDiscoveredChildren);
+        return getConfirmedPublishedButUnacceptedChildren(
+                newlyDiscoveredChildren, remainingMissingPublicationChildren);
+    }
+
+    private static long sanitizePollIntervalMillis(Duration pollInterval) {
+        long pollIntervalMillis = pollInterval.toMillis();
+        if (pollIntervalMillis <= 0L) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "PG10 publication poll interval must be greater than 0 ms, but is %s",
+                            pollInterval));
+        }
+        return pollIntervalMillis;
+    }
+
+    private static long elapsedMillisSince(long startedAtNanos, long nowNanos) {
+        return Math.max(0L, (nowNanos - startedAtNanos) / 1_000_000L);
     }
 
     private void overwritePublishedButUnacceptedChildren(List<TableId> stillNewChildren) {

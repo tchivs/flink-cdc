@@ -62,14 +62,18 @@ public class PostgresStreamFetchTask implements FetchTask<SourceSplitBase> {
     private final StreamSplit split;
     private volatile boolean taskRunning = false;
     private volatile boolean stopped = false;
-    private volatile StoppableChangeEventSourceContext changeEventSourceContext;
+    private volatile org.apache.flink.cdc.connectors.postgres.source.fetch
+                    .StoppableChangeEventSourceContext
+            changeEventSourceContext;
 
     private StreamSplitReadTask streamSplitReadTask;
     private Long lastCommitLsn;
 
     public PostgresStreamFetchTask(StreamSplit streamSplit) {
         this.split = streamSplit;
-        this.changeEventSourceContext = new StoppableChangeEventSourceContext();
+        this.changeEventSourceContext =
+                new org.apache.flink.cdc.connectors.postgres.source.fetch
+                        .StoppableChangeEventSourceContext();
     }
 
     @Override
@@ -87,8 +91,10 @@ public class PostgresStreamFetchTask implements FetchTask<SourceSplitBase> {
                 (PostgresSourceFetchTaskContext) context;
         taskRunning = true;
         try {
-            StoppableChangeEventSourceContext sessionContext =
-                    new StoppableChangeEventSourceContext();
+            org.apache.flink.cdc.connectors.postgres.source.fetch.StoppableChangeEventSourceContext
+                    sessionContext =
+                            new org.apache.flink.cdc.connectors.postgres.source.fetch
+                                    .StoppableChangeEventSourceContext();
             changeEventSourceContext = sessionContext;
 
             streamSplitReadTask =
@@ -117,12 +123,19 @@ public class PostgresStreamFetchTask implements FetchTask<SourceSplitBase> {
     @Override
     public void close() {
         LOG.debug("stopping StreamFetchTask for split: {}", split);
-        StoppableChangeEventSourceContext currentContext = changeEventSourceContext;
+        org.apache.flink.cdc.connectors.postgres.source.fetch.StoppableChangeEventSourceContext
+                currentContext = changeEventSourceContext;
         if (currentContext != null) {
             currentContext.stopChangeEventSource();
         }
-        if (streamSplitReadTask != null && streamSplitReadTask.context != null) {
-            ((StoppableChangeEventSourceContext) streamSplitReadTask.context)
+        if (streamSplitReadTask != null
+                && streamSplitReadTask.context
+                        instanceof
+                        org.apache.flink.cdc.connectors.postgres.source.fetch
+                                .StoppableChangeEventSourceContext) {
+            ((org.apache.flink.cdc.connectors.postgres.source.fetch
+                                    .StoppableChangeEventSourceContext)
+                            streamSplitReadTask.context)
                     .stopChangeEventSource();
         }
         stopped = true;
@@ -193,7 +206,9 @@ public class PostgresStreamFetchTask implements FetchTask<SourceSplitBase> {
     }
 
     /** Sets the current change event source context (used by PG10 subclass for session restart). */
-    protected void setChangeEventSourceContext(StoppableChangeEventSourceContext context) {
+    protected void setChangeEventSourceContext(
+            org.apache.flink.cdc.connectors.postgres.source.fetch.StoppableChangeEventSourceContext
+                    context) {
         this.changeEventSourceContext = context;
     }
 
@@ -230,24 +245,20 @@ public class PostgresStreamFetchTask implements FetchTask<SourceSplitBase> {
     }
 
     @VisibleForTesting
-    StoppableChangeEventSourceContext getChangeEventSourceContext() {
+    org.apache.flink.cdc.connectors.postgres.source.fetch.StoppableChangeEventSourceContext
+            getChangeEventSourceContext() {
         return changeEventSourceContext;
     }
 
-    /** Stoppable implementation of {@link ChangeEventSource.ChangeEventSourceContext}. */
+    /**
+     * @deprecated Use the package-level {@link
+     *     org.apache.flink.cdc.connectors.postgres.source.fetch.StoppableChangeEventSourceContext}
+     *     instead.
+     */
+    @Deprecated
     public static class StoppableChangeEventSourceContext
-            implements ChangeEventSource.ChangeEventSourceContext {
-        private volatile boolean running = true;
-
-        public void stopChangeEventSource() {
-            running = false;
-        }
-
-        @Override
-        public boolean isRunning() {
-            return running;
-        }
-    }
+            extends org.apache.flink.cdc.connectors.postgres.source.fetch
+                    .StoppableChangeEventSourceContext {}
 
     /** A {@link ChangeEventSource} implementation for Postgres to read streaming changes. */
     public static class StreamSplitReadTask extends PostgresStreamingChangeEventSource {
@@ -320,7 +331,15 @@ public class PostgresStreamFetchTask implements FetchTask<SourceSplitBase> {
                             new FlinkRuntimeException("Error processing WAL signal event", e));
                 }
 
-                ((StoppableChangeEventSourceContext) context).stopChangeEventSource();
+                if (context
+                        instanceof
+                        org.apache.flink.cdc.connectors.postgres.source.fetch
+                                .StoppableChangeEventSourceContext) {
+                    ((org.apache.flink.cdc.connectors.postgres.source.fetch
+                                            .StoppableChangeEventSourceContext)
+                                    context)
+                            .stopChangeEventSource();
+                }
             }
         }
 
