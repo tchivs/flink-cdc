@@ -37,6 +37,7 @@ import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresStreamFetch
 import org.apache.flink.cdc.connectors.postgres.source.utils.CustomPostgresSchema;
 import org.apache.flink.cdc.connectors.postgres.source.utils.Pg10PartitionMapper;
 import org.apache.flink.cdc.connectors.postgres.source.utils.Pg10PartitionReconciler;
+import org.apache.flink.cdc.connectors.postgres.source.utils.Pg10PublicationManager;
 import org.apache.flink.cdc.connectors.postgres.source.utils.TableDiscoveryUtils;
 import org.apache.flink.util.FlinkRuntimeException;
 
@@ -57,6 +58,7 @@ import io.debezium.schema.TopicSelector;
 import javax.annotation.Nullable;
 
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -252,6 +254,14 @@ public class PostgresDialect implements JdbcDataSourceDialect {
         sourceConfig.setPg10PartitionMappingInitialized(true);
     }
 
+    public void syncPg10PartitionMappings(
+            Map<TableId, TableId> childToParentMapping,
+            Map<TableId, List<TableId>> parentToChildrenMapping) {
+        sourceConfig.setChildToParentMapping(childToParentMapping);
+        sourceConfig.setParentToChildrenMapping(parentToChildrenMapping);
+        sourceConfig.setPg10PartitionMappingInitialized(true);
+    }
+
     /**
      * Reconciles PG10 partition mappings using the pure {@link Pg10PartitionReconciler}.
      *
@@ -277,6 +287,60 @@ public class PostgresDialect implements JdbcDataSourceDialect {
                         parentTables,
                         captureState.getParentToChildrenMapping(),
                         captureState.getChildToParentMapping());
+    }
+
+    public void validateRestoredPg10CaptureState(
+            JdbcConnection jdbc, Pg10CaptureState restoredCaptureState, List<TableId> parentTables)
+            throws SQLException {
+        Pg10PartitionReconciler.Pg10ReconcileResult reconcileResult =
+                getPg10PartitionReconciler()
+                        .reconcile(
+                                jdbc,
+                                parentTables,
+                                restoredCaptureState.getParentToChildrenMapping(),
+                                restoredCaptureState.getChildToParentMapping());
+
+        List<String> validationIssues = new ArrayList<>();
+        List<TableId> publicationValidatedChildren = new ArrayList<>();
+        Map<TableId, TableId> latestChildToParent = reconcileResult.getLatestChildToParent();
+        for (Map.Entry<TableId, TableId> entry :
+                restoredCaptureState.getChildToParentMapping().entrySet()) {
+            TableId childTable = entry.getKey();
+            TableId restoredParentTable = entry.getValue();
+            TableId latestParentTable = latestChildToParent.get(childTable);
+            if (latestParentTable == null) {
+                validationIssues.add(
+                        String.format(
+                                "child '%s' is missing from the current catalog (restored parent: '%s')",
+                                childTable, restoredParentTable));
+            } else if (!restoredParentTable.equals(latestParentTable)) {
+                validationIssues.add(
+                        String.format(
+                                "child '%s' is now mapped to parent '%s' instead of restored parent '%s'",
+                                childTable, latestParentTable, restoredParentTable));
+            } else {
+                publicationValidatedChildren.add(childTable);
+            }
+        }
+
+        String publicationName = sourceConfig.getDbzProperties().getProperty("publication.name");
+        if (publicationName != null) {
+            List<TableId> missingPublicationChildren =
+                    Pg10PublicationManager.findMissingPublicationChildren(
+                            jdbc, publicationName, publicationValidatedChildren);
+            for (TableId childTable : missingPublicationChildren) {
+                validationIssues.add(
+                        String.format(
+                                "child '%s' is no longer a member of publication '%s'",
+                                childTable, publicationName));
+            }
+        }
+
+        if (!validationIssues.isEmpty()) {
+            throw new FlinkRuntimeException(
+                    "Restored PG10 routing state references missing or altered child partitions: "
+                            + String.join("; ", validationIssues));
+        }
     }
 
     @Override

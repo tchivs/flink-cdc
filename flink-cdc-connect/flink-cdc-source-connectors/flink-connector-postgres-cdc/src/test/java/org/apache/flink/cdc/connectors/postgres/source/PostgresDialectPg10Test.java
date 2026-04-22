@@ -18,17 +18,21 @@
 package org.apache.flink.cdc.connectors.postgres.source;
 
 import org.apache.flink.cdc.connectors.base.options.StartupOptions;
+import org.apache.flink.cdc.connectors.base.source.meta.split.FinishedSnapshotSplitInfo;
+import org.apache.flink.cdc.connectors.base.source.meta.split.SnapshotSplit;
 import org.apache.flink.cdc.connectors.base.source.meta.split.StreamSplit;
 import org.apache.flink.cdc.connectors.postgres.PostgresPg10TestBase;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfigFactory;
 import org.apache.flink.cdc.connectors.postgres.source.fetch.Pg10CaptureState;
+import org.apache.flink.cdc.connectors.postgres.source.fetch.Pg10StreamingSessionRuntime;
 import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresSourceFetchTaskContext;
 import org.apache.flink.cdc.connectors.postgres.source.schema.RelationAwarePostgresSchema;
 import org.apache.flink.cdc.connectors.postgres.source.utils.Pg10PartitionMapper;
 import org.apache.flink.cdc.connectors.postgres.source.utils.Pg10PartitionReconciler;
 import org.apache.flink.cdc.connectors.postgres.source.utils.Pg10PublicationManager;
 import org.apache.flink.cdc.connectors.postgres.testutils.UniqueDatabase;
+import org.apache.flink.util.FlinkRuntimeException;
 
 import io.debezium.connector.postgresql.PostgresObjectUtils;
 import io.debezium.connector.postgresql.PostgresOffsetContext;
@@ -44,6 +48,7 @@ import java.sql.Connection;
 import java.sql.Statement;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -451,6 +456,460 @@ class PostgresDialectPg10Test extends PostgresPg10TestBase {
                 .isEqualTo(acceptedCaptureState.getChildToParentMapping());
         Assertions.assertThat(restartedInitialCaptureState.getParentToChildrenMapping())
                 .isEqualTo(acceptedCaptureState.getParentToChildrenMapping());
+    }
+
+    @Test
+    void testRestoredStreamSplitSeedsInitialCaptureStateBeforeFreshConfigMappings()
+            throws Exception {
+        UniqueDatabase inventoryPartitionedDatabase = createInventoryPartitionedDatabase();
+        createDatabase(inventoryPartitionedDatabase.getDatabaseName());
+        initializePg10PartitionedTable(inventoryPartitionedDatabase.getDatabaseName());
+
+        PostgresSourceConfigFactory configFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "products", 10);
+        configFactory.setIncludePartitionedTables(true);
+        configFactory.startupOptions(StartupOptions.latest());
+
+        PostgresSourceConfig config = configFactory.create(0);
+        PostgresDialect dialect = new PostgresDialect(config);
+        dialect.discoverDataCollections(config);
+
+        TableId parentTable = new TableId(null, "inventory_partitioned", "products");
+        TableId childUk = new TableId(null, "inventory_partitioned", "products_uk");
+        TableId childCa = new TableId(null, "inventory_partitioned", "products_ca");
+
+        StreamSplit baseStreamSplit = createMinimalStreamSplit(config, dialect);
+
+        try (Connection connection =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER,
+                                inventoryPartitionedDatabase.getDatabaseName());
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "CREATE TABLE inventory_partitioned.products_ca PARTITION OF inventory_partitioned.products FOR VALUES IN ('ca')");
+        }
+
+        Map<TableId, TableId> restoredChildToParent = new LinkedHashMap<>();
+        restoredChildToParent.put(childUk, parentTable);
+        restoredChildToParent.put(childCa, parentTable);
+        Map<TableId, List<TableId>> restoredParentToChildren = new LinkedHashMap<>();
+        restoredParentToChildren.put(parentTable, List.of(childUk, childCa));
+
+        config.setChildToParentMapping(Collections.singletonMap(childUk, parentTable));
+        config.setParentToChildrenMapping(
+                Collections.singletonMap(parentTable, Collections.singletonList(childUk)));
+        config.setPg10PartitionMappingInitialized(true);
+
+        StreamSplit restoredStreamSplit =
+                StreamSplit.withPg10RoutingState(
+                        baseStreamSplit, restoredChildToParent, restoredParentToChildren, true);
+        PostgresSourceFetchTaskContext fetchTaskContext =
+                (PostgresSourceFetchTaskContext) dialect.createFetchTaskContext(config);
+
+        try {
+            fetchTaskContext.configure(restoredStreamSplit);
+
+            Pg10CaptureState initialCaptureState =
+                    fetchTaskContext.buildInitialCaptureState(restoredStreamSplit);
+
+            Assertions.assertThat(initialCaptureState.getChildToParentMapping())
+                    .isEqualTo(restoredChildToParent);
+            Assertions.assertThat(initialCaptureState.getParentToChildrenMapping())
+                    .isEqualTo(restoredParentToChildren);
+            Assertions.assertThat(config.getChildToParentMappingOrEmpty())
+                    .isEqualTo(restoredChildToParent);
+            Assertions.assertThat(config.getParentToChildrenMappingOrEmpty())
+                    .isEqualTo(restoredParentToChildren);
+        } finally {
+            fetchTaskContext.close();
+        }
+    }
+
+    @Test
+    void testRestoreConfigureDefersPg10ReplicationConnectionUntilStreamingRuntime()
+            throws Exception {
+        UniqueDatabase inventoryPartitionedDatabase = createInventoryPartitionedDatabase();
+        createDatabase(inventoryPartitionedDatabase.getDatabaseName());
+        initializePg10PartitionedTable(inventoryPartitionedDatabase.getDatabaseName());
+
+        PostgresSourceConfigFactory configFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "products", 10);
+        configFactory.setIncludePartitionedTables(true);
+        configFactory.startupOptions(StartupOptions.latest());
+
+        PostgresSourceConfig config = configFactory.create(0);
+        PostgresDialect dialect = new PostgresDialect(config);
+        dialect.discoverDataCollections(config);
+
+        TableId parentTable = new TableId(null, "inventory_partitioned", "products");
+        TableId childUk = new TableId(null, "inventory_partitioned", "products_uk");
+        TableId childUs = new TableId(null, "inventory_partitioned", "products_us");
+        TableId childCa = new TableId(null, "inventory_partitioned", "products_ca");
+
+        StreamSplit baseStreamSplit = createMinimalStreamSplit(config, dialect);
+
+        try (Connection connection =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER,
+                                inventoryPartitionedDatabase.getDatabaseName());
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "CREATE TABLE inventory_partitioned.products_ca PARTITION OF inventory_partitioned.products FOR VALUES IN ('ca')");
+        }
+
+        Map<TableId, TableId> restoredChildToParent = new LinkedHashMap<>();
+        restoredChildToParent.put(childUk, parentTable);
+        restoredChildToParent.put(childUs, parentTable);
+        restoredChildToParent.put(childCa, parentTable);
+        Map<TableId, List<TableId>> restoredParentToChildren = new LinkedHashMap<>();
+        restoredParentToChildren.put(parentTable, List.of(childUk, childUs, childCa));
+
+        StreamSplit restoredStreamSplit =
+                StreamSplit.withPg10RoutingState(
+                        baseStreamSplit, restoredChildToParent, restoredParentToChildren, true);
+        PostgresSourceFetchTaskContext fetchTaskContext =
+                (PostgresSourceFetchTaskContext) dialect.createFetchTaskContext(config);
+
+        try {
+            fetchTaskContext.configure(restoredStreamSplit);
+
+            Assertions.assertThat(fetchTaskContext.getReplicationConnection()).isNull();
+
+            Pg10CaptureState initialCaptureState =
+                    fetchTaskContext.buildInitialCaptureState(restoredStreamSplit);
+
+            try (Pg10StreamingSessionRuntime runtime =
+                    fetchTaskContext.buildStreamingRuntime(
+                            restoredStreamSplit,
+                            initialCaptureState,
+                            loadOffsetContext(config, 67890L, 67890L))) {
+                Assertions.assertThat(runtime.getReplicationConnection()).isNotNull();
+            }
+        } finally {
+            fetchTaskContext.close();
+        }
+    }
+
+    @Test
+    void testReconcileTreatsRestoredCaptureStateAsAdditiveBaseline() throws Exception {
+        UniqueDatabase inventoryPartitionedDatabase = createInventoryPartitionedDatabase();
+        createDatabase(inventoryPartitionedDatabase.getDatabaseName());
+        initializePg10PartitionedTable(inventoryPartitionedDatabase.getDatabaseName());
+
+        PostgresSourceConfigFactory configFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "products", 10);
+        configFactory.setIncludePartitionedTables(true);
+        configFactory.startupOptions(StartupOptions.latest());
+
+        PostgresSourceConfig config = configFactory.create(0);
+        PostgresDialect dialect = new PostgresDialect(config);
+
+        TableId parentTable = new TableId(null, "inventory_partitioned", "products");
+        TableId childUk = new TableId(null, "inventory_partitioned", "products_uk");
+        TableId childUs = new TableId(null, "inventory_partitioned", "products_us");
+        TableId childCa = new TableId(null, "inventory_partitioned", "products_ca");
+        TableId childAu = new TableId(null, "inventory_partitioned", "products_au");
+
+        List<TableId> parentTables = dialect.discoverDataCollections(config);
+
+        try (Connection connection =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER,
+                                inventoryPartitionedDatabase.getDatabaseName());
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "CREATE TABLE inventory_partitioned.products_ca PARTITION OF inventory_partitioned.products FOR VALUES IN ('ca')");
+            statement.execute(
+                    "CREATE TABLE inventory_partitioned.products_au PARTITION OF inventory_partitioned.products FOR VALUES IN ('au')");
+        }
+
+        Pg10CaptureState restoredCaptureState =
+                Pg10CaptureState.of(
+                        new LinkedHashMap<TableId, TableId>() {
+                            {
+                                put(childUk, parentTable);
+                                put(childUs, parentTable);
+                                put(childCa, parentTable);
+                            }
+                        },
+                        Collections.singletonMap(parentTable, List.of(childUk, childUs, childCa)));
+
+        try (JdbcConnection jdbc = dialect.openJdbcConnection(config)) {
+            Pg10PartitionReconciler.Pg10ReconcileResult reconcileResult =
+                    dialect.reconcilePg10PartitionMappings(
+                            jdbc, restoredCaptureState, parentTables);
+
+            Assertions.assertThat(reconcileResult.getNewChildren()).containsExactly(childAu);
+            Assertions.assertThat(reconcileResult.getNewChildToParent())
+                    .containsOnlyKeys(childAu)
+                    .containsEntry(childAu, parentTable);
+        }
+    }
+
+    @Test
+    void testRestoreValidationIgnoresCompensationChildSchemasInParentBaseline() throws Exception {
+        UniqueDatabase inventoryPartitionedDatabase = createInventoryPartitionedDatabase();
+        createDatabase(inventoryPartitionedDatabase.getDatabaseName());
+        initializePg10PartitionedTable(inventoryPartitionedDatabase.getDatabaseName());
+
+        PostgresSourceConfigFactory configFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "products", 10);
+        configFactory.setIncludePartitionedTables(true);
+        configFactory.startupOptions(StartupOptions.latest());
+
+        PostgresSourceConfig config = configFactory.create(0);
+        PostgresDialect dialect = new PostgresDialect(config);
+        dialect.discoverDataCollections(config);
+
+        TableId parentTable = new TableId(null, "inventory_partitioned", "products");
+        TableId childUk = new TableId(null, "inventory_partitioned", "products_uk");
+        TableId childUs = new TableId(null, "inventory_partitioned", "products_us");
+        TableId compensationChild = new TableId(null, "inventory_partitioned", "products_ca");
+
+        StreamSplit baseStreamSplit = createMinimalStreamSplit(config, dialect);
+
+        try (Connection connection =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER,
+                                inventoryPartitionedDatabase.getDatabaseName());
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "CREATE TABLE inventory_partitioned.products_ca PARTITION OF inventory_partitioned.products FOR VALUES IN ('ca')");
+        }
+
+        try (JdbcConnection jdbc = dialect.openJdbcConnection(config)) {
+            PostgresSourceConfigFactory childConfigFactory =
+                    getMockPostgresSourceConfigFactory(
+                            inventoryPartitionedDatabase,
+                            "inventory_partitioned",
+                            "products_ca",
+                            10);
+            PostgresSourceConfig childConfig = childConfigFactory.create(0);
+            PostgresDialect childDialect = new PostgresDialect(childConfig);
+            io.debezium.relational.history.TableChanges.TableChange compensationSchema =
+                    childDialect.queryTableSchema(jdbc, compensationChild);
+            org.apache.flink.cdc.connectors.postgres.source.offset.PostgresOffset
+                    compensationHighWatermark =
+                            org.apache.flink.cdc.connectors.postgres.source.offset.PostgresOffset
+                                    .of(loadOffsetContext(config, 12345L, 12345L).getOffset());
+
+            PostgresSourceFetchTaskContext compensationContext =
+                    (PostgresSourceFetchTaskContext) dialect.createFetchTaskContext(config);
+            compensationContext.configure(baseStreamSplit);
+            compensationContext.syncPg10CaptureState(
+                    Pg10CaptureState.of(
+                            new LinkedHashMap<TableId, TableId>() {
+                                {
+                                    put(childUk, parentTable);
+                                    put(childUs, parentTable);
+                                    put(compensationChild, parentTable);
+                                }
+                            },
+                            Collections.singletonMap(
+                                    parentTable, List.of(childUk, childUs, compensationChild))),
+                    baseStreamSplit);
+            SnapshotSplit compensationSnapshotSplit =
+                    new SnapshotSplit(
+                            compensationChild,
+                            "pg10-compensation-inventory_partitioned.products_ca:0",
+                            org.apache.flink.table.types.logical.RowType.of(
+                                    new org.apache.flink.table.types.logical.LogicalType[] {
+                                        new org.apache.flink.table.types.logical.IntType()
+                                    },
+                                    new String[] {"id"}),
+                            null,
+                            null,
+                            compensationHighWatermark,
+                            Collections.singletonMap(compensationChild, compensationSchema));
+            FinishedSnapshotSplitInfo compensationFinishedSplitInfo =
+                    compensationContext.createPg10CompensationFinishedSplitInfo(
+                            compensationSnapshotSplit);
+            compensationContext.close();
+
+            StreamSplit restoredStreamSplit =
+                    StreamSplit.withPg10RoutingState(
+                            StreamSplit.appendCompensationSplitInfos(
+                                    baseStreamSplit,
+                                    Collections.singletonList(compensationFinishedSplitInfo),
+                                    Collections.singletonMap(
+                                            compensationChild, compensationSchema)),
+                            new LinkedHashMap<TableId, TableId>() {
+                                {
+                                    put(childUk, parentTable);
+                                    put(childUs, parentTable);
+                                    put(compensationChild, parentTable);
+                                }
+                            },
+                            Collections.singletonMap(
+                                    parentTable, List.of(childUk, childUs, compensationChild)),
+                            true);
+
+            Assertions.assertThat(compensationFinishedSplitInfo.getTableId())
+                    .isEqualTo(parentTable);
+
+            Pg10CaptureState restoredCaptureState =
+                    Pg10CaptureState.of(
+                            restoredStreamSplit.getPg10ChildToParentMapping(),
+                            restoredStreamSplit.getPg10ParentToChildrenMapping());
+
+            PostgresSourceFetchTaskContext fetchTaskContext =
+                    (PostgresSourceFetchTaskContext) dialect.createFetchTaskContext(config);
+            try {
+                fetchTaskContext.configure(restoredStreamSplit);
+
+                Assertions.assertThatCode(
+                                () ->
+                                        fetchTaskContext.buildInitialCaptureState(
+                                                restoredStreamSplit))
+                        .doesNotThrowAnyException();
+                Pg10CaptureState initialCaptureState =
+                        fetchTaskContext.buildInitialCaptureState(restoredStreamSplit);
+                Assertions.assertThat(initialCaptureState.getChildToParentMapping())
+                        .isEqualTo(restoredCaptureState.getChildToParentMapping());
+                Assertions.assertThat(initialCaptureState.getParentToChildrenMapping())
+                        .isEqualTo(restoredCaptureState.getParentToChildrenMapping());
+            } finally {
+                fetchTaskContext.close();
+            }
+        }
+    }
+
+    @Test
+    void testMissingRestoredChildFailsDeterministically() throws Exception {
+        UniqueDatabase inventoryPartitionedDatabase = createInventoryPartitionedDatabase();
+        createDatabase(inventoryPartitionedDatabase.getDatabaseName());
+        initializePg10PartitionedTable(inventoryPartitionedDatabase.getDatabaseName());
+
+        PostgresSourceConfigFactory configFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "products", 10);
+        configFactory.setIncludePartitionedTables(true);
+        configFactory.startupOptions(StartupOptions.latest());
+
+        PostgresSourceConfig config = configFactory.create(0);
+        PostgresDialect dialect = new PostgresDialect(config);
+
+        TableId parentTable = new TableId(null, "inventory_partitioned", "products");
+        TableId childUk = new TableId(null, "inventory_partitioned", "products_uk");
+        TableId childUs = new TableId(null, "inventory_partitioned", "products_us");
+        TableId childCa = new TableId(null, "inventory_partitioned", "products_ca");
+
+        List<TableId> parentTables = dialect.discoverDataCollections(config);
+
+        try (Connection connection =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER,
+                                inventoryPartitionedDatabase.getDatabaseName());
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "CREATE TABLE inventory_partitioned.products_ca PARTITION OF inventory_partitioned.products FOR VALUES IN ('ca')");
+            statement.execute("DROP TABLE inventory_partitioned.products_ca");
+        }
+
+        Pg10CaptureState restoredCaptureState =
+                Pg10CaptureState.of(
+                        new LinkedHashMap<TableId, TableId>() {
+                            {
+                                put(childUk, parentTable);
+                                put(childUs, parentTable);
+                                put(childCa, parentTable);
+                            }
+                        },
+                        Collections.singletonMap(parentTable, List.of(childUk, childUs, childCa)));
+
+        try (JdbcConnection jdbc = dialect.openJdbcConnection(config)) {
+            Assertions.assertThatThrownBy(
+                            () ->
+                                    dialect.validateRestoredPg10CaptureState(
+                                            jdbc, restoredCaptureState, parentTables))
+                    .isInstanceOf(FlinkRuntimeException.class)
+                    .hasMessageContaining(
+                            "Restored PG10 routing state references missing or altered child partitions")
+                    .hasMessageContaining("inventory_partitioned.products_ca")
+                    .hasMessageContaining("missing from the current catalog");
+        }
+    }
+
+    @Test
+    void testConfiguredRestoreEntryFailsWhenRestoredChildLeavesPublication() throws Exception {
+        UniqueDatabase inventoryPartitionedDatabase = createInventoryPartitionedDatabase();
+        createDatabase(inventoryPartitionedDatabase.getDatabaseName());
+        initializePg10PartitionedTable(inventoryPartitionedDatabase.getDatabaseName());
+
+        String publicationName = "dbz_publication_pg10_restore_missing_child";
+        try (Connection connection =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER,
+                                inventoryPartitionedDatabase.getDatabaseName());
+                Statement statement = connection.createStatement()) {
+            statement.execute("DROP PUBLICATION IF EXISTS " + publicationName);
+            statement.execute(
+                    "CREATE PUBLICATION "
+                            + publicationName
+                            + " FOR TABLE inventory_partitioned.products_uk, inventory_partitioned.products_us");
+        }
+
+        PostgresSourceConfigFactory configFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "products", 10);
+        configFactory.setIncludePartitionedTables(true);
+        configFactory.startupOptions(StartupOptions.latest());
+        Properties debeziumProperties = new Properties();
+        debeziumProperties.setProperty("publication.name", publicationName);
+        configFactory.debeziumProperties(debeziumProperties);
+
+        PostgresSourceConfig config = configFactory.create(0);
+        PostgresDialect dialect = new PostgresDialect(config);
+
+        TableId parentTable = new TableId(null, "inventory_partitioned", "products");
+        TableId childUk = new TableId(null, "inventory_partitioned", "products_uk");
+        TableId childUs = new TableId(null, "inventory_partitioned", "products_us");
+        TableId childCa = new TableId(null, "inventory_partitioned", "products_ca");
+
+        StreamSplit baseStreamSplit = createMinimalStreamSplit(config, dialect);
+
+        try (Connection connection =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER,
+                                inventoryPartitionedDatabase.getDatabaseName());
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "CREATE TABLE inventory_partitioned.products_ca PARTITION OF inventory_partitioned.products FOR VALUES IN ('ca')");
+        }
+
+        StreamSplit restoredStreamSplit =
+                StreamSplit.withPg10RoutingState(
+                        baseStreamSplit,
+                        new LinkedHashMap<TableId, TableId>() {
+                            {
+                                put(childUk, parentTable);
+                                put(childUs, parentTable);
+                                put(childCa, parentTable);
+                            }
+                        },
+                        Collections.singletonMap(parentTable, List.of(childUk, childUs, childCa)),
+                        true);
+        PostgresSourceFetchTaskContext fetchTaskContext =
+                (PostgresSourceFetchTaskContext) dialect.createFetchTaskContext(config);
+
+        try {
+            fetchTaskContext.configure(restoredStreamSplit);
+
+            Assertions.assertThatThrownBy(
+                            () -> fetchTaskContext.buildInitialCaptureState(restoredStreamSplit))
+                    .isInstanceOf(FlinkRuntimeException.class)
+                    .hasMessageContaining(
+                            "Restored PG10 routing state references missing or altered child partitions")
+                    .hasMessageContaining("inventory_partitioned.products_ca")
+                    .hasMessageContaining("publication")
+                    .hasMessageContaining(publicationName);
+        } finally {
+            fetchTaskContext.close();
+        }
     }
 
     @Test
