@@ -27,7 +27,9 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -48,6 +50,12 @@ public class StreamSplit extends SourceSplitBase {
 
     private final boolean isSuspended;
 
+    private final Map<TableId, TableId> pg10ChildToParentMapping;
+
+    private final Map<TableId, List<TableId>> pg10ParentToChildrenMapping;
+
+    private final boolean pg10RoutingStateInitialized;
+
     /**
      * Indicates whether initial state snapshot was completed right before this split. See
      * io.debezium.connector.sqlserver.SqlServerOffsetContext#isSnapshotCompleted().
@@ -65,6 +73,56 @@ public class StreamSplit extends SourceSplitBase {
             int totalFinishedSplitSize,
             boolean isSuspended,
             boolean isSnapshotCompleted) {
+        this(
+                splitId,
+                startingOffset,
+                endingOffset,
+                finishedSnapshotSplitInfos,
+                tableSchemas,
+                totalFinishedSplitSize,
+                isSuspended,
+                isSnapshotCompleted,
+                Collections.emptyMap(),
+                Collections.emptyMap());
+    }
+
+    public StreamSplit(
+            String splitId,
+            Offset startingOffset,
+            Offset endingOffset,
+            List<FinishedSnapshotSplitInfo> finishedSnapshotSplitInfos,
+            Map<TableId, TableChange> tableSchemas,
+            int totalFinishedSplitSize,
+            boolean isSuspended,
+            boolean isSnapshotCompleted,
+            Map<TableId, TableId> pg10ChildToParentMapping,
+            Map<TableId, List<TableId>> pg10ParentToChildrenMapping) {
+        this(
+                splitId,
+                startingOffset,
+                endingOffset,
+                finishedSnapshotSplitInfos,
+                tableSchemas,
+                totalFinishedSplitSize,
+                isSuspended,
+                isSnapshotCompleted,
+                pg10ChildToParentMapping,
+                pg10ParentToChildrenMapping,
+                !pg10ChildToParentMapping.isEmpty() || !pg10ParentToChildrenMapping.isEmpty());
+    }
+
+    public StreamSplit(
+            String splitId,
+            Offset startingOffset,
+            Offset endingOffset,
+            List<FinishedSnapshotSplitInfo> finishedSnapshotSplitInfos,
+            Map<TableId, TableChange> tableSchemas,
+            int totalFinishedSplitSize,
+            boolean isSuspended,
+            boolean isSnapshotCompleted,
+            Map<TableId, TableId> pg10ChildToParentMapping,
+            Map<TableId, List<TableId>> pg10ParentToChildrenMapping,
+            boolean pg10RoutingStateInitialized) {
         super(splitId);
         this.startingOffset = startingOffset;
         this.endingOffset = endingOffset;
@@ -73,6 +131,11 @@ public class StreamSplit extends SourceSplitBase {
         this.totalFinishedSplitSize = totalFinishedSplitSize;
         this.isSuspended = isSuspended;
         this.isSnapshotCompleted = isSnapshotCompleted;
+        this.pg10ChildToParentMapping =
+                Collections.unmodifiableMap(new LinkedHashMap<>(pg10ChildToParentMapping));
+        this.pg10ParentToChildrenMapping =
+                Collections.unmodifiableMap(deepCopyParentToChildren(pg10ParentToChildrenMapping));
+        this.pg10RoutingStateInitialized = pg10RoutingStateInitialized;
     }
 
     public StreamSplit(
@@ -82,14 +145,17 @@ public class StreamSplit extends SourceSplitBase {
             List<FinishedSnapshotSplitInfo> finishedSnapshotSplitInfos,
             Map<TableId, TableChange> tableSchemas,
             int totalFinishedSplitSize) {
-        super(splitId);
-        this.startingOffset = startingOffset;
-        this.endingOffset = endingOffset;
-        this.finishedSnapshotSplitInfos = finishedSnapshotSplitInfos;
-        this.tableSchemas = tableSchemas;
-        this.totalFinishedSplitSize = totalFinishedSplitSize;
-        this.isSuspended = false;
-        this.isSnapshotCompleted = false;
+        this(
+                splitId,
+                startingOffset,
+                endingOffset,
+                finishedSnapshotSplitInfos,
+                tableSchemas,
+                totalFinishedSplitSize,
+                false,
+                false,
+                Collections.emptyMap(),
+                Collections.emptyMap());
     }
 
     public Offset getStartingOffset() {
@@ -125,6 +191,22 @@ public class StreamSplit extends SourceSplitBase {
         return isSnapshotCompleted;
     }
 
+    public Map<TableId, TableId> getPg10ChildToParentMapping() {
+        return pg10ChildToParentMapping;
+    }
+
+    public Map<TableId, List<TableId>> getPg10ParentToChildrenMapping() {
+        return pg10ParentToChildrenMapping;
+    }
+
+    public boolean hasPg10RoutingState() {
+        return !pg10ChildToParentMapping.isEmpty() || !pg10ParentToChildrenMapping.isEmpty();
+    }
+
+    public boolean isPg10RoutingStateInitialized() {
+        return pg10RoutingStateInitialized;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -143,7 +225,10 @@ public class StreamSplit extends SourceSplitBase {
                 && Objects.equals(startingOffset, that.startingOffset)
                 && Objects.equals(endingOffset, that.endingOffset)
                 && Objects.equals(finishedSnapshotSplitInfos, that.finishedSnapshotSplitInfos)
-                && Objects.equals(tableSchemas, that.tableSchemas);
+                && Objects.equals(tableSchemas, that.tableSchemas)
+                && pg10RoutingStateInitialized == that.pg10RoutingStateInitialized
+                && Objects.equals(pg10ChildToParentMapping, that.pg10ChildToParentMapping)
+                && Objects.equals(pg10ParentToChildrenMapping, that.pg10ParentToChildrenMapping);
     }
 
     @Override
@@ -156,7 +241,10 @@ public class StreamSplit extends SourceSplitBase {
                 tableSchemas,
                 totalFinishedSplitSize,
                 isSuspended,
-                isSnapshotCompleted);
+                isSnapshotCompleted,
+                pg10RoutingStateInitialized,
+                pg10ChildToParentMapping,
+                pg10ParentToChildrenMapping);
     }
 
     @Override
@@ -173,6 +261,10 @@ public class StreamSplit extends SourceSplitBase {
                 + isSuspended
                 + ", isSnapshotCompleted="
                 + isSnapshotCompleted
+                + ", pg10RoutingStateInitialized="
+                + pg10RoutingStateInitialized
+                + ", pg10ChildToParentMapping="
+                + pg10ChildToParentMapping
                 + '}';
     }
 
@@ -198,7 +290,68 @@ public class StreamSplit extends SourceSplitBase {
                 streamSplit.getTableSchemas(),
                 streamSplit.getTotalFinishedSplitSize(),
                 streamSplit.isSuspended(),
-                streamSplit.isSnapshotCompleted());
+                streamSplit.isSnapshotCompleted(),
+                streamSplit.getPg10ChildToParentMapping(),
+                streamSplit.getPg10ParentToChildrenMapping(),
+                streamSplit.isPg10RoutingStateInitialized());
+    }
+
+    /**
+     * Appends compensating finished split infos to a stream split and increases the finished-split
+     * size accordingly.
+     *
+     * <p>This is used for bounded compensation flows that reuse snapshot/backfill mechanics after a
+     * stream split has already been created. Unlike {@link #appendFinishedSplitInfos(StreamSplit,
+     * List)}, these finished split infos are not part of the original enumerator metadata groups,
+     * so the total finished-split size must grow as new compensation splits are accepted.
+     */
+    public static StreamSplit appendCompensationSplitInfos(
+            StreamSplit streamSplit,
+            List<FinishedSnapshotSplitInfo> splitInfos,
+            Map<TableId, TableChange> additionalTableSchemas) {
+        if (splitInfos.isEmpty() && additionalTableSchemas.isEmpty()) {
+            return streamSplit;
+        }
+
+        Map<String, FinishedSnapshotSplitInfo> mergedFinishedSplitInfos = new LinkedHashMap<>();
+        for (FinishedSnapshotSplitInfo existingInfo : streamSplit.getFinishedSnapshotSplitInfos()) {
+            mergedFinishedSplitInfos.put(existingInfo.getSplitId(), existingInfo);
+        }
+
+        int newlyAcceptedSplitCount = 0;
+        for (FinishedSnapshotSplitInfo splitInfo : splitInfos) {
+            if (!mergedFinishedSplitInfos.containsKey(splitInfo.getSplitId())) {
+                newlyAcceptedSplitCount++;
+            }
+            mergedFinishedSplitInfos.put(splitInfo.getSplitId(), splitInfo);
+        }
+
+        Offset startingOffset = streamSplit.getStartingOffset();
+        for (FinishedSnapshotSplitInfo splitInfo : mergedFinishedSplitInfos.values()) {
+            if (splitInfo.getHighWatermark().isBefore(startingOffset)) {
+                startingOffset = splitInfo.getHighWatermark();
+            }
+        }
+
+        Map<TableId, TableChange> mergedTableSchemas =
+                new LinkedHashMap<>(streamSplit.getTableSchemas());
+        mergedTableSchemas.putAll(additionalTableSchemas);
+
+        return new StreamSplit(
+                streamSplit.splitId,
+                startingOffset,
+                streamSplit.getEndingOffset(),
+                new ArrayList<>(mergedFinishedSplitInfos.values()),
+                mergedTableSchemas,
+                Math.max(
+                                streamSplit.getTotalFinishedSplitSize(),
+                                streamSplit.getFinishedSnapshotSplitInfos().size())
+                        + newlyAcceptedSplitCount,
+                streamSplit.isSuspended(),
+                streamSplit.isSnapshotCompleted(),
+                streamSplit.getPg10ChildToParentMapping(),
+                streamSplit.getPg10ParentToChildrenMapping(),
+                streamSplit.isPg10RoutingStateInitialized());
     }
 
     /**
@@ -245,7 +398,10 @@ public class StreamSplit extends SourceSplitBase {
                         - (streamSplit.getFinishedSnapshotSplitInfos().size()
                                 - allFinishedSnapshotSplitInfos.size()),
                 streamSplit.isSuspended(),
-                streamSplit.isSnapshotCompleted());
+                streamSplit.isSnapshotCompleted(),
+                streamSplit.getPg10ChildToParentMapping(),
+                streamSplit.getPg10ParentToChildrenMapping(),
+                streamSplit.isPg10RoutingStateInitialized());
     }
 
     public static StreamSplit fillTableSchemas(
@@ -259,7 +415,10 @@ public class StreamSplit extends SourceSplitBase {
                 tableSchemas,
                 streamSplit.getTotalFinishedSplitSize(),
                 streamSplit.isSuspended(),
-                streamSplit.isSnapshotCompleted());
+                streamSplit.isSnapshotCompleted(),
+                streamSplit.getPg10ChildToParentMapping(),
+                streamSplit.getPg10ParentToChildrenMapping(),
+                streamSplit.isPg10RoutingStateInitialized());
     }
 
     public static StreamSplit toNormalStreamSplit(
@@ -272,7 +431,10 @@ public class StreamSplit extends SourceSplitBase {
                 suspendedStreamSplit.getTableSchemas(),
                 totalFinishedSplitSize,
                 false,
-                suspendedStreamSplit.isSnapshotCompleted());
+                suspendedStreamSplit.isSnapshotCompleted(),
+                suspendedStreamSplit.getPg10ChildToParentMapping(),
+                suspendedStreamSplit.getPg10ParentToChildrenMapping(),
+                suspendedStreamSplit.isPg10RoutingStateInitialized());
     }
 
     public static StreamSplit toSuspendedStreamSplit(StreamSplit normalStreamSplit) {
@@ -286,7 +448,37 @@ public class StreamSplit extends SourceSplitBase {
                 normalStreamSplit.getTableSchemas(),
                 normalStreamSplit.getTotalFinishedSplitSize(),
                 true,
-                normalStreamSplit.isSnapshotCompleted());
+                normalStreamSplit.isSnapshotCompleted(),
+                normalStreamSplit.getPg10ChildToParentMapping(),
+                normalStreamSplit.getPg10ParentToChildrenMapping(),
+                normalStreamSplit.isPg10RoutingStateInitialized());
+    }
+
+    public static StreamSplit withPg10RoutingState(
+            StreamSplit streamSplit,
+            Map<TableId, TableId> pg10ChildToParentMapping,
+            Map<TableId, List<TableId>> pg10ParentToChildrenMapping) {
+        return withPg10RoutingState(
+                streamSplit, pg10ChildToParentMapping, pg10ParentToChildrenMapping, true);
+    }
+
+    public static StreamSplit withPg10RoutingState(
+            StreamSplit streamSplit,
+            Map<TableId, TableId> pg10ChildToParentMapping,
+            Map<TableId, List<TableId>> pg10ParentToChildrenMapping,
+            boolean pg10RoutingStateInitialized) {
+        return new StreamSplit(
+                streamSplit.splitId,
+                streamSplit.getStartingOffset(),
+                streamSplit.getEndingOffset(),
+                streamSplit.getFinishedSnapshotSplitInfos(),
+                streamSplit.getTableSchemas(),
+                streamSplit.getTotalFinishedSplitSize(),
+                streamSplit.isSuspended(),
+                streamSplit.isSnapshotCompleted(),
+                pg10ChildToParentMapping,
+                pg10ParentToChildrenMapping,
+                pg10RoutingStateInitialized);
     }
 
     /**
@@ -319,5 +511,16 @@ public class StreamSplit extends SourceSplitBase {
             }
         }
         return updatedSnapshotSplitInfos;
+    }
+
+    private static Map<TableId, List<TableId>> deepCopyParentToChildren(
+            Map<TableId, List<TableId>> parentToChildrenMapping) {
+        Map<TableId, List<TableId>> copied = new LinkedHashMap<>();
+        for (Map.Entry<TableId, List<TableId>> entry : parentToChildrenMapping.entrySet()) {
+            copied.put(
+                    entry.getKey(),
+                    Collections.unmodifiableList(new ArrayList<>(entry.getValue())));
+        }
+        return copied;
     }
 }
