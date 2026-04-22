@@ -408,6 +408,222 @@ class PostgreSQLPartitionedTablePg10ITCase extends PostgresPg10TestBase {
     }
 
     @Test
+    void testOptionalBoundedCompensationBackfillForAcceptedRuntimeChildPg10() throws Exception {
+        setup();
+
+        String databaseName = createUniqueDatabase("pg10_partitioned_runtime_compensation");
+        initializePg10PartitionedTable(databaseName);
+
+        String publicationName =
+                "dbz_publication_pg10_runtime_compensation_" + new Random().nextInt(1000);
+        String slotName = getSlotName();
+        createPublicationAndSlot(
+                databaseName,
+                publicationName,
+                slotName,
+                "inventory_partitioned.products_uk, inventory_partitioned.products_us");
+
+        String sourceDDL =
+                createSourceDDL(
+                        databaseName,
+                        "products",
+                        true,
+                        "pgoutput",
+                        publicationName,
+                        slotName,
+                        "latest-offset",
+                        ", 'scan.pg10.child-partition.backfill.enabled' = 'true'");
+
+        String sinkDDL =
+                "CREATE TABLE sink ("
+                        + " schema_name STRING,"
+                        + " table_name STRING,"
+                        + " id INT,"
+                        + " name STRING,"
+                        + " country STRING"
+                        + ") WITH ("
+                        + " 'connector' = 'values',"
+                        + " 'sink-insert-only' = 'false'"
+                        + ")";
+
+        tEnv.executeSql(sourceDDL);
+        tEnv.executeSql(sinkDDL);
+
+        TableResult result =
+                tEnv.executeSql(
+                        "INSERT INTO sink SELECT schema_name, table_name, id, name, country FROM debezium_source");
+
+        try {
+            long initialActivePid =
+                    waitForReplicationSlotActivePid(
+                            databaseName, slotName, Duration.ofMinutes(2), Duration.ofSeconds(1));
+
+            createRuntimePartition(databaseName, "products_ca", "ca");
+
+            String preAcceptanceMarker = "pre_acceptance_ca_" + new Random().nextInt(1_000_000);
+            String postAcceptanceMarker = "post_acceptance_ca_" + new Random().nextInt(1_000_000);
+
+            insertPartitionRow(
+                    databaseName,
+                    "products_ca",
+                    preAcceptanceMarker,
+                    "created_after_partition_before_restart_acceptance",
+                    2.40,
+                    "ca");
+
+            waitForPublicationTable(
+                    databaseName,
+                    publicationName,
+                    "products_ca",
+                    Duration.ofMinutes(2),
+                    Duration.ofSeconds(1));
+
+            long restartedActivePid =
+                    waitForReplicationSlotActivePidChange(
+                            databaseName,
+                            slotName,
+                            initialActivePid,
+                            Duration.ofMinutes(2),
+                            Duration.ofSeconds(1));
+            Assertions.assertThat(restartedActivePid).isNotEqualTo(initialActivePid);
+
+            insertPartitionRow(
+                    databaseName,
+                    "products_ca",
+                    postAcceptanceMarker,
+                    "created_after_restart_acceptance",
+                    2.60,
+                    "ca");
+
+            waitForCondition(
+                    "accepted runtime child partition compensation + streaming records captured",
+                    rows ->
+                            countRowsContaining(rows, preAcceptanceMarker) == 1
+                                    && countRowsContaining(rows, postAcceptanceMarker) == 1,
+                    Duration.ofMinutes(2),
+                    Duration.ofSeconds(1));
+
+            java.util.List<String> actual = TestValuesTableFactory.getRawResultsAsStrings("sink");
+            Assertions.assertThat(countRowsContaining(actual, preAcceptanceMarker)).isEqualTo(1L);
+            Assertions.assertThat(countRowsContaining(actual, postAcceptanceMarker)).isEqualTo(1L);
+            assertParentMetadataRoutingOnly(actual, "products_uk", "products_us", "products_ca");
+        } finally {
+            cancelJob(result);
+        }
+    }
+
+    @Test
+    void testDisabledCompensationBackfillPreservesOldSemanticsForAcceptedRuntimeChildPg10()
+            throws Exception {
+        setup();
+
+        String databaseName = createUniqueDatabase("pg10_partitioned_runtime_no_compensation");
+        initializePg10PartitionedTable(databaseName);
+
+        String publicationName =
+                "dbz_publication_pg10_runtime_no_compensation_" + new Random().nextInt(1000);
+        String slotName = getSlotName();
+        createPublicationAndSlot(
+                databaseName,
+                publicationName,
+                slotName,
+                "inventory_partitioned.products_uk, inventory_partitioned.products_us");
+
+        String sourceDDL =
+                createSourceDDL(
+                        databaseName,
+                        "products",
+                        true,
+                        "pgoutput",
+                        publicationName,
+                        slotName,
+                        "latest-offset",
+                        ", 'scan.pg10.child-partition.backfill.enabled' = 'false'");
+
+        String sinkDDL =
+                "CREATE TABLE sink ("
+                        + " schema_name STRING,"
+                        + " table_name STRING,"
+                        + " id INT,"
+                        + " name STRING,"
+                        + " country STRING"
+                        + ") WITH ("
+                        + " 'connector' = 'values',"
+                        + " 'sink-insert-only' = 'false'"
+                        + ")";
+
+        tEnv.executeSql(sourceDDL);
+        tEnv.executeSql(sinkDDL);
+
+        TableResult result =
+                tEnv.executeSql(
+                        "INSERT INTO sink SELECT schema_name, table_name, id, name, country FROM debezium_source");
+
+        try {
+            long initialActivePid =
+                    waitForReplicationSlotActivePid(
+                            databaseName, slotName, Duration.ofMinutes(2), Duration.ofSeconds(1));
+
+            createRuntimePartition(databaseName, "products_ca", "ca");
+
+            String preAcceptanceMarker =
+                    "pre_acceptance_no_backfill_ca_" + new Random().nextInt(1_000_000);
+            String postAcceptanceMarker =
+                    "post_acceptance_no_backfill_ca_" + new Random().nextInt(1_000_000);
+
+            insertPartitionRow(
+                    databaseName,
+                    "products_ca",
+                    preAcceptanceMarker,
+                    "created_before_acceptance_without_backfill",
+                    2.40,
+                    "ca");
+
+            waitForPublicationTable(
+                    databaseName,
+                    publicationName,
+                    "products_ca",
+                    Duration.ofMinutes(2),
+                    Duration.ofSeconds(1));
+
+            long restartedActivePid =
+                    waitForReplicationSlotActivePidChange(
+                            databaseName,
+                            slotName,
+                            initialActivePid,
+                            Duration.ofMinutes(2),
+                            Duration.ofSeconds(1));
+            Assertions.assertThat(restartedActivePid).isNotEqualTo(initialActivePid);
+
+            java.util.List<String> rowsAfterAcceptance =
+                    TestValuesTableFactory.getRawResultsAsStrings("sink");
+            Assertions.assertThat(countRowsContaining(rowsAfterAcceptance, preAcceptanceMarker))
+                    .isEqualTo(0L);
+
+            insertPartitionRow(
+                    databaseName,
+                    "products_ca",
+                    postAcceptanceMarker,
+                    "created_after_acceptance_without_backfill",
+                    2.60,
+                    "ca");
+
+            waitForCondition(
+                    "accepted runtime child partition without backfill still captures post-acceptance streaming records",
+                    rows -> countRowsContaining(rows, postAcceptanceMarker) == 1,
+                    Duration.ofMinutes(2),
+                    Duration.ofSeconds(1));
+
+            java.util.List<String> actual = TestValuesTableFactory.getRawResultsAsStrings("sink");
+            Assertions.assertThat(countRowsContaining(actual, preAcceptanceMarker)).isEqualTo(0L);
+            Assertions.assertThat(countRowsContaining(actual, postAcceptanceMarker)).isEqualTo(1L);
+            assertParentMetadataRoutingOnly(actual, "products_uk", "products_us", "products_ca");
+        } finally {
+            cancelJob(result);
+        }
+    }
+
+    @Test
     void testPartitionedTableStartupFromLatestOffsetCapturesOnlyPostStartupPartitionChanges()
             throws Exception {
         setup();
@@ -876,6 +1092,26 @@ class PostgreSQLPartitionedTablePg10ITCase extends PostgresPg10TestBase {
             String publicationName,
             String slotName,
             String startupMode) {
+        return createSourceDDL(
+                databaseName,
+                tableName,
+                includePartitionedTables,
+                pluginName,
+                publicationName,
+                slotName,
+                startupMode,
+                "");
+    }
+
+    private String createSourceDDL(
+            String databaseName,
+            String tableName,
+            boolean includePartitionedTables,
+            String pluginName,
+            String publicationName,
+            String slotName,
+            String startupMode,
+            String extraOptions) {
         String publicationOption =
                 publicationName == null
                         ? ""
@@ -884,6 +1120,7 @@ class PostgreSQLPartitionedTablePg10ITCase extends PostgresPg10TestBase {
                 startupMode == null
                         ? ""
                         : String.format(", 'scan.startup.mode' = '%s'", startupMode);
+        String normalizedExtraOptions = extraOptions == null ? "" : extraOptions;
 
         return String.format(
                 "CREATE TABLE debezium_source ("
@@ -908,6 +1145,7 @@ class PostgreSQLPartitionedTablePg10ITCase extends PostgresPg10TestBase {
                         + " 'slot.name' = '%s'"
                         + "%s"
                         + "%s"
+                        + "%s"
                         + ")",
                 POSTGRES_CONTAINER.getHost(),
                 POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT),
@@ -920,7 +1158,8 @@ class PostgreSQLPartitionedTablePg10ITCase extends PostgresPg10TestBase {
                 pluginName,
                 slotName,
                 publicationOption,
-                startupModeOption);
+                startupModeOption,
+                normalizedExtraOptions);
     }
 
     private void createRuntimePartition(String databaseName, String childTableName, String country)
@@ -955,7 +1194,8 @@ class PostgreSQLPartitionedTablePg10ITCase extends PostgresPg10TestBase {
     private String buildInsertPartitionSql(
             String childTableName, String name, String description, double weight, String country) {
         return String.format(
-                "INSERT INTO inventory_partitioned.%s (name, description, weight, country) VALUES ('%s', '%s', %s, '%s');",
+                "INSERT INTO inventory_partitioned.%s (name, description, weight, country) "
+                        + "VALUES ('%s', '%s', %s, '%s');",
                 childTableName,
                 escapeSqlLiteral(name),
                 escapeSqlLiteral(description),
@@ -1002,7 +1242,8 @@ class PostgreSQLPartitionedTablePg10ITCase extends PostgresPg10TestBase {
             if (System.currentTimeMillis() - start > timeout.toMillis()) {
                 throw new AssertionError(
                         String.format(
-                                "Timeout waiting for replication slot %s active_pid to change from %s; latest pid: %s",
+                                "Timeout waiting for replication slot %s active_pid to change "
+                                        + "from %s; latest pid: %s",
                                 slotName, previousActivePid, activePid));
             }
             Thread.sleep(interval.toMillis());
@@ -1016,7 +1257,8 @@ class PostgreSQLPartitionedTablePg10ITCase extends PostgresPg10TestBase {
                 java.sql.ResultSet resultSet =
                         statement.executeQuery(
                                 String.format(
-                                        "SELECT active_pid FROM pg_replication_slots WHERE slot_name = '%s' AND database = '%s'",
+                                        "SELECT active_pid FROM pg_replication_slots "
+                                                + "WHERE slot_name = '%s' AND database = '%s'",
                                         slotName, databaseName))) {
             if (!resultSet.next()) {
                 throw new AssertionError(
@@ -1103,7 +1345,8 @@ class PostgreSQLPartitionedTablePg10ITCase extends PostgresPg10TestBase {
                 java.sql.ResultSet resultSet =
                         statement.executeQuery(
                                 String.format(
-                                        "SELECT 1 FROM pg_publication_tables WHERE pubname = '%s' AND schemaname = 'inventory_partitioned' AND tablename = '%s'",
+                                        "SELECT 1 FROM pg_publication_tables WHERE pubname = '%s' "
+                                                + "AND schemaname = 'inventory_partitioned' AND tablename = '%s'",
                                         publicationName, tableName))) {
             return resultSet.next();
         }
