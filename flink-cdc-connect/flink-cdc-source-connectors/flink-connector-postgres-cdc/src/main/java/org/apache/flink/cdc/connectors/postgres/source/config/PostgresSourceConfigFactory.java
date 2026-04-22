@@ -57,6 +57,18 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
     private boolean includeDatabaseInTableId =
             PostgresSourceOptions.TABLE_ID_INCLUDE_DATABASE.defaultValue();
 
+    private Duration pg10PublicationPollInterval =
+            PostgresSourceOptions.PG10_PUBLICATION_POLL_INTERVAL.defaultValue();
+
+    private Duration pg10StartupFastPollInterval =
+            PostgresSourceOptions.PG10_STARTUP_FAST_POLL_INTERVAL.defaultValue();
+
+    private Duration pg10StartupFastPollDuration =
+            PostgresSourceOptions.PG10_STARTUP_FAST_POLL_DURATION.defaultValue();
+
+    private boolean pg10ChildPartitionBackfillEnabled =
+            PostgresSourceOptions.PG10_CHILD_PARTITION_BACKFILL_ENABLED.defaultValue();
+
     /** Creates a new {@link PostgresSourceConfig} for the given subtask {@code subtaskId}. */
     @Override
     public PostgresSourceConfig create(int subtaskId) {
@@ -140,7 +152,11 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
                 lsnCommitCheckpointsDelay,
                 assignUnboundedChunkFirst,
                 includePartitionedTables,
-                includeDatabaseInTableId);
+                includeDatabaseInTableId,
+                pg10PublicationPollInterval,
+                pg10StartupFastPollInterval,
+                pg10StartupFastPollDuration,
+                pg10ChildPartitionBackfillEnabled);
     }
 
     /**
@@ -197,5 +213,25 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
     /** Set whether to include database in the generated Table ID. */
     public void setIncludeDatabaseInTableId(boolean includeDatabaseInTableId) {
         this.includeDatabaseInTableId = includeDatabaseInTableId;
+    }
+
+    /** Set the PG10 publication poll interval. */
+    public void setPg10PublicationPollInterval(Duration pg10PublicationPollInterval) {
+        this.pg10PublicationPollInterval = checkNotNull(pg10PublicationPollInterval);
+    }
+
+    /** Set the PG10 startup fast-poll interval. */
+    public void setPg10StartupFastPollInterval(Duration pg10StartupFastPollInterval) {
+        this.pg10StartupFastPollInterval = checkNotNull(pg10StartupFastPollInterval);
+    }
+
+    /** Set the PG10 startup fast-poll duration. */
+    public void setPg10StartupFastPollDuration(Duration pg10StartupFastPollDuration) {
+        this.pg10StartupFastPollDuration = checkNotNull(pg10StartupFastPollDuration);
+    }
+
+    /** Set whether PG10 runtime child-partition compensating backfill is enabled. */
+    public void setPg10ChildPartitionBackfillEnabled(boolean pg10ChildPartitionBackfillEnabled) {
+        this.pg10ChildPartitionBackfillEnabled = pg10ChildPartitionBackfillEnabled;
     }
 }

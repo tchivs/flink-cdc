@@ -309,6 +309,31 @@ public class PostgresSourceBuilder<T> {
         return this;
     }
 
+    /** Set the PG10 publication poll interval used for runtime child discovery. */
+    public PostgresSourceBuilder<T> pg10PublicationPollInterval(Duration publicationPollInterval) {
+        this.configFactory.setPg10PublicationPollInterval(publicationPollInterval);
+        return this;
+    }
+
+    /** Set the PG10 startup fast-poll interval used during the initial discovery window. */
+    public PostgresSourceBuilder<T> pg10StartupFastPollInterval(Duration startupFastPollInterval) {
+        this.configFactory.setPg10StartupFastPollInterval(startupFastPollInterval);
+        return this;
+    }
+
+    /** Set how long the PG10 startup fast-poll interval should remain active. */
+    public PostgresSourceBuilder<T> pg10StartupFastPollDuration(Duration startupFastPollDuration) {
+        this.configFactory.setPg10StartupFastPollDuration(startupFastPollDuration);
+        return this;
+    }
+
+    /** Set whether PG10 runtime child-partition compensating backfill is enabled. */
+    public PostgresSourceBuilder<T> pg10ChildPartitionBackfillEnabled(
+            boolean childPartitionBackfillEnabled) {
+        this.configFactory.setPg10ChildPartitionBackfillEnabled(childPartitionBackfillEnabled);
+        return this;
+    }
+
     /** Whether to include database in the generated Table ID. */
     public PostgresSourceBuilder<T> includeDatabaseInTableId(boolean includeDatabaseInTableId) {
         this.configFactory.setIncludeDatabaseInTableId(includeDatabaseInTableId);

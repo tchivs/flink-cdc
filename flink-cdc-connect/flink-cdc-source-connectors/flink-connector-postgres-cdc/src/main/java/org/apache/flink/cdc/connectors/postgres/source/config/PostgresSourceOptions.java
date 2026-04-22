@@ -98,6 +98,39 @@ public class PostgresSourceOptions extends JdbcSourceOptions {
                                     + "(1) PUBLICATION must be created beforehand with parameter publish_via_partition_root=true\n"
                                     + "(2) Table list (regex or predefined list) should only match the parent table name, if table list matches both parent and child tables, snapshot data will be read twice.");
 
+    public static final ConfigOption<Duration> PG10_PUBLICATION_POLL_INTERVAL =
+            ConfigOptions.key("scan.pg10.publication.poll.interval")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(30))
+                    .withDescription(
+                            "Polling interval used by PG10 runtime child-partition publication discovery."
+                                    + " This only applies when partitioned tables are enabled and a pgoutput publication is configured.");
+
+    public static final ConfigOption<Duration> PG10_STARTUP_FAST_POLL_INTERVAL =
+            ConfigOptions.key("scan.pg10.startup.fast-poll.interval")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(1))
+                    .withDescription(
+                            "Optional shorter polling interval used during the initial PG10 runtime"
+                                    + " discovery window after the streaming session starts.");
+
+    public static final ConfigOption<Duration> PG10_STARTUP_FAST_POLL_DURATION =
+            ConfigOptions.key("scan.pg10.startup.fast-poll.duration")
+                    .durationType()
+                    .defaultValue(Duration.ZERO)
+                    .withDescription(
+                            "How long the optional PG10 startup fast-poll interval should remain"
+                                    + " active. Set to 0 to disable startup fast-polling.");
+
+    public static final ConfigOption<Boolean> PG10_CHILD_PARTITION_BACKFILL_ENABLED =
+            ConfigOptions.key("scan.pg10.child-partition.backfill.enabled")
+                    .booleanType()
+                    .defaultValue(Boolean.FALSE)
+                    .withDescription(
+                            "Whether PG10 runtime-discovered child partitions should use the future"
+                                    + " compensating backfill flow after they become restart-eligible."
+                                    + " Disabled by default to preserve current semantics.");
+
     public static final ConfigOption<Boolean> TABLE_ID_INCLUDE_DATABASE =
             ConfigOptions.key("table-id.include-database")
                     .booleanType()

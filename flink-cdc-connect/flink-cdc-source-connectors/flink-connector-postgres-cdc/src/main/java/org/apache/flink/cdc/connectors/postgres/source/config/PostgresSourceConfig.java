@@ -19,10 +19,12 @@ package org.apache.flink.cdc.connectors.postgres.source.config;
 
 import org.apache.flink.cdc.connectors.base.config.JdbcSourceConfig;
 import org.apache.flink.cdc.connectors.base.options.StartupOptions;
+import org.apache.flink.cdc.connectors.base.source.meta.split.FinishedSnapshotSplitInfo;
 
 import io.debezium.config.Configuration;
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.relational.TableId;
+import io.debezium.relational.history.TableChanges;
 
 import javax.annotation.Nullable;
 
@@ -43,9 +45,15 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
     private final int lsnCommitCheckpointsDelay;
     private final boolean includePartitionedTables;
     private final boolean includeDatabaseInTableId;
-    private Map<TableId, TableId> childToParentMapping;
-    private Map<TableId, List<TableId>> parentToChildrenMapping;
-    private boolean pg10PartitionMappingInitialized;
+    private final Duration pg10PublicationPollInterval;
+    private final Duration pg10StartupFastPollInterval;
+    private final Duration pg10StartupFastPollDuration;
+    private final boolean pg10ChildPartitionBackfillEnabled;
+    private volatile Map<TableId, TableId> childToParentMapping;
+    private volatile Map<TableId, List<TableId>> parentToChildrenMapping;
+    private volatile List<FinishedSnapshotSplitInfo> pg10CompensationFinishedSplitInfos;
+    private volatile Map<TableId, TableChanges.TableChange> pg10CompensationTableSchemas;
+    private volatile boolean pg10PartitionMappingInitialized;
 
     public PostgresSourceConfig(
             int subtaskId,
@@ -77,7 +85,11 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
             int lsnCommitCheckpointsDelay,
             boolean assignUnboundedChunkFirst,
             boolean includePartitionedTables,
-            boolean includeDatabaseInTableId) {
+            boolean includeDatabaseInTableId,
+            Duration pg10PublicationPollInterval,
+            Duration pg10StartupFastPollInterval,
+            Duration pg10StartupFastPollDuration,
+            boolean pg10ChildPartitionBackfillEnabled) {
         super(
                 startupOptions,
                 databaseList,
@@ -109,6 +121,10 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
         this.lsnCommitCheckpointsDelay = lsnCommitCheckpointsDelay;
         this.includePartitionedTables = includePartitionedTables;
         this.includeDatabaseInTableId = includeDatabaseInTableId;
+        this.pg10PublicationPollInterval = pg10PublicationPollInterval;
+        this.pg10StartupFastPollInterval = pg10StartupFastPollInterval;
+        this.pg10StartupFastPollDuration = pg10StartupFastPollDuration;
+        this.pg10ChildPartitionBackfillEnabled = pg10ChildPartitionBackfillEnabled;
     }
 
     /**
@@ -161,6 +177,52 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
     /** Returns whether to include database in the generated Table ID. */
     public boolean isIncludeDatabaseInTableId() {
         return includeDatabaseInTableId;
+    }
+
+    /** Returns the PG10 publication poll interval. */
+    public Duration getPg10PublicationPollInterval() {
+        return pg10PublicationPollInterval;
+    }
+
+    /** Returns the PG10 startup fast-poll interval. */
+    public Duration getPg10StartupFastPollInterval() {
+        return pg10StartupFastPollInterval;
+    }
+
+    /** Returns the PG10 startup fast-poll duration. */
+    public Duration getPg10StartupFastPollDuration() {
+        return pg10StartupFastPollDuration;
+    }
+
+    /** Returns whether PG10 runtime child-partition compensating backfill is enabled. */
+    public boolean isPg10ChildPartitionBackfillEnabled() {
+        return pg10ChildPartitionBackfillEnabled;
+    }
+
+    /** Returns schemas cached for PG10 compensation snapshot splits. */
+    public Map<TableId, TableChanges.TableChange> getPg10CompensationTableSchemasOrEmpty() {
+        return pg10CompensationTableSchemas == null
+                ? Collections.emptyMap()
+                : pg10CompensationTableSchemas;
+    }
+
+    /** Returns finished split infos cached for PG10 compensation snapshot splits. */
+    public List<FinishedSnapshotSplitInfo> getPg10CompensationFinishedSplitInfosOrEmpty() {
+        return pg10CompensationFinishedSplitInfos == null
+                ? Collections.emptyList()
+                : pg10CompensationFinishedSplitInfos;
+    }
+
+    /** Sets schemas cached for PG10 compensation snapshot splits. */
+    public void setPg10CompensationTableSchemas(
+            Map<TableId, TableChanges.TableChange> pg10CompensationTableSchemas) {
+        this.pg10CompensationTableSchemas = pg10CompensationTableSchemas;
+    }
+
+    /** Sets finished split infos cached for PG10 compensation snapshot splits. */
+    public void setPg10CompensationFinishedSplitInfos(
+            List<FinishedSnapshotSplitInfo> pg10CompensationFinishedSplitInfos) {
+        this.pg10CompensationFinishedSplitInfos = pg10CompensationFinishedSplitInfos;
     }
 
     /** Returns the child→parent partition mapping discovered for PG10. */
