@@ -579,15 +579,16 @@ $ ./bin/flink run \
 
 PostgreSQL 10 不支持分区表上的 `PRIMARY KEY`。Flink CDC Postgres 连接器在启动时通过查询 `pg_inherits` 系统目录发现子分区，并将子分区事件重写为父表标识后输出。
 
-**运行时创建的子分区**（CDC 作业启动后创建的）通过协调（reconcile）和重启（restart）流程来捕获：
+**运行时创建的子分区**（CDC 作业启动后创建的）通过协调（reconcile）和重启（restart）流程来捕获。对于 PostgreSQL 10，仅靠 WAL 中的 relation listener 仍然不够，仍然需要 **轮询 catalog/publication**，因为只有在子表被加入 publication 之后，`pgoutput` 才会为该子表发出 `Relation` 元数据。
 
-1. 后台监控线程定期查询系统目录以发现新增的子分区
-2. 检测到新子分区后，在明确的生命周期边界停止当前 streaming session
-3. 主线程通过 `ALTER PUBLICATION ADD TABLE` 将缺失的子分区补齐到 publication
+1. 后台监控线程定期轮询系统目录和 publication，以发现新增的子分区
+2. 对缺失的子分区执行 `ALTER PUBLICATION ADD TABLE`，补齐 publication 成员关系
+3. 新子分区一旦可见，就由 WAL `Relation` 消息或 publication poller 请求一次 restart
 4. 协调器以当前 capture state 为基线，根据最新目录差异计算更新后的路由状态
-5. 使用当前 replication/source offset 和最新的分区映射构建新的 streaming session，子分区事件继续以父表事件身份输出
+5. 使用当前已提交的 restart 边界和最新分区映射构建新的 streaming session，子分区事件继续以父表事件身份输出
+6. 如果 `scan.pg10.child-partition.backfill.enabled = true`，连接器还会为新接受的子分区准备一次**有界补偿回填**
 
-这种 session 重启的方式确保了路由映射永远不会原地修改，Debezium 运行时对象始终在明确的生命周期边界 rebuilt。
+这种 session 重启的方式确保了路由映射永远不会原地修改，Debezium 运行时对象始终在明确的生命周期边界 rebuilt。换句话说，**session restart 仍然是 PG10 的预期行为**，不是异常场景下才发生的恢复动作。
 
 #### 前提条件
 - 仅适用于 PostgreSQL 10
@@ -598,8 +599,11 @@ PostgreSQL 10 不支持分区表上的 `PRIMARY KEY`。Flink CDC Postgres 连接
 #### 限制
 - 仅能发现已捕获的父表下的子分区
 - 不支持运行时发现全新的父表
-- 在子分区被补齐到 publication 之前写入的数据不会被捕获（无回填）
-- 在 session 重启期间会有短暂的流式消费中断
+- 即使有 WAL relation listener，也仍然需要轮询，因为 publication 成员关系必须先被刷新，`pgoutput` 才能暴露对应子表
+- 在 session 重启期间仍然会有短暂的流式消费中断
+- 在执行 `ALTER PUBLICATION ADD TABLE` 之前发生的写入，不会从未发布的 WAL 中被“魔法恢复”出来
+- 可选的 PG10 补偿逻辑会从已接受的 restart 边界开始，对新子分区做一次有界快照读取；它能帮助弥补 publication gap，但**不是** WAL-perfect 的恢复能力
+- 如果关闭 PG10 补偿，行为就保持为当前的“子分区被接受之后才开始捕获”语义
 
 ### DataStream Source
 
