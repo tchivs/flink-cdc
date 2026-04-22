@@ -17,7 +17,12 @@
 
 package org.apache.flink.cdc.connectors.postgres.table;
 
+import org.apache.flink.api.connector.source.Source;
 import org.apache.flink.cdc.connectors.base.options.StartupOptions;
+import org.apache.flink.cdc.connectors.base.source.IncrementalSource;
+import org.apache.flink.cdc.connectors.postgres.source.PostgresSourceBuilder;
+import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
+import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfigFactory;
 import org.apache.flink.cdc.debezium.DebeziumSourceFunction;
 import org.apache.flink.cdc.debezium.table.DebeziumChangelogMode;
 import org.apache.flink.cdc.debezium.utils.ResolvedSchemaUtils;
@@ -34,14 +39,17 @@ import org.apache.flink.table.catalog.UniqueConstraint;
 import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.connector.source.ScanTableSource;
 import org.apache.flink.table.connector.source.SourceFunctionProvider;
+import org.apache.flink.table.connector.source.SourceProvider;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.factories.Factory;
 import org.apache.flink.table.factories.FactoryUtilAdapter;
 import org.apache.flink.table.runtime.connector.source.ScanRuntimeProviderContext;
+import org.apache.flink.util.FlinkRuntimeException;
 
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -64,6 +72,10 @@ import static org.apache.flink.cdc.connectors.base.options.SourceOptions.SCAN_SN
 import static org.apache.flink.cdc.connectors.base.options.SourceOptions.SPLIT_KEY_EVEN_DISTRIBUTION_FACTOR_LOWER_BOUND;
 import static org.apache.flink.cdc.connectors.base.options.SourceOptions.SPLIT_KEY_EVEN_DISTRIBUTION_FACTOR_UPPER_BOUND;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.HEARTBEAT_INTERVAL;
+import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.PG10_CHILD_PARTITION_BACKFILL_ENABLED;
+import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.PG10_PUBLICATION_POLL_INTERVAL;
+import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.PG10_STARTUP_FAST_POLL_DURATION;
+import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.PG10_STARTUP_FAST_POLL_INTERVAL;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.SCAN_LSN_COMMIT_CHECKPOINTS_DELAY;
 import static org.apache.flink.cdc.connectors.utils.AssertUtils.assertProducedTypeOfSourceFunction;
@@ -157,7 +169,11 @@ class PostgreSQLTableFactoryTest {
                         SCAN_LSN_COMMIT_CHECKPOINTS_DELAY.defaultValue(),
                         SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED.defaultValue(),
                         SCAN_READ_CHANGELOG_AS_APPEND_ONLY_ENABLED.defaultValue(),
-                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue());
+                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue(),
+                        PG10_PUBLICATION_POLL_INTERVAL.defaultValue(),
+                        PG10_STARTUP_FAST_POLL_INTERVAL.defaultValue(),
+                        PG10_STARTUP_FAST_POLL_DURATION.defaultValue(),
+                        PG10_CHILD_PARTITION_BACKFILL_ENABLED.defaultValue());
         Assertions.assertThat(actualSource).isEqualTo(expectedSource);
     }
 
@@ -207,7 +223,11 @@ class PostgreSQLTableFactoryTest {
                         SCAN_LSN_COMMIT_CHECKPOINTS_DELAY.defaultValue(),
                         SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED.defaultValue(),
                         true,
-                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue());
+                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue(),
+                        PG10_PUBLICATION_POLL_INTERVAL.defaultValue(),
+                        PG10_STARTUP_FAST_POLL_INTERVAL.defaultValue(),
+                        PG10_STARTUP_FAST_POLL_DURATION.defaultValue(),
+                        PG10_CHILD_PARTITION_BACKFILL_ENABLED.defaultValue());
         Assertions.assertThat(actualSource).isEqualTo(expectedSource);
     }
 
@@ -254,7 +274,11 @@ class PostgreSQLTableFactoryTest {
                         SCAN_LSN_COMMIT_CHECKPOINTS_DELAY.defaultValue(),
                         SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED.defaultValue(),
                         SCAN_READ_CHANGELOG_AS_APPEND_ONLY_ENABLED.defaultValue(),
-                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue());
+                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue(),
+                        PG10_PUBLICATION_POLL_INTERVAL.defaultValue(),
+                        PG10_STARTUP_FAST_POLL_INTERVAL.defaultValue(),
+                        PG10_STARTUP_FAST_POLL_DURATION.defaultValue(),
+                        PG10_CHILD_PARTITION_BACKFILL_ENABLED.defaultValue());
         expectedSource.producedDataType = SCHEMA_WITH_METADATA.toSourceRowDataType();
         expectedSource.metadataKeys =
                 Arrays.asList("row_kind", "op_ts", "database_name", "schema_name", "table_name");
@@ -311,7 +335,11 @@ class PostgreSQLTableFactoryTest {
                         SCAN_LSN_COMMIT_CHECKPOINTS_DELAY.defaultValue(),
                         SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED.defaultValue(),
                         SCAN_READ_CHANGELOG_AS_APPEND_ONLY_ENABLED.defaultValue(),
-                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue());
+                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue(),
+                        PG10_PUBLICATION_POLL_INTERVAL.defaultValue(),
+                        PG10_STARTUP_FAST_POLL_INTERVAL.defaultValue(),
+                        PG10_STARTUP_FAST_POLL_DURATION.defaultValue(),
+                        PG10_CHILD_PARTITION_BACKFILL_ENABLED.defaultValue());
         Assertions.assertThat(actualSource).isEqualTo(expectedSource);
     }
 
@@ -358,8 +386,41 @@ class PostgreSQLTableFactoryTest {
                         SCAN_LSN_COMMIT_CHECKPOINTS_DELAY.defaultValue(),
                         SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED.defaultValue(),
                         SCAN_READ_CHANGELOG_AS_APPEND_ONLY_ENABLED.defaultValue(),
-                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue());
+                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue(),
+                        PG10_PUBLICATION_POLL_INTERVAL.defaultValue(),
+                        PG10_STARTUP_FAST_POLL_INTERVAL.defaultValue(),
+                        PG10_STARTUP_FAST_POLL_DURATION.defaultValue(),
+                        PG10_CHILD_PARTITION_BACKFILL_ENABLED.defaultValue());
         Assertions.assertThat(actualSource).isEqualTo(expectedSource);
+    }
+
+    @Test
+    void testPg10OptionsAreWiredThroughIncrementalRuntimeProvider() {
+        Map<String, String> properties = getAllOptions(MockPostgreSQLTableFactory.IDENTIFIER);
+        properties.put("scan.incremental.snapshot.enabled", "true");
+        properties.put("scan.include-partitioned-tables.enabled", "true");
+        properties.put("scan.pg10.publication.poll.interval", "15 s");
+        properties.put("scan.pg10.startup.fast-poll.interval", "2 s");
+        properties.put("scan.pg10.startup.fast-poll.duration", "20 s");
+        properties.put("scan.pg10.child-partition.backfill.enabled", "true");
+
+        PostgreSQLTableSource tableSource =
+                (PostgreSQLTableSource) createTableSource(SCHEMA, properties);
+
+        ScanTableSource.ScanRuntimeProvider provider =
+                tableSource.getScanRuntimeProvider(ScanRuntimeProviderContext.INSTANCE);
+        Assertions.assertThat(provider).isInstanceOf(SourceProvider.class);
+
+        PostgresSourceConfig sourceConfig =
+                extractConfigFromIncrementalProvider((SourceProvider) provider);
+        Assertions.assertThat(sourceConfig.includePartitionedTables()).isTrue();
+        Assertions.assertThat(sourceConfig.getPg10PublicationPollInterval())
+                .isEqualTo(Duration.ofSeconds(15));
+        Assertions.assertThat(sourceConfig.getPg10StartupFastPollInterval())
+                .isEqualTo(Duration.ofSeconds(2));
+        Assertions.assertThat(sourceConfig.getPg10StartupFastPollDuration())
+                .isEqualTo(Duration.ofSeconds(20));
+        Assertions.assertThat(sourceConfig.isPg10ChildPartitionBackfillEnabled()).isTrue();
     }
 
     @Test
@@ -395,6 +456,58 @@ class PostgreSQLTableFactoryTest {
     }
 
     @Test
+    void testLegacySourceRejectsPg10RuntimeOptions() {
+        Map<String, String> properties = getAllOptions();
+        properties.put("scan.include-partitioned-tables.enabled", "true");
+        properties.put("scan.pg10.publication.poll.interval", "5 s");
+
+        Assertions.assertThatThrownBy(() -> createTableSource(properties))
+                .hasStackTraceContaining("scan.incremental.snapshot.enabled' is disabled")
+                .hasStackTraceContaining("scan.include-partitioned-tables.enabled")
+                .hasStackTraceContaining("scan.pg10.publication.poll.interval");
+    }
+
+    @Test
+    void testRejectInvalidPg10PollIntervals() {
+        Map<String, String> properties = getAllOptions();
+        properties.put("scan.incremental.snapshot.enabled", "true");
+        properties.put("scan.pg10.publication.poll.interval", "0 ms");
+
+        Assertions.assertThatThrownBy(() -> createTableSource(properties))
+                .hasStackTraceContaining("scan.pg10.publication.poll.interval")
+                .hasStackTraceContaining("greater than 0 ms");
+
+        properties.put("scan.pg10.publication.poll.interval", "5 s");
+        properties.put("scan.pg10.startup.fast-poll.interval", "0 ms");
+
+        Assertions.assertThatThrownBy(() -> createTableSource(properties))
+                .hasStackTraceContaining("scan.pg10.startup.fast-poll.interval")
+                .hasStackTraceContaining("greater than 0 ms");
+    }
+
+    @Test
+    void testChildPartitionBackfillOptionIsPubliclyExposedForIncrementalRuntime() {
+        Assertions.assertThat(new PostgreSQLTableFactory().optionalOptions())
+                .contains(PG10_CHILD_PARTITION_BACKFILL_ENABLED);
+
+        Map<String, String> properties = getAllOptions(MockPostgreSQLTableFactory.IDENTIFIER);
+        properties.put("scan.incremental.snapshot.enabled", "true");
+        properties.put("scan.include-partitioned-tables.enabled", "true");
+        properties.put("scan.pg10.child-partition.backfill.enabled", "true");
+
+        PostgreSQLTableSource tableSource =
+                (PostgreSQLTableSource) createTableSource(SCHEMA, properties);
+        ScanTableSource.ScanRuntimeProvider provider =
+                tableSource.getScanRuntimeProvider(ScanRuntimeProviderContext.INSTANCE);
+
+        Assertions.assertThat(provider).isInstanceOf(SourceProvider.class);
+        Assertions.assertThat(
+                        extractConfigFromIncrementalProvider((SourceProvider) provider)
+                                .isPg10ChildPartitionBackfillEnabled())
+                .isTrue();
+    }
+
+    @Test
     void testUpsertModeWithoutPrimaryKeyError() {
         Assertions.assertThatThrownBy(
                         () -> {
@@ -408,8 +521,12 @@ class PostgreSQLTableFactoryTest {
     }
 
     private Map<String, String> getAllOptions() {
+        return getAllOptions("postgres-cdc");
+    }
+
+    private Map<String, String> getAllOptions(String connectorIdentifier) {
         Map<String, String> options = new HashMap<>();
-        options.put("connector", "postgres-cdc");
+        options.put("connector", connectorIdentifier);
         options.put("hostname", MY_LOCALHOST);
         options.put("database-name", MY_DATABASE);
         options.put("schema-name", MY_SCHEMA);
@@ -440,5 +557,21 @@ class PostgreSQLTableFactoryTest {
                 new Configuration(),
                 PostgreSQLTableFactoryTest.class.getClassLoader(),
                 false);
+    }
+
+    private static PostgresSourceConfig extractConfigFromIncrementalProvider(
+            SourceProvider provider) {
+        Source<RowData, ?, ?> source = provider.createSource();
+        Assertions.assertThat(source)
+                .isInstanceOf(PostgresSourceBuilder.PostgresIncrementalSource.class);
+        try {
+            Field configFactoryField = IncrementalSource.class.getDeclaredField("configFactory");
+            configFactoryField.setAccessible(true);
+            PostgresSourceConfigFactory configFactory =
+                    (PostgresSourceConfigFactory) configFactoryField.get(source);
+            return configFactory.create(0);
+        } catch (NoSuchFieldException | IllegalAccessException e) {
+            throw new FlinkRuntimeException(e);
+        }
     }
 }

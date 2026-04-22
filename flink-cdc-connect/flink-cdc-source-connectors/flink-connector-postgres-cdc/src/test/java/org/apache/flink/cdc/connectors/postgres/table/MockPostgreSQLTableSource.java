@@ -68,7 +68,11 @@ public class MockPostgreSQLTableSource extends PostgreSQLTableSource {
                 (int) get(postgreSQLTableSource, "lsnCommitCheckpointsDelay"),
                 (boolean) get(postgreSQLTableSource, "assignUnboundedChunkFirst"),
                 (boolean) get(postgreSQLTableSource, "appendOnly"),
-                (boolean) get(postgreSQLTableSource, "includePartitionedTables"));
+                (boolean) get(postgreSQLTableSource, "includePartitionedTables"),
+                (Duration) get(postgreSQLTableSource, "pg10PublicationPollInterval"),
+                (Duration) get(postgreSQLTableSource, "pg10StartupFastPollInterval"),
+                (Duration) get(postgreSQLTableSource, "pg10StartupFastPollDuration"),
+                (boolean) get(postgreSQLTableSource, "pg10ChildPartitionBackfillEnabled"));
     }
 
     @Override

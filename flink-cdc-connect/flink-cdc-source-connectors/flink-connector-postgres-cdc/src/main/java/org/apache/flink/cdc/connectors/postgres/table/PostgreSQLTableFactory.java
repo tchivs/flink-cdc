@@ -32,7 +32,9 @@ import org.apache.flink.table.factories.DynamicTableSourceFactory;
 import org.apache.flink.table.factories.FactoryUtil;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 
 import static org.apache.flink.cdc.connectors.base.options.JdbcSourceOptions.DATABASE_NAME;
@@ -54,6 +56,10 @@ import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSou
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.CONNECT_TIMEOUT;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.DECODING_PLUGIN_NAME;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.HEARTBEAT_INTERVAL;
+import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.PG10_CHILD_PARTITION_BACKFILL_ENABLED;
+import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.PG10_PUBLICATION_POLL_INTERVAL;
+import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.PG10_STARTUP_FAST_POLL_DURATION;
+import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.PG10_STARTUP_FAST_POLL_INTERVAL;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.PG_PORT;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_KEY_COLUMN;
@@ -119,9 +125,19 @@ public class PostgreSQLTableFactory implements DynamicTableSourceFactory {
         boolean isScanNewlyAddedTableEnabled = config.get(SCAN_NEWLY_ADDED_TABLE_ENABLED);
         int lsnCommitCheckpointsDelay = config.get(SCAN_LSN_COMMIT_CHECKPOINTS_DELAY);
         boolean includePartitionedTables = config.get(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED);
+        Duration pg10PublicationPollInterval = config.get(PG10_PUBLICATION_POLL_INTERVAL);
+        Duration pg10StartupFastPollInterval = config.get(PG10_STARTUP_FAST_POLL_INTERVAL);
+        Duration pg10StartupFastPollDuration = config.get(PG10_STARTUP_FAST_POLL_DURATION);
+        boolean pg10ChildPartitionBackfillEnabled =
+                config.get(PG10_CHILD_PARTITION_BACKFILL_ENABLED);
         boolean assignUnboundedChunkFirst =
                 config.get(SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED);
         boolean appendOnly = config.get(SCAN_READ_CHANGELOG_AS_APPEND_ONLY_ENABLED);
+
+        validatePg10PollOptions(
+                pg10PublicationPollInterval,
+                pg10StartupFastPollInterval,
+                pg10StartupFastPollDuration);
 
         if (enableParallelRead) {
             validateIntegerOption(SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE, splitSize, 1);
@@ -135,6 +151,12 @@ public class PostgreSQLTableFactory implements DynamicTableSourceFactory {
             checkState(
                     !StartupMode.LATEST_OFFSET.equals(startupOptions.startupMode),
                     "The Postgres CDC connector does not support 'latest-offset' startup mode when 'scan.incremental.snapshot.enabled' is disabled, you can enable 'scan.incremental.snapshot.enabled' to use this startup mode.");
+            validateLegacySourceDisallowsPg10RuntimeOptions(
+                    includePartitionedTables,
+                    pg10PublicationPollInterval,
+                    pg10StartupFastPollInterval,
+                    pg10StartupFastPollDuration,
+                    pg10ChildPartitionBackfillEnabled);
         }
 
         OptionUtils.printOptions(IDENTIFIER, config.toMap());
@@ -170,7 +192,11 @@ public class PostgreSQLTableFactory implements DynamicTableSourceFactory {
                 lsnCommitCheckpointsDelay,
                 assignUnboundedChunkFirst,
                 appendOnly,
-                includePartitionedTables);
+                includePartitionedTables,
+                pg10PublicationPollInterval,
+                pg10StartupFastPollInterval,
+                pg10StartupFastPollDuration,
+                pg10ChildPartitionBackfillEnabled);
     }
 
     @Override
@@ -216,6 +242,10 @@ public class PostgreSQLTableFactory implements DynamicTableSourceFactory {
         options.add(SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED);
         options.add(SCAN_READ_CHANGELOG_AS_APPEND_ONLY_ENABLED);
         options.add(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED);
+        options.add(PG10_PUBLICATION_POLL_INTERVAL);
+        options.add(PG10_STARTUP_FAST_POLL_INTERVAL);
+        options.add(PG10_STARTUP_FAST_POLL_DURATION);
+        options.add(PG10_CHILD_PARTITION_BACKFILL_ENABLED);
         return options;
     }
 
@@ -283,5 +313,60 @@ public class PostgreSQLTableFactory implements DynamicTableSourceFactory {
                         0.0d,
                         1.0d,
                         distributionFactorLower));
+    }
+
+    private void validatePg10PollOptions(
+            Duration pg10PublicationPollInterval,
+            Duration pg10StartupFastPollInterval,
+            Duration pg10StartupFastPollDuration) {
+        validatePositiveDuration(PG10_PUBLICATION_POLL_INTERVAL, pg10PublicationPollInterval);
+        validatePositiveDuration(PG10_STARTUP_FAST_POLL_INTERVAL, pg10StartupFastPollInterval);
+        validateNonNegativeDuration(PG10_STARTUP_FAST_POLL_DURATION, pg10StartupFastPollDuration);
+    }
+
+    private void validateLegacySourceDisallowsPg10RuntimeOptions(
+            boolean includePartitionedTables,
+            Duration pg10PublicationPollInterval,
+            Duration pg10StartupFastPollInterval,
+            Duration pg10StartupFastPollDuration,
+            boolean pg10ChildPartitionBackfillEnabled) {
+        List<String> unsupportedOptions = new ArrayList<>();
+        if (includePartitionedTables) {
+            unsupportedOptions.add(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.key());
+        }
+        if (!PG10_PUBLICATION_POLL_INTERVAL.defaultValue().equals(pg10PublicationPollInterval)) {
+            unsupportedOptions.add(PG10_PUBLICATION_POLL_INTERVAL.key());
+        }
+        if (!PG10_STARTUP_FAST_POLL_INTERVAL.defaultValue().equals(pg10StartupFastPollInterval)) {
+            unsupportedOptions.add(PG10_STARTUP_FAST_POLL_INTERVAL.key());
+        }
+        if (!PG10_STARTUP_FAST_POLL_DURATION.defaultValue().equals(pg10StartupFastPollDuration)) {
+            unsupportedOptions.add(PG10_STARTUP_FAST_POLL_DURATION.key());
+        }
+        if (pg10ChildPartitionBackfillEnabled) {
+            unsupportedOptions.add(PG10_CHILD_PARTITION_BACKFILL_ENABLED.key());
+        }
+
+        checkState(
+                unsupportedOptions.isEmpty(),
+                String.format(
+                        "The Postgres CDC connector does not support %s when 'scan.incremental.snapshot.enabled' is disabled.",
+                        unsupportedOptions));
+    }
+
+    private void validatePositiveDuration(ConfigOption<Duration> option, Duration optionValue) {
+        checkState(
+                optionValue.toMillis() > 0,
+                String.format(
+                        "The value of option '%s' must be greater than 0 ms, but is %s",
+                        option.key(), optionValue));
+    }
+
+    private void validateNonNegativeDuration(ConfigOption<Duration> option, Duration optionValue) {
+        checkState(
+                optionValue.toMillis() >= 0,
+                String.format(
+                        "The value of option '%s' must be greater than or equal to 0 ms, but is %s",
+                        option.key(), optionValue));
     }
 }

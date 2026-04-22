@@ -88,6 +88,10 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
     private final boolean assignUnboundedChunkFirst;
     private final boolean appendOnly;
     private final boolean includePartitionedTables;
+    private final Duration pg10PublicationPollInterval;
+    private final Duration pg10StartupFastPollInterval;
+    private final Duration pg10StartupFastPollDuration;
+    private final boolean pg10ChildPartitionBackfillEnabled;
 
     // --------------------------------------------------------------------------------------------
     // Mutable attributes
@@ -130,7 +134,11 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
             int lsnCommitCheckpointsDelay,
             boolean assignUnboundedChunkFirst,
             boolean appendOnly,
-            boolean includePartitionedTables) {
+            boolean includePartitionedTables,
+            Duration pg10PublicationPollInterval,
+            Duration pg10StartupFastPollInterval,
+            Duration pg10StartupFastPollDuration,
+            boolean pg10ChildPartitionBackfillEnabled) {
         this.physicalSchema = physicalSchema;
         this.port = port;
         this.hostname = checkNotNull(hostname);
@@ -165,6 +173,10 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
         this.assignUnboundedChunkFirst = assignUnboundedChunkFirst;
         this.appendOnly = appendOnly;
         this.includePartitionedTables = includePartitionedTables;
+        this.pg10PublicationPollInterval = pg10PublicationPollInterval;
+        this.pg10StartupFastPollInterval = pg10StartupFastPollInterval;
+        this.pg10StartupFastPollDuration = pg10StartupFastPollDuration;
+        this.pg10ChildPartitionBackfillEnabled = pg10ChildPartitionBackfillEnabled;
     }
 
     @Override
@@ -234,6 +246,10 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
                             .lsnCommitCheckpointsDelay(lsnCommitCheckpointsDelay)
                             .assignUnboundedChunkFirst(assignUnboundedChunkFirst)
                             .includePartitionedTables(includePartitionedTables)
+                            .pg10PublicationPollInterval(pg10PublicationPollInterval)
+                            .pg10StartupFastPollInterval(pg10StartupFastPollInterval)
+                            .pg10StartupFastPollDuration(pg10StartupFastPollDuration)
+                            .pg10ChildPartitionBackfillEnabled(pg10ChildPartitionBackfillEnabled)
                             .build();
             return SourceProvider.of(parallelSource);
         } else {
@@ -305,7 +321,11 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
                         lsnCommitCheckpointsDelay,
                         assignUnboundedChunkFirst,
                         appendOnly,
-                        includePartitionedTables);
+                        includePartitionedTables,
+                        pg10PublicationPollInterval,
+                        pg10StartupFastPollInterval,
+                        pg10StartupFastPollDuration,
+                        pg10ChildPartitionBackfillEnabled);
         source.metadataKeys = metadataKeys;
         source.producedDataType = producedDataType;
         return source;
@@ -351,7 +371,12 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
                 && Objects.equals(scanNewlyAddedTableEnabled, that.scanNewlyAddedTableEnabled)
                 && Objects.equals(assignUnboundedChunkFirst, that.assignUnboundedChunkFirst)
                 && Objects.equals(appendOnly, that.appendOnly)
-                && Objects.equals(includePartitionedTables, that.includePartitionedTables);
+                && Objects.equals(includePartitionedTables, that.includePartitionedTables)
+                && Objects.equals(pg10PublicationPollInterval, that.pg10PublicationPollInterval)
+                && Objects.equals(pg10StartupFastPollInterval, that.pg10StartupFastPollInterval)
+                && Objects.equals(pg10StartupFastPollDuration, that.pg10StartupFastPollDuration)
+                && Objects.equals(
+                        pg10ChildPartitionBackfillEnabled, that.pg10ChildPartitionBackfillEnabled);
     }
 
     @Override
@@ -388,7 +413,11 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
                 scanNewlyAddedTableEnabled,
                 assignUnboundedChunkFirst,
                 appendOnly,
-                includePartitionedTables);
+                includePartitionedTables,
+                pg10PublicationPollInterval,
+                pg10StartupFastPollInterval,
+                pg10StartupFastPollDuration,
+                pg10ChildPartitionBackfillEnabled);
     }
 
     @Override
