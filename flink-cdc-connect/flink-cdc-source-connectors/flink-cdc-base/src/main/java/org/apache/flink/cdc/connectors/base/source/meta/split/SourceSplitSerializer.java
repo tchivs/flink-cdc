@@ -38,6 +38,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -46,11 +47,16 @@ import java.util.Map;
  *
  * <p>The modification of 5th version: add isSuspended(boolean) to StreamSplit, which means whether
  * stream split read is suspended.
+ *
+ * <p>The modification of 7th version: add persisted PG10 child-parent routing state to StreamSplit.
+ *
+ * <p>The modification of 8th version: persist whether PG10 routing state has been initialized, even
+ * if the accepted state is empty.
  */
 public abstract class SourceSplitSerializer
         implements SimpleVersionedSerializer<SourceSplitBase>, OffsetDeserializerSerializer {
 
-    private static final int VERSION = 6;
+    private static final int VERSION = 8;
     private static final ThreadLocal<DataOutputSerializer> SERIALIZER_CACHE =
             ThreadLocal.withInitial(() -> new DataOutputSerializer(64));
 
@@ -110,6 +116,9 @@ public abstract class SourceSplitSerializer
             out.writeInt(streamSplit.getTotalFinishedSplitSize());
             out.writeBoolean(streamSplit.isSuspended());
             out.writeBoolean(streamSplit.isSnapshotCompleted());
+            writeTableIdMappings(streamSplit.getPg10ChildToParentMapping(), out);
+            writeParentToChildrenMappings(streamSplit.getPg10ParentToChildrenMapping(), out);
+            out.writeBoolean(streamSplit.isPg10RoutingStateInitialized());
             final byte[] result = out.getCopyOfBuffer();
             out.clear();
             // optimization: cache the serialized from, so we avoid the byte work during repeated
@@ -128,6 +137,8 @@ public abstract class SourceSplitSerializer
             case 4:
             case 5:
             case 6:
+            case 7:
+            case 8:
                 return deserializeSplit(version, serialized);
             default:
                 throw new IOException("Unknown version: " + version);
@@ -186,6 +197,19 @@ public abstract class SourceSplitSerializer
                 isSnapshotCompleted = in.readBoolean();
             }
 
+            Map<TableId, TableId> pg10ChildToParentMapping = new LinkedHashMap<>();
+            Map<TableId, List<TableId>> pg10ParentToChildrenMapping = new LinkedHashMap<>();
+            boolean pg10RoutingStateInitialized = false;
+            if (version >= 7) {
+                pg10ChildToParentMapping = readTableIdMappings(in);
+                pg10ParentToChildrenMapping = readParentToChildrenMappings(in);
+                pg10RoutingStateInitialized =
+                        version >= 8
+                                ? in.readBoolean()
+                                : !pg10ChildToParentMapping.isEmpty()
+                                        || !pg10ParentToChildrenMapping.isEmpty();
+            }
+
             in.releaseArrays();
             return new StreamSplit(
                     splitId,
@@ -195,10 +219,70 @@ public abstract class SourceSplitSerializer
                     tableChangeMap,
                     totalFinishedSplitSize,
                     isSuspended,
-                    isSnapshotCompleted);
+                    isSnapshotCompleted,
+                    pg10ChildToParentMapping,
+                    pg10ParentToChildrenMapping,
+                    pg10RoutingStateInitialized);
         } else {
             throw new IOException("Unknown split kind: " + splitKind);
         }
+    }
+
+    private void writeTableIdMappings(Map<TableId, TableId> mappings, DataOutputSerializer out)
+            throws IOException {
+        out.writeInt(mappings.size());
+        for (Map.Entry<TableId, TableId> entry : mappings.entrySet()) {
+            writeTableId(entry.getKey(), out);
+            writeTableId(entry.getValue(), out);
+        }
+    }
+
+    private Map<TableId, TableId> readTableIdMappings(DataInputDeserializer in) throws IOException {
+        int size = in.readInt();
+        Map<TableId, TableId> mappings = new LinkedHashMap<>(size);
+        for (int i = 0; i < size; i++) {
+            mappings.put(readTableId(in), readTableId(in));
+        }
+        return mappings;
+    }
+
+    private void writeParentToChildrenMappings(
+            Map<TableId, List<TableId>> mappings, DataOutputSerializer out) throws IOException {
+        out.writeInt(mappings.size());
+        for (Map.Entry<TableId, List<TableId>> entry : mappings.entrySet()) {
+            writeTableId(entry.getKey(), out);
+            out.writeInt(entry.getValue().size());
+            for (TableId child : entry.getValue()) {
+                writeTableId(child, out);
+            }
+        }
+    }
+
+    private Map<TableId, List<TableId>> readParentToChildrenMappings(DataInputDeserializer in)
+            throws IOException {
+        int size = in.readInt();
+        Map<TableId, List<TableId>> mappings = new LinkedHashMap<>(size);
+        for (int i = 0; i < size; i++) {
+            TableId parent = readTableId(in);
+            int childSize = in.readInt();
+            List<TableId> children = new ArrayList<>(childSize);
+            for (int j = 0; j < childSize; j++) {
+                children.add(readTableId(in));
+            }
+            mappings.put(parent, children);
+        }
+        return mappings;
+    }
+
+    private void writeTableId(TableId tableId, DataOutputSerializer out) throws IOException {
+        boolean useCatalogBeforeSchema = SerializerUtils.shouldUseCatalogBeforeSchema(tableId);
+        out.writeBoolean(useCatalogBeforeSchema);
+        out.writeUTF(tableId.toDoubleQuotedString());
+    }
+
+    private TableId readTableId(DataInputDeserializer in) throws IOException {
+        boolean useCatalogBeforeSchema = in.readBoolean();
+        return TableId.parse(in.readUTF(), useCatalogBeforeSchema);
     }
 
     public static void writeTableSchemas(
@@ -238,6 +322,8 @@ public abstract class SourceSplitSerializer
                 case 4:
                 case 5:
                 case 6:
+                case 7:
+                case 8:
                     final int len = in.readInt();
                     final byte[] bytes = new byte[len];
                     in.read(bytes);
