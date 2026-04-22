@@ -21,10 +21,14 @@ import org.apache.flink.api.common.eventtime.Watermark;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.connector.source.ReaderOutput;
 import org.apache.flink.api.connector.source.SourceOutput;
+import org.apache.flink.cdc.connectors.base.config.JdbcSourceConfig;
 import org.apache.flink.cdc.connectors.base.options.StartupOptions;
+import org.apache.flink.cdc.connectors.base.source.meta.events.LatestFinishedSplitsNumberEvent;
 import org.apache.flink.cdc.connectors.base.source.meta.split.SnapshotSplit;
 import org.apache.flink.cdc.connectors.base.source.meta.split.SourceSplitBase;
+import org.apache.flink.cdc.connectors.base.source.meta.split.SourceSplitState;
 import org.apache.flink.cdc.connectors.base.source.meta.split.StreamSplit;
+import org.apache.flink.cdc.connectors.base.source.meta.split.StreamSplitState;
 import org.apache.flink.cdc.connectors.postgres.PostgresTestBase;
 import org.apache.flink.cdc.connectors.postgres.source.MockPostgresDialect;
 import org.apache.flink.cdc.connectors.postgres.source.PostgresDialect;
@@ -43,7 +47,9 @@ import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.util.Collector;
 
+import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
+import io.debezium.relational.Tables;
 import io.debezium.relational.history.TableChanges;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.AfterEach;
@@ -52,18 +58,23 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.apache.flink.core.io.InputStatus.END_OF_INPUT;
 import static org.apache.flink.core.io.InputStatus.MORE_AVAILABLE;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.entry;
 
 /** Tests for {@link PostgresSourceReader}. */
 public class PostgresSourceReaderTest extends PostgresTestBase {
@@ -87,6 +98,7 @@ public class PostgresSourceReaderTest extends PostgresTestBase {
 
     @AfterEach
     public void after() throws Exception {
+        PostgresSourceReader.clearSnapshotStreamSplitHook();
         customDatabase.removeSlot(slotName);
     }
 
@@ -295,6 +307,365 @@ public class PostgresSourceReaderTest extends PostgresTestBase {
                 .isTrue();
     }
 
+    @Test
+    void testRestoredPg10RoutingStateSeedsReaderAndSnapshotsBack() throws Exception {
+        PostgresSourceConfigFactory configFactory = createConfigFactory();
+        configFactory.startupOptions(StartupOptions.latest());
+
+        PostgresSourceConfig dialectConfig = configFactory.create(0);
+        PostgresDialect dialect = new MockPostgresDialect(dialectConfig);
+        Map<TableId, TableChanges.TableChange> tableSchemas =
+                dialect.discoverDataCollectionSchemas(dialectConfig);
+
+        TableId parentTable = new TableId(null, SCHEMA_NAME, "Customers");
+        TableId childUk = new TableId(null, SCHEMA_NAME, "Customers_uk");
+        TableId childUs = new TableId(null, SCHEMA_NAME, "Customers_us");
+
+        StreamSplit restoredSplit =
+                new StreamSplit(
+                        StreamSplit.STREAM_SPLIT_ID,
+                        new PostgresOffsetFactory().createInitialOffset(),
+                        new PostgresOffsetFactory().createNoStoppingOffset(),
+                        Collections.emptyList(),
+                        tableSchemas,
+                        0,
+                        false,
+                        false,
+                        new LinkedHashMap<>(Map.of(childUk, parentTable, childUs, parentTable)),
+                        new LinkedHashMap<>(
+                                Map.of(parentTable, new ArrayList<>(List.of(childUk, childUs)))));
+
+        PostgresSourceReader reader = createReaderWithFactory(configFactory, dialect);
+        reader.addSplits(Collections.singletonList(restoredSplit));
+
+        PostgresSourceConfig restoredReaderConfig = extractReaderSourceConfig(reader);
+        PostgresDialect restoredDialect = extractReaderDialect(reader);
+
+        assertThat(restoredReaderConfig.isPg10PartitionMappingInitialized()).isTrue();
+        assertThat(restoredReaderConfig.getChildToParentMappingOrEmpty())
+                .containsEntry(childUk, parentTable)
+                .containsEntry(childUs, parentTable);
+        assertThat(restoredReaderConfig.getParentToChildrenMappingOrEmpty().get(parentTable))
+                .containsExactly(childUk, childUs);
+        assertThat(restoredDialect.createFetchTask(restoredSplit))
+                .isInstanceOf(
+                        org.apache.flink.cdc.connectors.postgres.source.fetch.Pg10StreamFetchTask
+                                .class);
+
+        List<SourceSplitBase> snapshotSplits = reader.snapshotState(1L);
+        assertThat(snapshotSplits).hasSize(1);
+        StreamSplit snapshottedSplit = snapshotSplits.get(0).asStreamSplit();
+        assertThat(snapshottedSplit.getPg10ChildToParentMapping())
+                .containsEntry(childUk, parentTable)
+                .containsEntry(childUs, parentTable);
+        assertThat(snapshottedSplit.getPg10ParentToChildrenMapping().get(parentTable))
+                .containsExactly(childUk, childUs);
+    }
+
+    @Test
+    void testRestoredPg10RoutingStateAppliedBeforeSchemaRediscovery() throws Exception {
+        PostgresSourceConfigFactory configFactory = createConfigFactory();
+        configFactory.startupOptions(StartupOptions.latest());
+        configFactory.scanNewlyAddedTableEnabled(true);
+
+        PostgresSourceConfig dialectConfig = configFactory.create(0);
+        TableId parentTable = new TableId(null, SCHEMA_NAME, "Customers");
+        TableId childUk = new TableId(null, SCHEMA_NAME, "Customers_uk");
+        TableId childUs = new TableId(null, SCHEMA_NAME, "Customers_us");
+        Map<TableId, TableChanges.TableChange> restoredTableSchemas =
+                createTableSchemas(parentTable, childUk, childUs);
+
+        RecordingMockPostgresDialect dialect =
+                new RecordingMockPostgresDialect(
+                        dialectConfig, restoredTableSchemas, childUk, childUs);
+
+        StreamSplit restoredSplit =
+                new StreamSplit(
+                        StreamSplit.STREAM_SPLIT_ID,
+                        new PostgresOffsetFactory().createInitialOffset(),
+                        new PostgresOffsetFactory().createNoStoppingOffset(),
+                        Collections.emptyList(),
+                        restoredTableSchemas,
+                        0,
+                        false,
+                        false,
+                        new LinkedHashMap<>(Map.of(childUk, parentTable, childUs, parentTable)),
+                        new LinkedHashMap<>(
+                                Map.of(parentTable, new ArrayList<>(List.of(childUk, childUs)))));
+
+        PostgresSourceReader reader = createReaderWithFactory(configFactory, dialect);
+
+        reader.addSplits(Collections.singletonList(restoredSplit));
+
+        assertThat(dialect.getSchemaRediscoveryCalls()).isEqualTo(1);
+        assertThat(dialect.hasRestoredPg10RoutingStateAtSchemaRediscovery()).isTrue();
+        assertThat(dialect.getObservedChildToParentMapping())
+                .containsEntry(childUk, parentTable)
+                .containsEntry(childUs, parentTable);
+    }
+
+    @Test
+    void testRestoredPg10RoutingStateWinsOverStaleReaderConfig() throws Exception {
+        PostgresSourceConfigFactory configFactory = createConfigFactory();
+        configFactory.startupOptions(StartupOptions.latest());
+
+        PostgresSourceConfig dialectConfig = configFactory.create(0);
+        PostgresDialect dialect = new MockPostgresDialect(dialectConfig);
+        Map<TableId, TableChanges.TableChange> tableSchemas =
+                dialect.discoverDataCollectionSchemas(dialectConfig);
+
+        TableId parentTable = new TableId(null, SCHEMA_NAME, "Customers");
+        TableId childUk = new TableId(null, SCHEMA_NAME, "Customers_uk");
+        TableId childUs = new TableId(null, SCHEMA_NAME, "Customers_us");
+
+        StreamSplit restoredSplit =
+                new StreamSplit(
+                        StreamSplit.STREAM_SPLIT_ID,
+                        new PostgresOffsetFactory().createInitialOffset(),
+                        new PostgresOffsetFactory().createNoStoppingOffset(),
+                        Collections.emptyList(),
+                        tableSchemas,
+                        0,
+                        false,
+                        false,
+                        new LinkedHashMap<>(Map.of(childUk, parentTable, childUs, parentTable)),
+                        new LinkedHashMap<>(
+                                Map.of(parentTable, new ArrayList<>(List.of(childUk, childUs)))));
+
+        PostgresSourceReader reader = createReaderWithFactory(configFactory, dialect);
+        PostgresSourceConfig readerConfig = extractReaderSourceConfig(reader);
+        readerConfig.setChildToParentMapping(new LinkedHashMap<>(Map.of(childUk, parentTable)));
+        readerConfig.setParentToChildrenMapping(
+                new LinkedHashMap<>(Map.of(parentTable, new ArrayList<>(List.of(childUk)))));
+        readerConfig.setPg10PartitionMappingInitialized(true);
+
+        reader.addSplits(Collections.singletonList(restoredSplit));
+
+        PostgresSourceConfig restoredReaderConfig = extractReaderSourceConfig(reader);
+        assertThat(restoredReaderConfig.getChildToParentMappingOrEmpty())
+                .containsEntry(childUk, parentTable)
+                .containsEntry(childUs, parentTable);
+        assertThat(restoredReaderConfig.getParentToChildrenMappingOrEmpty().get(parentTable))
+                .containsExactly(childUk, childUs);
+
+        List<SourceSplitBase> snapshotSplits = reader.snapshotState(1L);
+        assertThat(snapshotSplits).hasSize(1);
+        StreamSplit snapshottedSplit = snapshotSplits.get(0).asStreamSplit();
+        assertThat(snapshottedSplit.getPg10ChildToParentMapping())
+                .containsEntry(childUk, parentTable)
+                .containsEntry(childUs, parentTable);
+        assertThat(snapshottedSplit.getPg10ParentToChildrenMapping().get(parentTable))
+                .containsExactly(childUk, childUs);
+    }
+
+    @Test
+    void testSnapshotStatePersistsAcceptedRuntimePg10RoutingFromSharedConfig() throws Exception {
+        PostgresSourceConfigFactory configFactory = createConfigFactory();
+        configFactory.startupOptions(StartupOptions.latest());
+
+        PostgresSourceConfig dialectConfig = configFactory.create(0);
+        PostgresDialect dialect = new MockPostgresDialect(dialectConfig);
+        Map<TableId, TableChanges.TableChange> tableSchemas =
+                dialect.discoverDataCollectionSchemas(dialectConfig);
+
+        TableId parentTable = new TableId(null, SCHEMA_NAME, "Customers");
+        TableId childUk = new TableId(null, SCHEMA_NAME, "Customers_uk");
+        TableId childUs = new TableId(null, SCHEMA_NAME, "Customers_us");
+
+        StreamSplit restoredSplit =
+                new StreamSplit(
+                        StreamSplit.STREAM_SPLIT_ID,
+                        new PostgresOffsetFactory().createInitialOffset(),
+                        new PostgresOffsetFactory().createNoStoppingOffset(),
+                        Collections.emptyList(),
+                        tableSchemas,
+                        0,
+                        false,
+                        false,
+                        new LinkedHashMap<>(Map.of(childUk, parentTable)),
+                        new LinkedHashMap<>(
+                                Map.of(parentTable, new ArrayList<>(List.of(childUk)))));
+
+        PostgresSourceReader reader = createReaderWithFactory(configFactory, dialect);
+        reader.addSplits(Collections.singletonList(restoredSplit));
+
+        PostgresSourceConfig readerConfig = extractReaderSourceConfig(reader);
+        readerConfig.setChildToParentMapping(
+                new LinkedHashMap<>(Map.of(childUk, parentTable, childUs, parentTable)));
+        readerConfig.setParentToChildrenMapping(
+                new LinkedHashMap<>(
+                        Map.of(parentTable, new ArrayList<>(List.of(childUk, childUs)))));
+        readerConfig.setPg10PartitionMappingInitialized(true);
+
+        List<SourceSplitBase> snapshotSplits = reader.snapshotState(1L);
+        assertThat(snapshotSplits).hasSize(1);
+        StreamSplit snapshottedSplit = snapshotSplits.get(0).asStreamSplit();
+        assertThat(snapshottedSplit.getPg10ChildToParentMapping())
+                .containsEntry(childUk, parentTable)
+                .containsEntry(childUs, parentTable);
+        assertThat(snapshottedSplit.getPg10ParentToChildrenMapping().get(parentTable))
+                .containsExactly(childUk, childUs);
+    }
+
+    @Test
+    void testSnapshotStateHookObservesMaterializedAcceptedRuntimePg10Routing() throws Exception {
+        PostgresSourceConfigFactory configFactory = createConfigFactory();
+        configFactory.startupOptions(StartupOptions.latest());
+
+        PostgresSourceConfig dialectConfig = configFactory.create(0);
+        PostgresDialect dialect = new MockPostgresDialect(dialectConfig);
+        Map<TableId, TableChanges.TableChange> tableSchemas =
+                dialect.discoverDataCollectionSchemas(dialectConfig);
+
+        TableId parentTable = new TableId(null, SCHEMA_NAME, "Customers");
+        TableId childUk = new TableId(null, SCHEMA_NAME, "Customers_uk");
+        TableId childUs = new TableId(null, SCHEMA_NAME, "Customers_us");
+
+        StreamSplit restoredSplit =
+                new StreamSplit(
+                        StreamSplit.STREAM_SPLIT_ID,
+                        new PostgresOffsetFactory().createInitialOffset(),
+                        new PostgresOffsetFactory().createNoStoppingOffset(),
+                        Collections.emptyList(),
+                        tableSchemas,
+                        0,
+                        false,
+                        false,
+                        new LinkedHashMap<>(Map.of(childUk, parentTable)),
+                        new LinkedHashMap<>(
+                                Map.of(parentTable, new ArrayList<>(List.of(childUk)))));
+
+        AtomicReference<StreamSplit> observedSnapshotSplit = new AtomicReference<>();
+        PostgresSourceReader.setSnapshotStreamSplitHook(observedSnapshotSplit::set);
+
+        PostgresSourceReader reader = createReaderWithFactory(configFactory, dialect);
+        reader.addSplits(Collections.singletonList(restoredSplit));
+
+        PostgresSourceConfig readerConfig = extractReaderSourceConfig(reader);
+        readerConfig.setChildToParentMapping(
+                new LinkedHashMap<>(Map.of(childUk, parentTable, childUs, parentTable)));
+        readerConfig.setParentToChildrenMapping(
+                new LinkedHashMap<>(
+                        Map.of(parentTable, new ArrayList<>(List.of(childUk, childUs)))));
+        readerConfig.setPg10PartitionMappingInitialized(true);
+
+        List<SourceSplitBase> snapshotSplits = reader.snapshotState(1L);
+        StreamSplit snapshottedSplit = snapshotSplits.get(0).asStreamSplit();
+
+        assertThat(observedSnapshotSplit.get()).isNotNull();
+        assertThat(observedSnapshotSplit.get()).isEqualTo(snapshottedSplit);
+        assertThat(observedSnapshotSplit.get().getPg10ChildToParentMapping())
+                .containsEntry(childUk, parentTable)
+                .containsEntry(childUs, parentTable);
+        assertThat(observedSnapshotSplit.get().getPg10ParentToChildrenMapping().get(parentTable))
+                .containsExactly(childUk, childUs);
+    }
+
+    @Test
+    void testSnapshotStatePersistsInitializedButEmptyPg10RoutingState() throws Exception {
+        PostgresSourceConfigFactory configFactory = createConfigFactory();
+        configFactory.startupOptions(StartupOptions.latest());
+
+        PostgresSourceConfig dialectConfig = configFactory.create(0);
+        PostgresDialect dialect = new MockPostgresDialect(dialectConfig);
+        Map<TableId, TableChanges.TableChange> tableSchemas =
+                dialect.discoverDataCollectionSchemas(dialectConfig);
+
+        TableId parentTable = new TableId(null, SCHEMA_NAME, "Customers");
+        TableId childUk = new TableId(null, SCHEMA_NAME, "Customers_uk");
+
+        StreamSplit restoredSplit =
+                new StreamSplit(
+                        StreamSplit.STREAM_SPLIT_ID,
+                        new PostgresOffsetFactory().createInitialOffset(),
+                        new PostgresOffsetFactory().createNoStoppingOffset(),
+                        Collections.emptyList(),
+                        tableSchemas,
+                        0,
+                        false,
+                        false,
+                        new LinkedHashMap<>(Map.of(childUk, parentTable)),
+                        new LinkedHashMap<>(
+                                Map.of(parentTable, new ArrayList<>(List.of(childUk)))));
+
+        PostgresSourceReader reader = createReaderWithFactory(configFactory, dialect);
+        reader.addSplits(Collections.singletonList(restoredSplit));
+
+        PostgresSourceConfig readerConfig = extractReaderSourceConfig(reader);
+        readerConfig.setChildToParentMapping(new LinkedHashMap<>());
+        readerConfig.setParentToChildrenMapping(new LinkedHashMap<>());
+        readerConfig.setPg10PartitionMappingInitialized(true);
+
+        List<SourceSplitBase> snapshotSplits = reader.snapshotState(1L);
+        StreamSplit snapshottedSplit = snapshotSplits.get(0).asStreamSplit();
+
+        assertThat(snapshottedSplit.getPg10ChildToParentMapping()).isEmpty();
+        assertThat(snapshottedSplit.getPg10ParentToChildrenMapping()).isEmpty();
+        assertThat(snapshottedSplit.isPg10RoutingStateInitialized()).isTrue();
+    }
+
+    @Test
+    void testSuspendLifecycleDoesNotReapplyStalePg10RoutingState() throws Exception {
+        PostgresSourceConfigFactory configFactory = createConfigFactory();
+        configFactory.startupOptions(StartupOptions.latest());
+
+        PostgresSourceConfig dialectConfig = configFactory.create(0);
+        PostgresDialect dialect = new MockPostgresDialect(dialectConfig);
+        Map<TableId, TableChanges.TableChange> tableSchemas =
+                dialect.discoverDataCollectionSchemas(dialectConfig);
+
+        TableId parentTable = new TableId(null, SCHEMA_NAME, "Customers");
+        TableId childUk = new TableId(null, SCHEMA_NAME, "Customers_uk");
+        TableId childUs = new TableId(null, SCHEMA_NAME, "Customers_us");
+
+        StreamSplit restoredSplit =
+                new StreamSplit(
+                        StreamSplit.STREAM_SPLIT_ID,
+                        new PostgresOffsetFactory().createInitialOffset(),
+                        new PostgresOffsetFactory().createNoStoppingOffset(),
+                        Collections.emptyList(),
+                        tableSchemas,
+                        0,
+                        false,
+                        false,
+                        new LinkedHashMap<>(Map.of(childUk, parentTable)),
+                        new LinkedHashMap<>(
+                                Map.of(parentTable, new ArrayList<>(List.of(childUk)))));
+
+        PostgresSourceReader reader = createReaderWithFactory(configFactory, dialect);
+        reader.addSplits(Collections.singletonList(restoredSplit));
+
+        PostgresSourceConfig readerConfig = extractReaderSourceConfig(reader);
+        readerConfig.setChildToParentMapping(new LinkedHashMap<>(Map.of(childUs, parentTable)));
+        readerConfig.setParentToChildrenMapping(
+                new LinkedHashMap<>(Map.of(parentTable, new ArrayList<>(List.of(childUs)))));
+        readerConfig.setPg10PartitionMappingInitialized(true);
+
+        StreamSplitState staleStreamSplitState = new StreamSplitState(restoredSplit);
+        Method onSplitFinished =
+                reader.getClass()
+                        .getSuperclass()
+                        .getSuperclass()
+                        .getDeclaredMethod("onSplitFinished", Map.class);
+        onSplitFinished.setAccessible(true);
+        extractReaderContext(reader).suspendStreamSplitReader();
+        Map<String, SourceSplitState> finishedSplitIds =
+                new LinkedHashMap<>(Map.of(StreamSplit.STREAM_SPLIT_ID, staleStreamSplitState));
+        onSplitFinished.invoke(reader, finishedSplitIds);
+
+        StreamSplit suspendedStreamSplit = extractSuspendedStreamSplit(reader);
+        assertThat(suspendedStreamSplit).isNotNull();
+        assertThat(suspendedStreamSplit.getPg10ChildToParentMapping())
+                .containsOnly(entry(childUs, parentTable));
+        assertThat(suspendedStreamSplit.getPg10ParentToChildrenMapping().get(parentTable))
+                .containsExactly(childUs);
+
+        reader.handleSourceEvents(new LatestFinishedSplitsNumberEvent(0));
+        PostgresSourceConfig restoredReaderConfig = extractReaderSourceConfig(reader);
+        assertThat(restoredReaderConfig.getChildToParentMappingOrEmpty())
+                .containsOnly(entry(childUs, parentTable));
+    }
+
     private List<String> consumeSnapshotRecords(
             PostgresSourceReader sourceReader, DataType recordType) throws Exception {
         // Poll all the  records of the multiple assigned snapshot split.
@@ -315,11 +686,16 @@ public class PostgresSourceReaderTest extends PostgresTestBase {
 
     private PostgresSourceReader createReader(
             final int lsnCommitCheckpointsDelay, boolean skipBackFill) throws Exception {
-        final PostgresOffsetFactory offsetFactory = new PostgresOffsetFactory();
         final PostgresSourceConfigFactory configFactory = createConfigFactory();
+        MockPostgresDialect dialect = new MockPostgresDialect(configFactory.create(0));
         configFactory.setLsnCommitCheckpointsDelay(lsnCommitCheckpointsDelay);
         configFactory.skipSnapshotBackfill(skipBackFill);
-        MockPostgresDialect dialect = new MockPostgresDialect(configFactory.create(0));
+        return createReaderWithFactory(configFactory, dialect);
+    }
+
+    private PostgresSourceReader createReaderWithFactory(
+            PostgresSourceConfigFactory configFactory, PostgresDialect dialect) throws Exception {
+        final PostgresOffsetFactory offsetFactory = new PostgresOffsetFactory();
         final PostgresSourceBuilder.PostgresIncrementalSource<?> source =
                 new PostgresSourceBuilder.PostgresIncrementalSource<>(
                         configFactory, new ForwardDeserializeSchema(), offsetFactory, dialect);
@@ -338,6 +714,43 @@ public class PostgresSourceReaderTest extends PostgresTestBase {
         return source.createReader(new TestingReaderContext());
     }
 
+    private PostgresSourceConfig extractReaderSourceConfig(PostgresSourceReader reader)
+            throws Exception {
+        Field sourceConfigField =
+                reader.getClass().getSuperclass().getSuperclass().getDeclaredField("sourceConfig");
+        sourceConfigField.setAccessible(true);
+        return (PostgresSourceConfig) sourceConfigField.get(reader);
+    }
+
+    private PostgresDialect extractReaderDialect(PostgresSourceReader reader) throws Exception {
+        Field dialectField =
+                reader.getClass().getSuperclass().getSuperclass().getDeclaredField("dialect");
+        dialectField.setAccessible(true);
+        return (PostgresDialect) dialectField.get(reader);
+    }
+
+    private org.apache.flink.cdc.connectors.base.source.reader.IncrementalSourceReaderContext
+            extractReaderContext(PostgresSourceReader reader) throws Exception {
+        Field readerContextField =
+                reader.getClass()
+                        .getSuperclass()
+                        .getSuperclass()
+                        .getDeclaredField("incrementalSourceReaderContext");
+        readerContextField.setAccessible(true);
+        return (org.apache.flink.cdc.connectors.base.source.reader.IncrementalSourceReaderContext)
+                readerContextField.get(reader);
+    }
+
+    private StreamSplit extractSuspendedStreamSplit(PostgresSourceReader reader) throws Exception {
+        Field suspendedStreamSplitField =
+                reader.getClass()
+                        .getSuperclass()
+                        .getSuperclass()
+                        .getDeclaredField("suspendedStreamSplit");
+        suspendedStreamSplitField.setAccessible(true);
+        return (StreamSplit) suspendedStreamSplitField.get(reader);
+    }
+
     private PostgresSourceConfigFactory createConfigFactory() {
         final PostgresSourceConfigFactory configFactory = new PostgresSourceConfigFactory();
         configFactory.hostname(customDatabase.getHost());
@@ -347,7 +760,20 @@ public class PostgresSourceReaderTest extends PostgresTestBase {
         configFactory.username(customDatabase.getUsername());
         configFactory.password(customDatabase.getPassword());
         configFactory.decodingPluginName("pgoutput");
+        configFactory.slotName(slotName);
         return configFactory;
+    }
+
+    private Map<TableId, TableChanges.TableChange> createTableSchemas(TableId... tableIds) {
+        Map<TableId, TableChanges.TableChange> tableSchemas = new LinkedHashMap<>();
+        Tables tables = new Tables();
+        for (TableId tableId : tableIds) {
+            Table table = tables.editOrCreateTable(tableId).create();
+            tableSchemas.put(
+                    tableId,
+                    new TableChanges.TableChange(TableChanges.TableChangeType.CREATE, table));
+        }
+        return tableSchemas;
     }
 
     // ------------------------------------------------------------------------
@@ -404,6 +830,52 @@ public class PostgresSourceReaderTest extends PostgresTestBase {
         @Override
         public TypeInformation<SourceRecord> getProducedType() {
             return TypeInformation.of(SourceRecord.class);
+        }
+    }
+
+    private static class RecordingMockPostgresDialect extends MockPostgresDialect {
+
+        private final Map<TableId, TableChanges.TableChange> rediscoveredTableSchemas;
+        private final TableId expectedChildUk;
+        private final TableId expectedChildUs;
+        private int schemaRediscoveryCalls;
+        private boolean restoredPg10RoutingStateAtSchemaRediscovery;
+        private Map<TableId, TableId> observedChildToParentMapping = Collections.emptyMap();
+
+        private RecordingMockPostgresDialect(
+                PostgresSourceConfig sourceConfig,
+                Map<TableId, TableChanges.TableChange> rediscoveredTableSchemas,
+                TableId expectedChildUk,
+                TableId expectedChildUs) {
+            super(sourceConfig);
+            this.rediscoveredTableSchemas = rediscoveredTableSchemas;
+            this.expectedChildUk = expectedChildUk;
+            this.expectedChildUs = expectedChildUs;
+        }
+
+        @Override
+        public Map<TableId, TableChanges.TableChange> discoverDataCollectionSchemas(
+                JdbcSourceConfig sourceConfig) {
+            schemaRediscoveryCalls++;
+            PostgresSourceConfig postgresSourceConfig = (PostgresSourceConfig) sourceConfig;
+            observedChildToParentMapping =
+                    new LinkedHashMap<>(postgresSourceConfig.getChildToParentMappingOrEmpty());
+            restoredPg10RoutingStateAtSchemaRediscovery =
+                    observedChildToParentMapping.containsKey(expectedChildUk)
+                            && observedChildToParentMapping.containsKey(expectedChildUs);
+            return new LinkedHashMap<>(rediscoveredTableSchemas);
+        }
+
+        private int getSchemaRediscoveryCalls() {
+            return schemaRediscoveryCalls;
+        }
+
+        private boolean hasRestoredPg10RoutingStateAtSchemaRediscovery() {
+            return restoredPg10RoutingStateAtSchemaRediscovery;
+        }
+
+        private Map<TableId, TableId> getObservedChildToParentMapping() {
+            return observedChildToParentMapping;
         }
     }
 }
