@@ -58,9 +58,7 @@ public class Selectors {
             this.namespacePred =
                     namespace == null ? (namespacePred) -> true : Predicates.includes(namespace);
             this.schemaNamePred =
-                    schemaName == null
-                            ? (schemaNamePred) -> true
-                            : Predicates.includes(schemaName);
+                    schemaName == null ? (schemaNamePred) -> true : Predicates.includes(schemaName);
             this.tableNamePred =
                     tableName == null ? (tableNamePred) -> false : Predicates.includes(tableName);
         }

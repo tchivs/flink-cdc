@@ -60,21 +60,23 @@ import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSource
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CONNECTION_POOL_SIZE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CONNECT_MAX_RETRIES;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CONNECT_TIMEOUT;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.DATABASE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.DECODING_PLUGIN_NAME;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.HEARTBEAT_INTERVAL;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.HOSTNAME;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.METADATA_LIST;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PASSWORD;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PG_PORT;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_CLOSE_IDLE_READER_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_BACKFILL_SKIP;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_KEY_COLUMN;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_LSN_COMMIT_CHECKPOINTS_DELAY;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_SNAPSHOT_FETCH_SIZE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_STARTUP_MODE;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCHEMA;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCHEMA_CHANGE_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SERVER_TIME_ZONE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SLOT_NAME;
@@ -111,6 +113,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         String password = config.get(PASSWORD);
         String chunkKeyColumn = config.get(SCAN_INCREMENTAL_SNAPSHOT_CHUNK_KEY_COLUMN);
         String tables = config.get(TABLES);
+        String schema = config.get(SCHEMA);
         ZoneId serverTimeZone = getServerTimeZone(config);
         String tablesExclude = config.get(TABLES_EXCLUDE);
         Duration heartbeatInterval = config.get(HEARTBEAT_INTERVAL);
@@ -147,14 +150,18 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         validateDistributionFactorLower(distributionFactorLower);
 
         Map<String, String> configMap = config.toMap();
-        Optional<String> databaseName = getValidateDatabaseName(tables);
+        String database = config.get(DATABASE);
+        if (database == null) {
+            Optional<String> databaseName = getValidateDatabaseName(tables);
+            database = databaseName.orElse(null);
+        }
 
         PostgresSourceConfigFactory configFactory =
                 PostgresSourceBuilder.PostgresIncrementalSource.<RowData>builder()
                         .hostname(hostname)
                         .port(port)
-                        .database(databaseName.get())
-                        .schemaList(".*")
+                        .database(database)
+                        .schemaList(new String[] {schema})
                         .tableList(".*")
                         .username(username)
                         .password(password)
@@ -184,7 +191,10 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
 
         List<TableId> tableIds = PostgresSchemaUtils.listTables(configFactory.create(0), null);
 
-        Selectors selectors = new Selectors.SelectorsBuilder().includeTables(tables).build();
+        Selectors selectors =
+                new Selectors.SelectorsBuilder()
+                        .includeTables(qualifyTablesWithSchema(tables, schema))
+                        .build();
         List<String> capturedTables = getTableList(tableIds, selectors);
         if (capturedTables.isEmpty()) {
             throw new IllegalArgumentException(
@@ -251,6 +261,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
     public Set<ConfigOption<?>> optionalOptions() {
         Set<ConfigOption<?>> options = new HashSet<>();
         options.add(PG_PORT);
+        options.add(DATABASE);
         options.add(TABLES_EXCLUDE);
         options.add(DECODING_PLUGIN_NAME);
         options.add(SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE);
@@ -262,6 +273,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         options.add(CONNECTION_POOL_SIZE);
         options.add(HEARTBEAT_INTERVAL);
         options.add(SCAN_INCREMENTAL_CLOSE_IDLE_READER_ENABLED);
+        options.add(SCHEMA);
         options.add(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED);
         options.add(SCAN_INCREMENTAL_SNAPSHOT_BACKFILL_SKIP);
         options.add(CHUNK_META_GROUP_SIZE);
@@ -286,6 +298,28 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
                 .filter(selectors::isMatch)
                 .map(TableId::toString)
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * Qualifies table names with the given schema. For any table entry that has only a table name
+     * without schema prefix (no dot), the schema is prepended. Entries that already include a
+     * schema prefix (schema.table) or namespace (db.schema.table) are left unchanged.
+     */
+    private static String qualifyTablesWithSchema(String tables, String schema) {
+        if (tables == null) {
+            return null;
+        }
+        return Arrays.stream(tables.split(","))
+                .map(String::trim)
+                .map(
+                        table -> {
+                            int dotCount = table.replace("\\.", "").split("\\.").length - 1;
+                            if (dotCount == 0 && !".*".equals(schema)) {
+                                return schema + "." + table;
+                            }
+                            return table;
+                        })
+                .collect(Collectors.joining(","));
     }
 
     /** Checks the value of given integer option is valid. */

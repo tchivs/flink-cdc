@@ -53,6 +53,12 @@ public class PostgresDataSourceOptions {
                     .withDescription(
                             "Password to use when connecting to the PostgreSQL database server.");
 
+    public static final ConfigOption<String> DATABASE =
+            ConfigOptions.key("database")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("The PostgreSQL database name to connect to.");
+
     public static final ConfigOption<String> TABLES =
             ConfigOptions.key("tables")
                     .stringType()
@@ -63,6 +69,16 @@ public class PostgresDataSourceOptions {
                                     + "If there is a need to use a dot (.) in a regular expression to match any character, "
                                     + "it is necessary to escape the dot with a backslash."
                                     + "eg. db0.\\.*, db1.user_table_[0-9]+, db[1-2].[app|web]_order_\\.*");
+
+    public static final ConfigOption<String> SCHEMA =
+            ConfigOptions.key("schema")
+                    .stringType()
+                    .defaultValue(".*")
+                    .withDescription(
+                            "Schema name of the PostgreSQL database to monitor. When specified, "
+                                    + "table names without schema prefix in 'tables' option will be "
+                                    + "automatically qualified with this schema. "
+                                    + "Also used to limit the tables discovered by the connector.");
 
     public static final ConfigOption<String> DECODING_PLUGIN_NAME =
             ConfigOptions.key("decoding.plugin.name")
