@@ -202,7 +202,9 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         }
         if (tablesExclude != null) {
             Selectors selectExclude =
-                    new Selectors.SelectorsBuilder().includeTables(tablesExclude).build();
+                    new Selectors.SelectorsBuilder()
+                            .includeTables(qualifyTablesWithSchema(tablesExclude, schema))
+                            .build();
             List<String> excludeTables = getTableList(tableIds, selectExclude);
             if (!excludeTables.isEmpty()) {
                 capturedTables.removeAll(excludeTables);

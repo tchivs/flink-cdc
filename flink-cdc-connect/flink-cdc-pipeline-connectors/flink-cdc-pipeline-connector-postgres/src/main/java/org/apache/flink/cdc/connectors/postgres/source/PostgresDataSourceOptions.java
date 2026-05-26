@@ -255,6 +255,7 @@ public class PostgresDataSourceOptions {
                     .noDefaultValue()
                     .withDescription(
                             "Table names of the PostgreSQL tables to Exclude. Regular expressions are supported. "
+                                    + "When the 'schema' option is specified, table names without schema prefix will be automatically qualified with this schema. "
                                     + "It is important to note that the dot (.) is treated as a delimiter for database and table names. "
                                     + "If there is a need to use a dot (.) in a regular expression to match any character, "
                                     + "it is necessary to escape the dot with a backslash."

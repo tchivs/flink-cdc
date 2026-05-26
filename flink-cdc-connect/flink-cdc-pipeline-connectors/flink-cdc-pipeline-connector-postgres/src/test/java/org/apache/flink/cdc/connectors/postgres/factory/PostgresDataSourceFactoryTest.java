@@ -54,10 +54,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.DATABASE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.HOSTNAME;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PASSWORD;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PG_PORT;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCHEMA;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SLOT_NAME;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.TABLES;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.TABLES_EXCLUDE;
@@ -338,6 +340,57 @@ public class PostgresDataSourceFactoryTest extends PostgresTestBase {
                 (PostgresDataSource) new PostgresDataSourceFactory().createDataSource(context);
 
         assertThat(factoryDataSource.getPostgresSourceConfig().includePartitionedTables()).isTrue();
+    }
+
+    @Test
+    public void testShortTableNamesWithDatabaseAndSchemaOptions() {
+        Map<String, String> options = new HashMap<>();
+        options.put(HOSTNAME.key(), POSTGRES_CONTAINER.getHost());
+        options.put(
+                PG_PORT.key(), String.valueOf(POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT)));
+        options.put(USERNAME.key(), TEST_USER);
+        options.put(PASSWORD.key(), TEST_PASSWORD);
+        options.put(DATABASE.key(), POSTGRES_CONTAINER.getDatabaseName());
+        options.put(SCHEMA.key(), "inventory");
+        options.put(TABLES.key(), "products,customers");
+        options.put(SLOT_NAME.key(), slotName);
+        options.put(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.key(), "true");
+        Factory.Context context = new MockContext(Configuration.fromMap(options));
+
+        PostgresDataSource factoryDataSource =
+                (PostgresDataSource) new PostgresDataSourceFactory().createDataSource(context);
+        List<String> actualTableList =
+                new ArrayList<>(factoryDataSource.getPostgresSourceConfig().getTableList());
+        Collections.sort(actualTableList);
+
+        assertThat(actualTableList)
+                .isEqualTo(Arrays.asList("inventory.customers", "inventory.products"));
+        assertThat(factoryDataSource.getPostgresSourceConfig().includePartitionedTables()).isTrue();
+    }
+
+    @Test
+    public void testShortTableExcludeWithDatabaseAndSchemaOptions() {
+        Map<String, String> options = new HashMap<>();
+        options.put(HOSTNAME.key(), POSTGRES_CONTAINER.getHost());
+        options.put(
+                PG_PORT.key(), String.valueOf(POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT)));
+        options.put(USERNAME.key(), TEST_USER);
+        options.put(PASSWORD.key(), TEST_PASSWORD);
+        options.put(DATABASE.key(), POSTGRES_CONTAINER.getDatabaseName());
+        options.put(SCHEMA.key(), "inventory");
+        options.put(TABLES.key(), "products,customers,orders");
+        options.put(TABLES_EXCLUDE.key(), "orders");
+        options.put(SLOT_NAME.key(), slotName);
+        Factory.Context context = new MockContext(Configuration.fromMap(options));
+
+        PostgresDataSource factoryDataSource =
+                (PostgresDataSource) new PostgresDataSourceFactory().createDataSource(context);
+        List<String> actualTableList =
+                new ArrayList<>(factoryDataSource.getPostgresSourceConfig().getTableList());
+        Collections.sort(actualTableList);
+
+        assertThat(actualTableList)
+                .isEqualTo(Arrays.asList("inventory.customers", "inventory.products"));
     }
 
     @Test
