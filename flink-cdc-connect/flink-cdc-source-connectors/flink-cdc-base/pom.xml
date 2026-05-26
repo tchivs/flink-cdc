@@ -35,7 +35,7 @@ limitations under the License.
         <dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-connector-debezium</artifactId>
-            <version>${project.version}</version>
+            <version>${flink.cdc.base.version}</version>
             <scope>provided</scope>
             <exclusions>
                 <exclusion>
@@ -48,7 +48,7 @@ limitations under the License.
         <dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-cdc-common</artifactId>
-            <version>${project.version}</version>
+            <version>${flink.cdc.base.version}</version>
         </dependency>
 
         <dependency>
@@ -98,7 +98,7 @@ limitations under the License.
         <dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-connector-test-util</artifactId>
-            <version>${project.version}</version>
+            <version>${flink.cdc.base.version}</version>
             <scope>test</scope>
         </dependency>
 
