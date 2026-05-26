@@ -56,10 +56,10 @@ public class Selectors {
 
         public Selector(String namespace, String schemaName, String tableName) {
             this.namespacePred =
-                    namespace == null ? (namespacePred) -> false : Predicates.includes(namespace);
+                    namespace == null ? (namespacePred) -> true : Predicates.includes(namespace);
             this.schemaNamePred =
                     schemaName == null
-                            ? (schemaNamePred) -> false
+                            ? (schemaNamePred) -> true
                             : Predicates.includes(schemaName);
             this.tableNamePred =
                     tableName == null ? (tableNamePred) -> false : Predicates.includes(tableName);

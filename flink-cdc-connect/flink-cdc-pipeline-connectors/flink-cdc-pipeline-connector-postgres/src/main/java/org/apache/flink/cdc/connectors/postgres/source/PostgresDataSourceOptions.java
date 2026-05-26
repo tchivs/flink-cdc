@@ -225,6 +225,13 @@ public class PostgresDataSourceOptions {
                                     + "FLIP-147: Support Checkpoints After Tasks Finished. The flink version is required to be "
                                     + "greater than or equal to 1.14 when enabling this feature.");
 
+    public static final ConfigOption<Boolean> SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED =
+            ConfigOptions.key("scan.include-partitioned-tables.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Enable reading from partitioned table via partition root. This option is required for PG10 partition parent table discovery and routing.");
+
     @Experimental
     public static final ConfigOption<String> TABLES_EXCLUDE =
             ConfigOptions.key("tables.exclude")

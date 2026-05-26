@@ -71,6 +71,7 @@ import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSource
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_KEY_COLUMN;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_LSN_COMMIT_CHECKPOINTS_DELAY;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_SNAPSHOT_FETCH_SIZE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_STARTUP_MODE;
@@ -133,6 +134,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         int lsnCommitCheckpointsDelay = config.get(SCAN_LSN_COMMIT_CHECKPOINTS_DELAY);
         boolean tableIdIncludeDatabase = config.get(TABLE_ID_INCLUDE_DATABASE);
         boolean includeSchemaChanges = config.get(SCHEMA_CHANGE_ENABLED);
+        boolean includePartitionedTables = config.get(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED);
 
         validateIntegerOption(SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE, splitSize, 1);
         validateIntegerOption(CHUNK_META_GROUP_SIZE, splitMetaGroupSize, 1);
@@ -175,6 +177,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
                         .skipSnapshotBackfill(skipSnapshotBackfill)
                         .lsnCommitCheckpointsDelay(lsnCommitCheckpointsDelay)
                         .assignUnboundedChunkFirst(isAssignUnboundedChunkFirst)
+                        .includePartitionedTables(includePartitionedTables)
                         .includeDatabaseInTableId(tableIdIncludeDatabase)
                         .includeSchemaChanges(includeSchemaChanges)
                         .getConfigFactory();
@@ -259,6 +262,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         options.add(CONNECTION_POOL_SIZE);
         options.add(HEARTBEAT_INTERVAL);
         options.add(SCAN_INCREMENTAL_CLOSE_IDLE_READER_ENABLED);
+        options.add(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED);
         options.add(SCAN_INCREMENTAL_SNAPSHOT_BACKFILL_SKIP);
         options.add(CHUNK_META_GROUP_SIZE);
         options.add(CHUNK_KEY_EVEN_DISTRIBUTION_FACTOR_UPPER_BOUND);

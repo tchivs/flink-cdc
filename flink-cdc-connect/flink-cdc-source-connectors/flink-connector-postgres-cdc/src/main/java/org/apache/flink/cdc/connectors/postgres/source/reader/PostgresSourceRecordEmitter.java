@@ -62,9 +62,14 @@ public class PostgresSourceRecordEmitter<T> extends IncrementalSourceRecordEmitt
     }
 
     /** Returns current mapping, defensively guarding against suppliers that return null. */
-    private Map<TableId, TableId> getChildToParentMapping() {
+    protected Map<TableId, TableId> getChildToParentMapping() {
         Map<TableId, TableId> childToParentMapping = childToParentMappingSupplier.get();
         return childToParentMapping == null ? Collections.emptyMap() : childToParentMapping;
+    }
+
+    protected TableId routeTableId(TableId tableId) {
+        TableId parentTableId = getChildToParentMapping().get(tableId);
+        return parentTableId == null ? tableId : parentTableId;
     }
 
     @Override
@@ -79,15 +84,11 @@ public class PostgresSourceRecordEmitter<T> extends IncrementalSourceRecordEmitt
     }
 
     private Table routeTable(Table table) {
-        Map<TableId, TableId> childToParentMapping = getChildToParentMapping();
-        if (childToParentMapping.isEmpty()) {
+        TableId routedTableId = routeTableId(table.id());
+        if (routedTableId.equals(table.id())) {
             return table;
         }
-        TableId parentTableId = childToParentMapping.get(table.id());
-        if (parentTableId == null) {
-            return table;
-        }
-        return table.edit().tableId(parentTableId).create();
+        return table.edit().tableId(routedTableId).create();
     }
 
     @Override
@@ -100,11 +101,6 @@ public class PostgresSourceRecordEmitter<T> extends IncrementalSourceRecordEmitt
     }
 
     private SourceRecord rewriteDataRecordTableId(SourceRecord element) {
-        Map<TableId, TableId> childToParentMapping = getChildToParentMapping();
-        if (childToParentMapping.isEmpty()) {
-            return element;
-        }
-
         Object valueObj = element.value();
         if (!(valueObj instanceof Struct)) {
             return element;
@@ -123,8 +119,8 @@ public class PostgresSourceRecordEmitter<T> extends IncrementalSourceRecordEmitt
         }
 
         TableId currentTableId = new TableId(null, schemaName, tableName);
-        TableId routedTableId = childToParentMapping.get(currentTableId);
-        if (routedTableId == null) {
+        TableId routedTableId = routeTableId(currentTableId);
+        if (routedTableId.equals(currentTableId)) {
             return element;
         }
 

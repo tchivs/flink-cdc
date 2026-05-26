@@ -75,7 +75,6 @@ public class PostgresDialect implements JdbcDataSourceDialect {
 
     private final PostgresSourceConfig sourceConfig;
     private transient Tables.TableFilter filters;
-    private transient CustomPostgresSchema schema;
     @Nullable private PostgresStreamFetchTask streamFetchTask;
     private transient Pg10PartitionReconciler pg10PartitionReconciler;
 
@@ -364,18 +363,14 @@ public class PostgresDialect implements JdbcDataSourceDialect {
 
     @Override
     public TableChange queryTableSchema(JdbcConnection jdbc, TableId tableId) {
-        if (schema == null) {
-            schema = new CustomPostgresSchema((PostgresConnection) jdbc, sourceConfig);
-        }
-        return schema.getTableSchema(tableId);
+        return new CustomPostgresSchema((PostgresConnection) jdbc, sourceConfig)
+                .getTableSchema(tableId);
     }
 
     private Map<TableId, TableChange> queryTableSchema(
             JdbcConnection jdbc, List<TableId> tableIds) {
-        if (schema == null) {
-            schema = new CustomPostgresSchema((PostgresConnection) jdbc, sourceConfig);
-        }
-        return schema.getTableSchema(tableIds);
+        return new CustomPostgresSchema((PostgresConnection) jdbc, sourceConfig)
+                .getTableSchema(tableIds);
     }
 
     @Override
@@ -390,7 +385,7 @@ public class PostgresDialect implements JdbcDataSourceDialect {
 
     private PostgresStreamFetchTask createStreamFetchTask(StreamSplit streamSplit) {
         if (sourceConfig.isPg10PartitionMappingInitialized()
-                && !sourceConfig.getParentToChildrenMappingOrEmpty().isEmpty()) {
+                || streamSplit.isPg10RoutingStateInitialized()) {
             return new Pg10StreamFetchTask(streamSplit);
         }
         return new PostgresStreamFetchTask(streamSplit);

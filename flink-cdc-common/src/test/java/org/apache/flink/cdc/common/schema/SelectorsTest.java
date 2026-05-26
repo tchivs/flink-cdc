@@ -81,7 +81,7 @@ class SelectorsTest {
         assertAllowed(selectors, null, "sc1", "A2");
         assertAllowed(selectors, null, "sc2", "B0");
         assertAllowed(selectors, null, "sc2", "B1");
-        assertNotAllowed(selectors, "db", "sc1", "A1");
+        assertAllowed(selectors, "db", "sc1", "A1");
         assertNotAllowed(selectors, null, "sc1", "A");
         assertNotAllowed(selectors, null, "sc2", "B");
         assertNotAllowed(selectors, null, "sc1", "AA");
@@ -93,8 +93,8 @@ class SelectorsTest {
                 new Selectors.SelectorsBuilder().includeTables("\\.A[0-9]+,B[0-1]+,sc1").build();
 
         assertAllowed(selectors, null, null, "sc1");
-        assertNotAllowed(selectors, "db", "sc1", "sc1");
-        assertNotAllowed(selectors, null, "sc1", "sc1");
+        assertAllowed(selectors, "db", "sc1", "sc1");
+        assertAllowed(selectors, null, "sc1", "sc1");
         assertAllowed(selectors, null, null, "1A1");
         assertAllowed(selectors, null, null, "AA2");
         assertAllowed(selectors, null, null, "B0");
@@ -114,7 +114,7 @@ class SelectorsTest {
         assertAllowed(selectors, null, "sc1", "A2");
         assertAllowed(selectors, null, "sc1", "A2");
         assertAllowed(selectors, null, "sc2", "B0");
-        assertNotAllowed(selectors, "db", "sc1", "A1");
+        assertAllowed(selectors, "db", "sc1", "A1");
         assertNotAllowed(selectors, null, "sc1", "A");
         assertNotAllowed(selectors, null, "sc1", "AA");
         assertNotAllowed(selectors, null, "sc2", "B");

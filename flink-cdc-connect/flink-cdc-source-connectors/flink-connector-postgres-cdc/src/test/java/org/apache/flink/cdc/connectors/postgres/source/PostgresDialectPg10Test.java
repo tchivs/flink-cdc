@@ -1073,6 +1073,72 @@ class PostgresDialectPg10Test extends PostgresPg10TestBase {
     }
 
     @Test
+    void testCreateFetchTaskUsesPg10SubclassForInitializedEmptyRoutingState() throws Exception {
+        UniqueDatabase inventoryPartitionedDatabase = createInventoryPartitionedDatabase();
+        createDatabase(inventoryPartitionedDatabase.getDatabaseName());
+        initializePg10PartitionedTable(inventoryPartitionedDatabase.getDatabaseName());
+
+        PostgresSourceConfigFactory configFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "products", 10);
+        configFactory.setIncludePartitionedTables(true);
+        configFactory.startupOptions(StartupOptions.latest());
+
+        PostgresSourceConfig config = configFactory.create(0);
+        config.setPg10PartitionMappingInitialized(true);
+        PostgresDialect dialect = new PostgresDialect(config);
+
+        StreamSplit initializedEmptySplit =
+                StreamSplit.withPg10RoutingState(
+                        createMinimalStreamSplit(config, dialect),
+                        Collections.emptyMap(),
+                        Collections.emptyMap(),
+                        true);
+        org.apache.flink.cdc.connectors.base.source.reader.external.FetchTask<?> fetchTask =
+                dialect.createFetchTask(initializedEmptySplit);
+
+        Assertions.assertThat(fetchTask)
+                .isInstanceOf(
+                        org.apache.flink.cdc.connectors.postgres.source.fetch.Pg10StreamFetchTask
+                                .class);
+    }
+
+    @Test
+    void testQueryTableSchemaUsesCurrentJdbcAfterSchemaDiscovery() throws Exception {
+        UniqueDatabase inventoryPartitionedDatabase = createInventoryPartitionedDatabase();
+        createDatabase(inventoryPartitionedDatabase.getDatabaseName());
+        initializePg10PartitionedTable(inventoryPartitionedDatabase.getDatabaseName());
+
+        PostgresSourceConfigFactory configFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "products", 10);
+        configFactory.setIncludePartitionedTables(true);
+
+        PostgresSourceConfig config = configFactory.create(0);
+        PostgresDialect dialect = new PostgresDialect(config);
+
+        dialect.discoverDataCollectionSchemas(config);
+
+        TableId childCa = new TableId(null, "inventory_partitioned", "products_ca");
+        try (Connection connection =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER,
+                                inventoryPartitionedDatabase.getDatabaseName());
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "CREATE TABLE inventory_partitioned.products_ca PARTITION OF inventory_partitioned.products FOR VALUES IN ('ca')");
+        }
+
+        try (JdbcConnection jdbc = dialect.openJdbcConnection(config)) {
+            io.debezium.relational.history.TableChanges.TableChange tableChange =
+                    dialect.queryTableSchema(jdbc, childCa);
+
+            Assertions.assertThat(tableChange.getId()).isEqualTo(childCa);
+            Assertions.assertThat(tableChange.getTable().id()).isEqualTo(childCa);
+        }
+    }
+
+    @Test
     void testRelationListenerSeesRuntimeChildBeforeAcceptance() throws Exception {
         UniqueDatabase inventoryPartitionedDatabase = createInventoryPartitionedDatabase();
         createDatabase(inventoryPartitionedDatabase.getDatabaseName());

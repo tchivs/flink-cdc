@@ -97,7 +97,6 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
         this.createTableEventCache =
                 ((DebeziumEventDeserializationSchema) debeziumDeserializationSchema)
                         .getCreateTableEventCache();
-        generateCreateTableEvent(sourceConfig);
         this.isBounded = StartupOptions.snapshot().equals(sourceConfig.getStartupOptions());
     }
 
@@ -111,7 +110,7 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
                     split.getTableSchemas().entrySet()) {
                 TableChanges.TableChange tableChange = entry.getValue();
 
-                Table table = tableChange.getTable();
+                Table table = routeTable(tableChange.getTable());
                 CreateTableEvent createTableEvent =
                         toCreateTableEvent(table, sourceConfig, postgresDialect);
                 ((DebeziumEventDeserializationSchema) debeziumDeserializationSchema)
@@ -143,7 +142,7 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
     }
 
     private void handleDataChangeRecord(SourceRecord element, SourceOutput<T> output) {
-        TableId tableId = getTableId(element);
+        TableId tableId = routeTableId(getTableId(element));
         maybeSendCreateTableEventFromCache(tableId, output);
         // In rare case, we may miss some CreateTableEvents before DataChangeEvents.
         // Don't send CreateTableEvent for SchemaChangeEvents as it's the latest schema.
@@ -165,26 +164,31 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
         Map<TableId, TableChanges.TableChange> existedTableSchemas =
                 splitState.toSourceSplit().getTableSchemas();
         PostgresSchemaRecord schemaRecord = (PostgresSchemaRecord) element;
-        Table schemaAfter = schemaRecord.getTable();
-        maybeSendCreateTableEventFromCache(schemaAfter.id(), output);
+        Table schemaAfter = routeTable(schemaRecord.getTable());
+        TableId routedTableId = schemaAfter.id();
+        maybeSendCreateTableEventFromCache(routedTableId, output);
         Table schemaBefore = null;
-        if (existedTableSchemas.containsKey(schemaAfter.id())) {
-            schemaBefore = existedTableSchemas.get(schemaAfter.id()).getTable();
+        if (existedTableSchemas.containsKey(routedTableId)) {
+            schemaBefore = existedTableSchemas.get(routedTableId).getTable();
+        } else if (existedTableSchemas.containsKey(schemaRecord.getTable().id())) {
+            schemaBefore =
+                    routeTable(existedTableSchemas.get(schemaRecord.getTable().id()).getTable());
         }
         List<SchemaChangeEvent> schemaChangeEvents =
                 inferSchemaChangeEvent(
-                        schemaAfter.id(), schemaBefore, schemaAfter, sourceConfig, postgresDialect);
+                        routedTableId, schemaBefore, schemaAfter, sourceConfig, postgresDialect);
         LOG.info("Inferred Schema change events: {}", schemaChangeEvents);
         schemaChangeEvents.forEach(schemaChangeEvent -> output.collect((T) schemaChangeEvent));
     }
 
     private void maybeSendCreateTableEventFromCache(TableId tableId, SourceOutput<T> output) {
-        if (!alreadySendCreateTableTables.contains(tableId)) {
-            CreateTableEvent createTableEvent = createTableEventCache.get(tableId);
+        TableId routedTableId = routeTableId(tableId);
+        if (!alreadySendCreateTableTables.contains(routedTableId)) {
+            CreateTableEvent createTableEvent = createTableEventCache.get(routedTableId);
             if (createTableEvent != null) {
                 sendCreateTableEvent(createTableEvent, output);
             }
-            alreadySendCreateTableTables.add(tableId);
+            alreadySendCreateTableTables.add(routedTableId);
         }
     }
 
@@ -194,11 +198,12 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
 
     private CreateTableEvent getCreateTableEvent(
             PostgresSourceConfig sourceConfig, TableId tableId) {
+        TableId routedTableId = routeTableId(tableId);
         try (PostgresConnection jdbc = postgresDialect.openJdbcConnection()) {
-            Schema schema = PostgresSchemaUtils.getTableSchema(tableId, sourceConfig, jdbc);
+            Schema schema = PostgresSchemaUtils.getTableSchema(routedTableId, sourceConfig, jdbc);
             return new CreateTableEvent(
                     toCdcTableId(
-                            tableId,
+                            routedTableId,
                             sourceConfig.getDatabaseList().get(0),
                             includeDatabaseInTableId),
                     schema);
@@ -228,12 +233,14 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
                             sourceConfig.getTableFilters(),
                             sourceConfig.includePartitionedTables());
             for (TableId tableId : capturedTableIds) {
-                Schema schema = PostgresSchemaUtils.getTableSchema(tableId, sourceConfig, jdbc);
+                TableId routedTableId = routeTableId(tableId);
+                Schema schema =
+                        PostgresSchemaUtils.getTableSchema(routedTableId, sourceConfig, jdbc);
                 createTableEventCache.put(
-                        tableId,
+                        routedTableId,
                         new CreateTableEvent(
                                 toCdcTableId(
-                                        tableId,
+                                        routedTableId,
                                         this.sourceConfig.getDatabaseList().get(0),
                                         includeDatabaseInTableId),
                                 schema));
@@ -242,5 +249,13 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
         } catch (SQLException e) {
             throw new RuntimeException("Cannot start emitter to fetch table schema.", e);
         }
+    }
+
+    private Table routeTable(Table table) {
+        TableId routedTableId = routeTableId(table.id());
+        if (routedTableId.equals(table.id())) {
+            return table;
+        }
+        return table.edit().tableId(routedTableId).create();
     }
 }
