@@ -56,13 +56,13 @@ limitations under the License.
         <dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-cdc-common</artifactId>
-            <version>${project.version}</version>
+            <version>${flink.cdc.base.version}</version>
         </dependency>
 
         <dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-cdc-runtime</artifactId>
-            <version>${project.version}</version>
+            <version>${flink.cdc.base.version}</version>
             <exclusions>
                 <exclusion>
                     <groupId>org.codehaus.janino</groupId>
@@ -87,7 +87,7 @@ limitations under the License.
                 <dependency>
                     <groupId>org.apache.flink</groupId>
                     <artifactId>flink-cdc-flink1-compat</artifactId>
-                    <version>${project.version}</version>
+                    <version>${flink.cdc.base.version}</version>
                 </dependency>
             </dependencies>
         </profile>
@@ -98,7 +98,7 @@ limitations under the License.
                 <dependency>
                     <groupId>org.apache.flink</groupId>
                     <artifactId>flink-cdc-flink2-compat</artifactId>
-                    <version>${project.version}</version>
+                    <version>${flink.cdc.base.version}</version>
                 </dependency>
             </dependencies>
         </profile>

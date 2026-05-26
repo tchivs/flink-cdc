@@ -62,6 +62,7 @@ limitations under the License.
 
     <properties>
         <revision>3.6-SNAPSHOT</revision>
+        <flink.cdc.base.version>${revision}</flink.cdc.base.version>
         <scala.binary.version>2.12</scala.binary.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <!-- Enforce single fork execution due to heavy mini cluster use in the tests -->
