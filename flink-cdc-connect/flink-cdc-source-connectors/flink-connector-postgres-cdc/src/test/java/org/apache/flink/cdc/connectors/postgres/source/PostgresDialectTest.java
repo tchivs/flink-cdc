@@ -22,10 +22,14 @@ import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConf
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfigFactory;
 import org.apache.flink.cdc.connectors.postgres.testutils.UniqueDatabase;
 
+import io.debezium.jdbc.JdbcConnection;
 import io.debezium.relational.TableId;
+import io.debezium.relational.history.TableChanges;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
 
+import java.sql.Connection;
+import java.sql.Statement;
 import java.util.List;
 import java.util.Map;
 
@@ -144,5 +148,72 @@ class PostgresDialectTest extends PostgresTestBase {
             Assertions.assertThat(childToParentMapping).containsEntry(childUk, parentTable);
             Assertions.assertThat(childToParentMapping).containsEntry(childUs, parentTable);
         }
+    }
+
+    @Test
+    void testPartitionParentSchemaUsesRepresentativeChildPrimaryKeyForPg12Plus() throws Exception {
+        inventoryPartitionedDatabase.createAndInitialize();
+        try (Connection connection =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER,
+                                inventoryPartitionedDatabase.getDatabaseName());
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "ALTER TABLE inventory_partitioned.products DROP CONSTRAINT products_pkey");
+            statement.execute("ALTER TABLE inventory_partitioned.products_uk ADD PRIMARY KEY (id)");
+            statement.execute("ALTER TABLE inventory_partitioned.products_us ADD PRIMARY KEY (id)");
+        }
+
+        PostgresSourceConfigFactory configFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "products", 10);
+        configFactory.setIncludePartitionedTables(true);
+        PostgresSourceConfig config = configFactory.create(0);
+        config.setPg10PartitionMappingInitialized(true);
+        PostgresDialect dialect = new PostgresDialect(config);
+        TableId parentTable = new TableId(null, "inventory_partitioned", "products");
+
+        try (JdbcConnection jdbc = dialect.openJdbcConnection(config)) {
+            TableChanges.TableChange parentSchema = dialect.queryTableSchema(jdbc, parentTable);
+
+            Assertions.assertThat(parentSchema.getTable().id()).isEqualTo(parentTable);
+            Assertions.assertThat(parentSchema.getTable().primaryKeyColumnNames())
+                    .containsExactly("id");
+        }
+
+        Assertions.assertThat(config.isPg10PartitionMappingInitialized()).isTrue();
+        Assertions.assertThat(config.getParentToChildrenMappingOrEmpty()).containsKey(parentTable);
+    }
+
+    @Test
+    void testOrdinaryTableWithoutPrimaryKeyDoesNotUsePartitionFallback() throws Exception {
+        inventoryPartitionedDatabase.createAndInitialize();
+        try (Connection connection =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER,
+                                inventoryPartitionedDatabase.getDatabaseName());
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "CREATE TABLE inventory_partitioned.no_pk_table (id INT NOT NULL, name VARCHAR(255))");
+        }
+
+        PostgresSourceConfigFactory configFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "no_pk_table", 10);
+        configFactory.setIncludePartitionedTables(true);
+        PostgresSourceConfig config = configFactory.create(0);
+        PostgresDialect dialect = new PostgresDialect(config);
+        TableId ordinaryTable = new TableId(null, "inventory_partitioned", "no_pk_table");
+
+        try (JdbcConnection jdbc = dialect.openJdbcConnection(config)) {
+            TableChanges.TableChange schema = dialect.queryTableSchema(jdbc, ordinaryTable);
+
+            Assertions.assertThat(schema.getTable().id()).isEqualTo(ordinaryTable);
+            Assertions.assertThat(schema.getTable().primaryKeyColumnNames()).isEmpty();
+        }
+
+        Assertions.assertThat(config.getParentToChildrenMappingOrEmpty())
+                .doesNotContainKey(ordinaryTable);
+        Assertions.assertThat(config.isPg10PartitionMappingInitialized()).isFalse();
     }
 }

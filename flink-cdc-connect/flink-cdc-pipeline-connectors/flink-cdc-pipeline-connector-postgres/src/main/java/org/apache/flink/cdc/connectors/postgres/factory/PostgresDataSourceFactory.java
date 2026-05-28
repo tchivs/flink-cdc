@@ -266,6 +266,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         options.add(DATABASE);
         options.add(TABLES_EXCLUDE);
         options.add(DECODING_PLUGIN_NAME);
+        options.add(SCAN_INCREMENTAL_SNAPSHOT_CHUNK_KEY_COLUMN);
         options.add(SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE);
         options.add(SCAN_SNAPSHOT_FETCH_SIZE);
         options.add(SCAN_STARTUP_MODE);

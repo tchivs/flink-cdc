@@ -41,6 +41,7 @@ import io.debezium.connector.postgresql.SourceInfo;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.relational.TableId;
+import io.debezium.relational.history.TableChanges;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -145,6 +146,40 @@ class PostgresDialectPg10Test extends PostgresPg10TestBase {
                 .containsEntry(childCa, parentTable);
         Assertions.assertThat(refreshResult.getLatestParentToChildren().get(parentTable))
                 .contains(childCa);
+    }
+
+    @Test
+    void testPg10ParentSchemaUsesRepresentativeChildPrimaryKey() throws Exception {
+        UniqueDatabase inventoryPartitionedDatabase = createInventoryPartitionedDatabase();
+        createDatabase(inventoryPartitionedDatabase.getDatabaseName());
+        initializePg10PartitionedTable(inventoryPartitionedDatabase.getDatabaseName());
+        try (Connection connection =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER,
+                                inventoryPartitionedDatabase.getDatabaseName());
+                Statement statement = connection.createStatement()) {
+            statement.execute("ALTER TABLE inventory_partitioned.products_uk ADD PRIMARY KEY (id)");
+            statement.execute("ALTER TABLE inventory_partitioned.products_us ADD PRIMARY KEY (id)");
+        }
+
+        PostgresSourceConfigFactory configFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "products", 10);
+        configFactory.setIncludePartitionedTables(true);
+
+        PostgresSourceConfig config = configFactory.create(0);
+        PostgresDialect dialect = new PostgresDialect(config);
+        TableId parentTable = new TableId(null, "inventory_partitioned", "products");
+
+        Assertions.assertThat(dialect.discoverDataCollections(config)).containsExactly(parentTable);
+
+        try (JdbcConnection jdbc = dialect.openJdbcConnection(config)) {
+            TableChanges.TableChange parentSchema = dialect.queryTableSchema(jdbc, parentTable);
+
+            Assertions.assertThat(parentSchema.getTable().id()).isEqualTo(parentTable);
+            Assertions.assertThat(parentSchema.getTable().primaryKeyColumnNames())
+                    .containsExactly("id");
+        }
     }
 
     @Test

@@ -50,15 +50,21 @@ import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.connection.PostgresConnectionUtils;
 import io.debezium.connector.postgresql.connection.PostgresReplicationConnection;
 import io.debezium.jdbc.JdbcConnection;
+import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
+import io.debezium.relational.history.TableChanges;
 import io.debezium.relational.history.TableChanges.TableChange;
 import io.debezium.schema.TopicSelector;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -70,6 +76,8 @@ import static io.debezium.connector.postgresql.Utils.currentOffset;
 
 /** The dialect for Postgres. */
 public class PostgresDialect implements JdbcDataSourceDialect {
+    private static final Logger LOG = LoggerFactory.getLogger(PostgresDialect.class);
+
     private static final long serialVersionUID = 1L;
     private static final String CONNECTION_NAME = "postgres-cdc-connector";
 
@@ -363,14 +371,115 @@ public class PostgresDialect implements JdbcDataSourceDialect {
 
     @Override
     public TableChange queryTableSchema(JdbcConnection jdbc, TableId tableId) {
-        return new CustomPostgresSchema((PostgresConnection) jdbc, sourceConfig)
-                .getTableSchema(tableId);
+        CustomPostgresSchema schemaReader =
+                new CustomPostgresSchema((PostgresConnection) jdbc, sourceConfig);
+        return maybeUsePartitionParentRepresentativeChildSchema(
+                jdbc, schemaReader, tableId, schemaReader.getTableSchema(tableId));
     }
 
     private Map<TableId, TableChange> queryTableSchema(
             JdbcConnection jdbc, List<TableId> tableIds) {
-        return new CustomPostgresSchema((PostgresConnection) jdbc, sourceConfig)
-                .getTableSchema(tableIds);
+        CustomPostgresSchema schemaReader =
+                new CustomPostgresSchema((PostgresConnection) jdbc, sourceConfig);
+        Map<TableId, TableChange> tableSchemas = schemaReader.getTableSchema(tableIds);
+        for (TableId tableId : tableIds) {
+            tableSchemas.computeIfPresent(
+                    tableId,
+                    (id, tableSchema) ->
+                            maybeUsePartitionParentRepresentativeChildSchema(
+                                    jdbc, schemaReader, id, tableSchema));
+        }
+        return tableSchemas;
+    }
+
+    private TableChange maybeUsePartitionParentRepresentativeChildSchema(
+            JdbcConnection jdbc,
+            CustomPostgresSchema schemaReader,
+            TableId tableId,
+            TableChange tableSchema) {
+        if (!sourceConfig.includePartitionedTables()
+                || tableSchema == null
+                || tableSchema.getTable() == null
+                || !tableSchema.getTable().primaryKeyColumns().isEmpty()) {
+            return tableSchema;
+        }
+
+        ensurePartitionParentMappingInitialized(jdbc, tableId);
+
+        List<TableId> childTables =
+                sourceConfig
+                        .getParentToChildrenMappingOrEmpty()
+                        .getOrDefault(tableId, Collections.emptyList());
+        for (TableId childTableId : childTables) {
+            TableChange childSchema = schemaReader.getTableSchema(childTableId);
+            if (childSchema == null
+                    || childSchema.getTable() == null
+                    || childSchema.getTable().primaryKeyColumns().isEmpty()) {
+                continue;
+            }
+
+            Table parentTable = childSchema.getTable().edit().tableId(tableId).create();
+            LOG.info(
+                    "Using PostgreSQL child partition schema {} as split schema for partition parent table {}.",
+                    childTableId,
+                    tableId);
+            return new TableChanges.TableChange(TableChanges.TableChangeType.CREATE, parentTable);
+        }
+        return tableSchema;
+    }
+
+    private void ensurePartitionParentMappingInitialized(JdbcConnection jdbc, TableId tableId) {
+        if (sourceConfig.getParentToChildrenMappingOrEmpty().containsKey(tableId)) {
+            return;
+        }
+        try {
+            Map<TableId, List<TableId>> parentToChildren =
+                    TableDiscoveryUtils.discoverPartitionedTableMappings(
+                            Collections.singletonList(tableId), jdbc, true);
+            mergePartitionMappings(parentToChildren);
+
+            if (isPg10(jdbc) && !parentToChildren.isEmpty()) {
+                validatePg10PublicationMembership(jdbc, parentToChildren);
+            }
+        } catch (SQLException e) {
+            throw new FlinkRuntimeException(
+                    String.format(
+                            "Failed to initialize PostgreSQL partition parent mapping for table %s",
+                            tableId),
+                    e);
+        }
+    }
+
+    private void mergePartitionMappings(Map<TableId, List<TableId>> parentToChildren) {
+        Map<TableId, List<TableId>> mergedParentToChildren =
+                new HashMap<>(sourceConfig.getParentToChildrenMappingOrEmpty());
+        for (Map.Entry<TableId, List<TableId>> entry : parentToChildren.entrySet()) {
+            List<TableId> mergedChildren =
+                    new ArrayList<>(
+                            mergedParentToChildren.getOrDefault(
+                                    entry.getKey(), Collections.emptyList()));
+            for (TableId childTableId : entry.getValue()) {
+                if (!mergedChildren.contains(childTableId)) {
+                    mergedChildren.add(childTableId);
+                }
+            }
+            mergedParentToChildren.put(entry.getKey(), mergedChildren);
+        }
+        sourceConfig.setParentToChildrenMapping(mergedParentToChildren);
+
+        Map<TableId, TableId> mergedChildToParent =
+                new HashMap<>(sourceConfig.getChildToParentMappingOrEmpty());
+        mergedChildToParent.putAll(Pg10PartitionMapper.buildChildToParentMapping(parentToChildren));
+        sourceConfig.setChildToParentMapping(mergedChildToParent);
+    }
+
+    private void validatePg10PublicationMembership(
+            JdbcConnection jdbc, Map<TableId, List<TableId>> parentToChildren) throws SQLException {
+        String publicationName = sourceConfig.getDbzProperties().getProperty("publication.name");
+        if (publicationName != null) {
+            Pg10PartitionMapper.validatePublicationMembership(
+                    jdbc, publicationName, Pg10PartitionMapper.getAllChildTableIds(parentToChildren));
+        }
     }
 
     @Override

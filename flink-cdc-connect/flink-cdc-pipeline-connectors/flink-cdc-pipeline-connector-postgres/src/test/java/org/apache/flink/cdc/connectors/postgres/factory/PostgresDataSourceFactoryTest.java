@@ -287,6 +287,8 @@ public class PostgresDataSourceFactoryTest extends PostgresTestBase {
         Map<String, String> options = baseOptions();
         options.put(PostgresDataSourceOptions.HEARTBEAT_INTERVAL.key(), "12 s");
         options.put(PostgresDataSourceOptions.CONNECT_TIMEOUT.key(), "45 s");
+        options.put(
+                PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_KEY_COLUMN.key(), "id");
 
         PostgresDataSourceFactory factory = new PostgresDataSourceFactory();
         Factory.Context context = new MockContext(Configuration.fromMap(options));
@@ -300,6 +302,7 @@ public class PostgresDataSourceFactoryTest extends PostgresTestBase {
         assertThat(sourceConfig.getDbzProperties().getProperty("heartbeat.interval.ms"))
                 .isEqualTo(String.valueOf(java.time.Duration.ofSeconds(12).toMillis()));
         assertThat(sourceConfig.getConnectTimeout()).isEqualTo(java.time.Duration.ofSeconds(45));
+        assertThat(sourceConfig.getChunkKeyColumn()).isEqualTo("id");
         assertThat(sourceConfig.getTableList()).isEqualTo(Arrays.asList("inventory.products"));
     }
 
