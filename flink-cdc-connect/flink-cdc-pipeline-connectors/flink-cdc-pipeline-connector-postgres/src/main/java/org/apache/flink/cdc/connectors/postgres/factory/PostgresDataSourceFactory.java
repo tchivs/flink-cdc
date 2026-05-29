@@ -64,6 +64,7 @@ import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSource
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.HEARTBEAT_INTERVAL;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.HOSTNAME;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.METADATA_LIST;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PARTITION_DISCOVERY_POLL_INTERVAL;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PASSWORD;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PG_PORT;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCLUDE_PARTITIONED_TABLES;
@@ -136,6 +137,9 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         boolean includeSchemaChanges = config.get(SCHEMA_CHANGE_ENABLED);
         boolean includePartitionedTables =
                 config.getOptional(SCAN_INCLUDE_PARTITIONED_TABLES).orElse(false);
+        Duration partitionDiscoveryPollInterval =
+                config.getOptional(PARTITION_DISCOVERY_POLL_INTERVAL)
+                        .orElse(PARTITION_DISCOVERY_POLL_INTERVAL.defaultValue());
 
         validateIntegerOption(SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE, splitSize, 1);
         validateIntegerOption(CHUNK_META_GROUP_SIZE, splitMetaGroupSize, 1);
@@ -179,6 +183,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
                         .includeDatabaseInTableId(tableIdIncludeDatabase)
                         .includeSchemaChanges(includeSchemaChanges)
                         .includePartitionedTables(includePartitionedTables)
+                        .partitionDiscoveryPollInterval(partitionDiscoveryPollInterval)
                         .getConfigFactory();
 
         List<TableId> tableIds = PostgresSchemaUtils.listTables(configFactory.create(0), null);
@@ -275,6 +280,8 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         options.add(SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED);
         options.add(TABLE_ID_INCLUDE_DATABASE);
         options.add(SCHEMA_CHANGE_ENABLED);
+        options.add(SCAN_INCLUDE_PARTITIONED_TABLES);
+        options.add(PARTITION_DISCOVERY_POLL_INTERVAL);
         return options;
     }
 

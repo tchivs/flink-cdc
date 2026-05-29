@@ -203,10 +203,15 @@ public class PartitionAwareStreamFetchTask extends PostgresStreamFetchTask {
         PartitionCaptureState reconciled =
                 coordinator.reconcilePartitionMappings(currentCaptureState, parentTables);
         if (reconciled == currentCaptureState) {
+            // No actual partition mapping changes, but the current session was already stopped
+            // by the reconciler checker. We must still restart to resume WAL consumption.
             LOG.info(
                     "Partition reconciliation found no actual changes; "
-                            + "resuming without session restart.");
-            return false;
+                            + "restarting streaming session to resume WAL consumption.");
+            this.currentOffsetContext =
+                    freezeRestartOffsetAtLastCommit(
+                            runtime.getOffsetContext(), runtime.getDbzConnectorConfig());
+            return true;
         }
 
         this.currentCaptureState = reconciled;

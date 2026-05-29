@@ -291,4 +291,13 @@ public class PostgresDataSourceOptions {
                             "Whether to include partitioned tables and route child partition "
                                     + "events to their parent table. When enabled, child partition "
                                     + "DML events are automatically routed to the parent table ID.");
+
+    @Experimental
+    public static final ConfigOption<Duration> PARTITION_DISCOVERY_POLL_INTERVAL =
+            ConfigOptions.key("scan.partition-discovery.poll-interval")
+                    .durationType()
+                    .defaultValue(Duration.ofMinutes(10))
+                    .withDescription(
+                            "The interval for polling new child partitions during streaming. "
+                                    + "Only effective when 'scan.include-partitioned-tables.enabled' is true.");
 }
