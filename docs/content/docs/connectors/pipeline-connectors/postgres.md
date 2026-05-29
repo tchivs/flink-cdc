@@ -286,6 +286,18 @@ pipeline:
         The <code>tables</code> list should only match the parent table name. Experimental option.
       </td>
     </tr>
+    <tr>
+      <td>scan.partition-discovery.poll-interval</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">10min</td>
+      <td>Duration</td>
+      <td>
+        The interval at which the connector polls the catalog for newly created child partitions during streaming.<br>
+        The WAL-based reconciler detects new partitions in real time; this poller acts as a secondary safety net. On PG10, it is the primary discovery channel because publication membership must be refreshed before <code>pgoutput</code> can emit <code>Relation</code> messages for a new child.<br>
+        A shorter interval means faster discovery of new partitions but increases catalog query load; a longer interval reduces overhead but delays new partition capture.<br>
+        Only effective when <code>scan.include-partitioned-tables.enabled = true</code>.
+      </td>
+    </tr>
     </tbody>
 </table>
 </div>

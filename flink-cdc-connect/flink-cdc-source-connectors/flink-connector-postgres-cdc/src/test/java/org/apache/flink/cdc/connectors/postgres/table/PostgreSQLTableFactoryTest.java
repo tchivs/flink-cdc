@@ -64,6 +64,7 @@ import static org.apache.flink.cdc.connectors.base.options.SourceOptions.SCAN_SN
 import static org.apache.flink.cdc.connectors.base.options.SourceOptions.SPLIT_KEY_EVEN_DISTRIBUTION_FACTOR_LOWER_BOUND;
 import static org.apache.flink.cdc.connectors.base.options.SourceOptions.SPLIT_KEY_EVEN_DISTRIBUTION_FACTOR_UPPER_BOUND;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.HEARTBEAT_INTERVAL;
+import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.PARTITION_DISCOVERY_POLL_INTERVAL;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.SCAN_LSN_COMMIT_CHECKPOINTS_DELAY;
 import static org.apache.flink.cdc.connectors.utils.AssertUtils.assertProducedTypeOfSourceFunction;
@@ -157,7 +158,8 @@ class PostgreSQLTableFactoryTest {
                         SCAN_LSN_COMMIT_CHECKPOINTS_DELAY.defaultValue(),
                         SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED.defaultValue(),
                         SCAN_READ_CHANGELOG_AS_APPEND_ONLY_ENABLED.defaultValue(),
-                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue());
+                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue(),
+                        PARTITION_DISCOVERY_POLL_INTERVAL.defaultValue());
         Assertions.assertThat(actualSource).isEqualTo(expectedSource);
     }
 
@@ -207,7 +209,8 @@ class PostgreSQLTableFactoryTest {
                         SCAN_LSN_COMMIT_CHECKPOINTS_DELAY.defaultValue(),
                         SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED.defaultValue(),
                         true,
-                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue());
+                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue(),
+                        PARTITION_DISCOVERY_POLL_INTERVAL.defaultValue());
         Assertions.assertThat(actualSource).isEqualTo(expectedSource);
     }
 
@@ -254,7 +257,8 @@ class PostgreSQLTableFactoryTest {
                         SCAN_LSN_COMMIT_CHECKPOINTS_DELAY.defaultValue(),
                         SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED.defaultValue(),
                         SCAN_READ_CHANGELOG_AS_APPEND_ONLY_ENABLED.defaultValue(),
-                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue());
+                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue(),
+                        PARTITION_DISCOVERY_POLL_INTERVAL.defaultValue());
         expectedSource.producedDataType = SCHEMA_WITH_METADATA.toSourceRowDataType();
         expectedSource.metadataKeys =
                 Arrays.asList("row_kind", "op_ts", "database_name", "schema_name", "table_name");
@@ -311,7 +315,8 @@ class PostgreSQLTableFactoryTest {
                         SCAN_LSN_COMMIT_CHECKPOINTS_DELAY.defaultValue(),
                         SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED.defaultValue(),
                         SCAN_READ_CHANGELOG_AS_APPEND_ONLY_ENABLED.defaultValue(),
-                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue());
+                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue(),
+                        PARTITION_DISCOVERY_POLL_INTERVAL.defaultValue());
         Assertions.assertThat(actualSource).isEqualTo(expectedSource);
     }
 
@@ -358,7 +363,8 @@ class PostgreSQLTableFactoryTest {
                         SCAN_LSN_COMMIT_CHECKPOINTS_DELAY.defaultValue(),
                         SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED.defaultValue(),
                         SCAN_READ_CHANGELOG_AS_APPEND_ONLY_ENABLED.defaultValue(),
-                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue());
+                        SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.defaultValue(),
+                        PARTITION_DISCOVERY_POLL_INTERVAL.defaultValue());
         Assertions.assertThat(actualSource).isEqualTo(expectedSource);
     }
 
@@ -405,6 +411,51 @@ class PostgreSQLTableFactoryTest {
                         })
                 .hasStackTraceContaining(
                         "Primary key must be present when upsert mode is selected.");
+    }
+
+    @Test
+    void testPartitionRoutingOptions() {
+        Map<String, String> properties = getAllOptions();
+        properties.put("scan.incremental.snapshot.enabled", "true");
+        properties.put("scan.include-partitioned-tables.enabled", "true");
+        properties.put("scan.partition-discovery.poll-interval", "5min");
+
+        DynamicTableSource actualSource = createTableSource(properties);
+        PostgreSQLTableSource expectedSource =
+                new PostgreSQLTableSource(
+                        SCHEMA,
+                        5432,
+                        MY_LOCALHOST,
+                        MY_DATABASE,
+                        MY_SCHEMA,
+                        MY_TABLE,
+                        MY_USERNAME,
+                        MY_PASSWORD,
+                        "decoderbufs",
+                        MY_SLOT_NAME,
+                        DebeziumChangelogMode.ALL,
+                        PROPERTIES,
+                        true,
+                        SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE.defaultValue(),
+                        CHUNK_META_GROUP_SIZE.defaultValue(),
+                        SCAN_SNAPSHOT_FETCH_SIZE.defaultValue(),
+                        CONNECT_TIMEOUT.defaultValue(),
+                        CONNECT_MAX_RETRIES.defaultValue(),
+                        CONNECTION_POOL_SIZE.defaultValue(),
+                        SPLIT_KEY_EVEN_DISTRIBUTION_FACTOR_UPPER_BOUND.defaultValue(),
+                        SPLIT_KEY_EVEN_DISTRIBUTION_FACTOR_LOWER_BOUND.defaultValue(),
+                        HEARTBEAT_INTERVAL.defaultValue(),
+                        StartupOptions.initial(),
+                        null,
+                        SCAN_INCREMENTAL_CLOSE_IDLE_READER_ENABLED_DEFAULT,
+                        SCAN_INCREMENTAL_SNAPSHOT_BACKFILL_SKIP.defaultValue(),
+                        SCAN_NEWLY_ADDED_TABLE_ENABLED.defaultValue(),
+                        SCAN_LSN_COMMIT_CHECKPOINTS_DELAY.defaultValue(),
+                        SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED.defaultValue(),
+                        SCAN_READ_CHANGELOG_AS_APPEND_ONLY_ENABLED.defaultValue(),
+                        true,
+                        Duration.ofMinutes(5));
+        Assertions.assertThat(actualSource).isEqualTo(expectedSource);
     }
 
     private Map<String, String> getAllOptions() {

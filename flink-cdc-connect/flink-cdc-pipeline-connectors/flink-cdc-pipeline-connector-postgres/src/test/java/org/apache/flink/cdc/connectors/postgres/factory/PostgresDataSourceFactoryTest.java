@@ -46,8 +46,10 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.HOSTNAME;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PARTITION_DISCOVERY_POLL_INTERVAL;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PASSWORD;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PG_PORT;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCLUDE_PARTITIONED_TABLES;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SLOT_NAME;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.TABLES;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.TABLES_EXCLUDE;
@@ -335,6 +337,27 @@ public class PostgresDataSourceFactoryTest extends PostgresTestBase {
         assertThat(metadataColumns[2].getName()).isEqualTo("database_name");
         assertThat(metadataColumns[3]).isInstanceOf(SchemaNameMetadataColumn.class);
         assertThat(metadataColumns[3].getName()).isEqualTo("schema_name");
+    }
+
+    @Test
+    public void testPartitionRoutingOptionsAreAccepted() {
+        Map<String, String> options = new HashMap<>();
+        options.put(HOSTNAME.key(), POSTGRES_CONTAINER.getHost());
+        options.put(
+                PG_PORT.key(), String.valueOf(POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT)));
+        options.put(USERNAME.key(), TEST_USER);
+        options.put(PASSWORD.key(), TEST_PASSWORD);
+        options.put(TABLES.key(), POSTGRES_CONTAINER.getDatabaseName() + ".inventory.prod\\.*");
+        options.put(SLOT_NAME.key(), slotName);
+        options.put(SCAN_INCLUDE_PARTITIONED_TABLES.key(), "true");
+        options.put(PARTITION_DISCOVERY_POLL_INTERVAL.key(), "5min");
+
+        Factory.Context context = new MockContext(Configuration.fromMap(options));
+        PostgresDataSourceFactory factory = new PostgresDataSourceFactory();
+
+        // Should not throw ValidationException for unsupported options.
+        PostgresDataSource dataSource = (PostgresDataSource) factory.createDataSource(context);
+        assertThat(dataSource).isNotNull();
     }
 
     class MockContext implements Factory.Context {

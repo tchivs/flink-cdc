@@ -294,6 +294,18 @@ pipeline:
         <code>tables</code> 列表应只匹配父表名。此为实验性选项。
       </td>
     </tr>
+    <tr>
+      <td>scan.partition-discovery.poll-interval</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">10min</td>
+      <td>Duration</td>
+      <td>
+        流式阶段连接器轮询系统目录以发现新增子分区的时间间隔。<br>
+        基于 WAL 的 reconciler 可以实时检测新分区；本轮询作为兜底机制。对 PG10 而言则是主要的发现通道（必须先刷新 publication 成员关系，<code>pgoutput</code> 才能为新子表发出 <code>Relation</code> 消息）。<br>
+        间隔越短，新分区被发现的速度越快，但会增加系统目录查询负载；间隔越长，开销越低，但新分区数据的捕获会相应延迟。<br>
+        仅在 <code>scan.include-partitioned-tables.enabled = true</code> 时生效。
+      </td>
+    </tr>
     </tbody>
 </table>
 </div>
