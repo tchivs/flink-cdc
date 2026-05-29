@@ -57,6 +57,10 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
     private boolean includeDatabaseInTableId =
             PostgresSourceOptions.TABLE_ID_INCLUDE_DATABASE.defaultValue();
 
+    // Partition discovery settings
+    private Duration partitionDiscoveryPollInterval =
+            PostgresSourceOptions.PARTITION_DISCOVERY_POLL_INTERVAL.defaultValue();
+
     /** Creates a new {@link PostgresSourceConfig} for the given subtask {@code subtaskId}. */
     @Override
     public PostgresSourceConfig create(int subtaskId) {
@@ -140,7 +144,8 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
                 lsnCommitCheckpointsDelay,
                 assignUnboundedChunkFirst,
                 includePartitionedTables,
-                includeDatabaseInTableId);
+                includeDatabaseInTableId,
+                partitionDiscoveryPollInterval);
     }
 
     /**
@@ -197,5 +202,10 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
     /** Set whether to include database in the generated Table ID. */
     public void setIncludeDatabaseInTableId(boolean includeDatabaseInTableId) {
         this.includeDatabaseInTableId = includeDatabaseInTableId;
+    }
+
+    /** Set the poll interval for partition discovery. */
+    public void setPartitionDiscoveryPollInterval(Duration interval) {
+        this.partitionDiscoveryPollInterval = interval;
     }
 }

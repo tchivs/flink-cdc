@@ -54,6 +54,7 @@ import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSou
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.CONNECT_TIMEOUT;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.DECODING_PLUGIN_NAME;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.HEARTBEAT_INTERVAL;
+import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.PARTITION_DISCOVERY_POLL_INTERVAL;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.PG_PORT;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_KEY_COLUMN;
@@ -216,6 +217,7 @@ public class PostgreSQLTableFactory implements DynamicTableSourceFactory {
         options.add(SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED);
         options.add(SCAN_READ_CHANGELOG_AS_APPEND_ONLY_ENABLED);
         options.add(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED);
+        options.add(PARTITION_DISCOVERY_POLL_INTERVAL);
         return options;
     }
 

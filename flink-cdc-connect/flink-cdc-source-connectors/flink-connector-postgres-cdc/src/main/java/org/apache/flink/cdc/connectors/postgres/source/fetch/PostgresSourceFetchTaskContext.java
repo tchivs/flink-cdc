@@ -70,6 +70,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.sql.SQLException;
+import java.util.Collections;
+import java.util.Map;
 
 import static io.debezium.connector.AbstractSourceInfo.SCHEMA_NAME_KEY;
 import static io.debezium.connector.AbstractSourceInfo.TABLE_NAME_KEY;
@@ -267,7 +269,8 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
                                             break;
                                     }
                                 }),
-                        schemaNameAdjuster);
+                        schemaNameAdjuster,
+                        resolveChildToParentMapping(sourceSplitBase));
         schema.setDispatcher(postgresDispatcher);
 
         ChangeEventSourceMetricsFactory<PostgresPartition> metricsFactory =
@@ -331,7 +334,23 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
         Struct source = value.getStruct(Envelope.FieldName.SOURCE);
         String schemaName = source.getString(SCHEMA_NAME_KEY);
         String tableName = source.getString(TABLE_NAME_KEY);
-        return new TableId(null, schemaName, tableName);
+        TableId tableId = new TableId(null, schemaName, tableName);
+        // Route child partition tableId → parent so that
+        // IncrementalSourceStreamFetcher.shouldEmit() can match the parent tableId
+        // stored in finishedSplitsInfo (snapshot splits are created against the parent
+        // when scan.include-partitioned-tables.enabled=true). Without this, WAL events
+        // tagged with child tableIds would be filtered out as "not in monitored splits scope".
+        if (getDataSourceDialect() instanceof PostgresDialect) {
+            Map<TableId, TableId> mapping =
+                    ((PostgresDialect) getDataSourceDialect()).getChildToParentMapping();
+            if (mapping != null && !mapping.isEmpty()) {
+                TableId routed = mapping.get(tableId);
+                if (routed != null) {
+                    return routed;
+                }
+            }
+        }
+        return tableId;
     }
 
     @Override
@@ -391,5 +410,70 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
             return tableId.table();
         }
         return tableId.schema() + "." + tableId.table();
+    }
+
+    /**
+     * Resolves child→parent mapping from the dialect's live partition state. For snapshot splits,
+     * returns empty (no routing needed during snapshot). For stream splits, uses the dialect's
+     * current partition capture state.
+     */
+    private Map<TableId, TableId> resolveChildToParentMapping(SourceSplitBase sourceSplitBase) {
+        if (sourceSplitBase.isSnapshotSplit()) {
+            return Collections.emptyMap();
+        }
+        if (getDataSourceDialect() instanceof PostgresDialect) {
+            return ((PostgresDialect) getDataSourceDialect()).getChildToParentMapping();
+        }
+        return Collections.emptyMap();
+    }
+
+    /**
+     * Creates a {@link CDCPostgresDispatcher} with the given parameters. Used by {@link
+     * PartitionFetchContextCoordinator} to build session-scoped dispatchers with partition routing.
+     */
+    CDCPostgresDispatcher createDispatcher(
+            PostgresConnectorConfig dbzConfig,
+            TopicSelector<TableId> topicSelector,
+            RelationAwarePostgresSchema schema,
+            ChangeEventQueue<DataChangeEvent> queue,
+            EventMetadataProvider metadataProvider,
+            Map<TableId, TableId> childToParentMapping) {
+        return new CDCPostgresDispatcher(
+                dbzConfig,
+                topicSelector,
+                schema,
+                queue,
+                dbzConfig.getTableFilters().dataCollectionFilter(),
+                DataChangeEvent::new,
+                metadataProvider,
+                new HeartbeatFactory<>(
+                        dbzConfig,
+                        topicSelector,
+                        schemaNameAdjuster,
+                        () ->
+                                new PostgresConnection(
+                                        dbzConfig.getJdbcConfig(),
+                                        PostgresConnection.CONNECTION_GENERAL),
+                        exception -> {
+                            String sqlErrorId = exception.getSQLState();
+                            switch (sqlErrorId) {
+                                case "57P01":
+                                    throw new DebeziumException(
+                                            "Could not execute heartbeat action query (Error: "
+                                                    + sqlErrorId
+                                                    + ")",
+                                            exception);
+                                case "57P03":
+                                    throw new RetriableException(
+                                            "Could not execute heartbeat action query (Error: "
+                                                    + sqlErrorId
+                                                    + ")",
+                                            exception);
+                                default:
+                                    break;
+                            }
+                        }),
+                schemaNameAdjuster,
+                childToParentMapping);
     }
 }

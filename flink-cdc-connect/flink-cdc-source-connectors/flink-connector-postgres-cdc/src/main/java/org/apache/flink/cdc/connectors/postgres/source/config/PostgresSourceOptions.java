@@ -94,9 +94,20 @@ public class PostgresSourceOptions extends JdbcSourceOptions {
                     .defaultValue(Boolean.FALSE)
                     .withDescription(
                             "Enable reading from partitioned table via partition root.\n"
-                                    + "If enabled:\n"
-                                    + "(1) PUBLICATION must be created beforehand with parameter publish_via_partition_root=true\n"
-                                    + "(2) Table list (regex or predefined list) should only match the parent table name, if table list matches both parent and child tables, snapshot data will be read twice.");
+                                    + "When enabled, the connector discovers child partitions and routes \n"
+                                    + "their CDC events to the parent table. This works on all PostgreSQL versions.\n"
+                                    + "For PG11+, setting publish_via_partition_root=true in PUBLICATION is recommended \n"
+                                    + "for best performance; when not set, the connector will handle routing automatically.");
+
+    public static final ConfigOption<Duration> PARTITION_DISCOVERY_POLL_INTERVAL =
+            ConfigOptions.key("scan.partition-discovery.poll-interval")
+                    .durationType()
+                    .defaultValue(Duration.ofMinutes(10))
+                    .withDescription(
+                            "The interval for the connector to poll the catalog for new child partitions "
+                                    + "during streaming. The WAL-based reconciler detects new partitions in real-time; "
+                                    + "this poller is a secondary safety net. "
+                                    + "Only effective when scan.include-partitioned-tables.enabled is true.");
 
     public static final ConfigOption<Boolean> TABLE_ID_INCLUDE_DATABASE =
             ConfigOptions.key("table-id.include-database")

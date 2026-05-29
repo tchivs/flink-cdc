@@ -274,6 +274,18 @@ pipeline:
         Defaults to false.
       </td>
     </tr>
+    <tr>
+      <td>scan.include-partitioned-tables.enabled</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">false</td>
+      <td>Boolean</td>
+      <td>
+        Whether to include partitioned tables and route child partition events to the parent table.<br>
+        When enabled, the connector discovers child partitions at startup and rewrites their CDC events to the parent table identity. This works on all PostgreSQL versions.<br>
+        For PG11+, setting <code>publish_via_partition_root=true</code> on the PUBLICATION is recommended for best performance; when not set, the connector routes events automatically. PG10 does <strong>not</strong> support <code>publish_via_partition_root</code>; the connector still routes events to the parent and additionally maintains publication membership for newly created child partitions.<br>
+        The <code>tables</code> list should only match the parent table name. Experimental option.
+      </td>
+    </tr>
     </tbody>
 </table>
 </div>

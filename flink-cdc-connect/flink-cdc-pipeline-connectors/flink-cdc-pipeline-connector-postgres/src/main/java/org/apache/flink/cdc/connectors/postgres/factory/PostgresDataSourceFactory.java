@@ -66,6 +66,7 @@ import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSource
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.METADATA_LIST;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PASSWORD;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PG_PORT;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCLUDE_PARTITIONED_TABLES;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_CLOSE_IDLE_READER_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_BACKFILL_SKIP;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_KEY_COLUMN;
@@ -133,6 +134,8 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         int lsnCommitCheckpointsDelay = config.get(SCAN_LSN_COMMIT_CHECKPOINTS_DELAY);
         boolean tableIdIncludeDatabase = config.get(TABLE_ID_INCLUDE_DATABASE);
         boolean includeSchemaChanges = config.get(SCHEMA_CHANGE_ENABLED);
+        boolean includePartitionedTables =
+                config.getOptional(SCAN_INCLUDE_PARTITIONED_TABLES).orElse(false);
 
         validateIntegerOption(SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE, splitSize, 1);
         validateIntegerOption(CHUNK_META_GROUP_SIZE, splitMetaGroupSize, 1);
@@ -175,11 +178,15 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
                         .assignUnboundedChunkFirst(isAssignUnboundedChunkFirst)
                         .includeDatabaseInTableId(tableIdIncludeDatabase)
                         .includeSchemaChanges(includeSchemaChanges)
+                        .includePartitionedTables(includePartitionedTables)
                         .getConfigFactory();
 
         List<TableId> tableIds = PostgresSchemaUtils.listTables(configFactory.create(0), null);
 
-        Selectors selectors = new Selectors.SelectorsBuilder().includeTables(tables).build();
+        Selectors selectors =
+                new Selectors.SelectorsBuilder()
+                        .includeTables(normalizeTablePatterns(tables))
+                        .build();
         List<String> capturedTables = getTableList(tableIds, selectors);
         if (capturedTables.isEmpty()) {
             throw new IllegalArgumentException(
@@ -187,7 +194,9 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         }
         if (tablesExclude != null) {
             Selectors selectExclude =
-                    new Selectors.SelectorsBuilder().includeTables(tablesExclude).build();
+                    new Selectors.SelectorsBuilder()
+                            .includeTables(normalizeTablePatterns(tablesExclude))
+                            .build();
             List<String> excludeTables = getTableList(tableIds, selectExclude);
             if (!excludeTables.isEmpty()) {
                 capturedTables.removeAll(excludeTables);
@@ -280,6 +289,53 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
                 .filter(selectors::isMatch)
                 .map(TableId::toString)
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * Normalizes table inclusion/exclusion patterns for PostgreSQL context.
+     *
+     * <p>PostgreSQL tables always have a schema qualifier (e.g., "public"). The common {@link
+     * Selectors} class treats null segments as "match nothing". When a user writes a single-segment
+     * pattern like "orders" (without schema), Selectors would create a Selector with null
+     * schemaNamePred that never matches any table with a non-null schema.
+     *
+     * <p>This method prepends ".*\." to single-segment patterns, converting them to two-segment
+     * patterns that explicitly match any schema. For example:
+     *
+     * <ul>
+     *   <li>"orders" → ".*\.orders" (matches orders in any schema)
+     *   <li>"public.orders" → unchanged (already schema-qualified)
+     *   <li>"db.public.orders" → unchanged (fully qualified)
+     * </ul>
+     */
+    static String normalizeTablePatterns(String tableInclusions) {
+        if (tableInclusions == null || tableInclusions.isEmpty()) {
+            return tableInclusions;
+        }
+        String[] patterns = tableInclusions.split(",");
+        StringBuilder normalized = new StringBuilder();
+        for (int i = 0; i < patterns.length; i++) {
+            String pattern = patterns[i].trim();
+            if (i > 0) {
+                normalized.append(",");
+            }
+            if (!containsUnescapedDot(pattern)) {
+                // Single-segment pattern: prepend wildcard schema match
+                normalized.append(".*\\.");
+            }
+            normalized.append(pattern);
+        }
+        return normalized.toString();
+    }
+
+    /** Returns true if the pattern contains at least one unescaped dot (segment separator). */
+    private static boolean containsUnescapedDot(String pattern) {
+        for (int i = 0; i < pattern.length(); i++) {
+            if (pattern.charAt(i) == '.' && (i == 0 || pattern.charAt(i - 1) != '\\')) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Checks the value of given integer option is valid. */

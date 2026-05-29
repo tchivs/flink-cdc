@@ -17,6 +17,8 @@
 
 package org.apache.flink.cdc.connectors.postgres.source.schema;
 
+import org.apache.flink.cdc.connectors.postgres.source.utils.SchemaFingerprints;
+
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.connector.postgresql.PostgresSchema;
 import io.debezium.connector.postgresql.PostgresValueConverter;
@@ -25,14 +27,74 @@ import io.debezium.connector.postgresql.connection.PostgresDefaultValueConverter
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.schema.TopicSelector;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * Extends PostgresSchema to dispatch Relation messages as schema change events via the event queue
  * and expose buildAndRegisterSchema as public.
+ *
+ * <p>Also supports a {@link NewPartitionListener} that is notified when a pgoutput Relation ('R')
+ * message arrives, including filtered runtime child relations. This allows partition detection to
+ * be driven by WAL events rather than by a polling thread, while schema events are still dispatched
+ * only for non-filtered tables.
  */
 public class RelationAwarePostgresSchema extends PostgresSchema {
 
+    private static final Logger LOG = LoggerFactory.getLogger(RelationAwarePostgresSchema.class);
+
+    private final Map<Integer, TableId> filteredRelationIdToTableId = new HashMap<>();
+
+    /** Fast O(1) lookup set for filtered child partition TableIds. */
+    private final Set<TableId> filteredTableIds = new HashSet<>();
+
+    /**
+     * Tracks schema fingerprints of child partitions to skip redundant overwriteTable calls. Key =
+     * TableId, Value = schema fingerprint computed by {@link SchemaFingerprints}. Since all
+     * children of a partition parent share the same schema, this avoids creating duplicate Table
+     * objects for each Relation message.
+     */
+    private final Map<TableId, Integer> childSchemaFingerprints = new HashMap<>();
+
+    /**
+     * TOAST column lists for synthesized parent tables (publish_via_partition_root=false mode). The
+     * base {@link PostgresSchema#getToastableColumnsForTableId(TableId)} only knows about tables
+     * refreshed via JDBC, so synthesized logical parent tables would otherwise return an empty list
+     * and unchanged-TOAST placeholders in UPDATE events would be mishandled. We mirror the child's
+     * TOAST column list onto the parent at synthesis time.
+     */
+    private final Map<TableId, List<String>> syntheticToastableColumns = new HashMap<>();
+
+    /**
+     * Listener invoked when a pgoutput Relation message is received for a table, including filtered
+     * runtime child relations.
+     *
+     * <p>This is used to detect previously unknown child partitions arriving in the WAL stream,
+     * which triggers a streaming session restart to rebuild routing mappings. Implementations run
+     * synchronously on the Debezium WAL processing thread, so they must stay lightweight and must
+     * not perform JDBC or other blocking catalog work.
+     */
+    @FunctionalInterface
+    public interface NewPartitionListener {
+        /**
+         * Called when a Relation message for the given table is applied to the schema.
+         *
+         * @param tableId the table whose Relation message was just processed
+         */
+        void onRelationSeen(TableId tableId);
+    }
+
     private SchemaDispatcher dispatcher;
+    private volatile NewPartitionListener partitionListener;
 
     public RelationAwarePostgresSchema(
             PostgresConnectorConfig config,
@@ -47,16 +109,163 @@ public class RelationAwarePostgresSchema extends PostgresSchema {
         this.dispatcher = dispatcher;
     }
 
+    /**
+     * Sets the partition listener. The listener is called within the WAL processing thread whenever
+     * a Relation message arrives, including for filtered runtime child relations, so it must remain
+     * lightweight and JDBC-free. Setting to {@code null} removes the listener.
+     */
+    public void setPartitionListener(NewPartitionListener listener) {
+        this.partitionListener = listener;
+    }
+
     @Override
     public void applySchemaChangesForTable(int relationId, Table table) {
-        super.applySchemaChangesForTable(relationId, table);
-        if (dispatcher != null && !isFilteredOut(table.id())) {
+        boolean filtered = isFilteredOut(table.id());
+        if (filtered) {
+            // Child partitions are filtered out by the configured table filter, but we still
+            // need their schema registered for WAL decoding. Store in our secondary index.
+            filteredRelationIdToTableId.put(relationId, table.id());
+            filteredTableIds.add(table.id());
+            int fingerprint = SchemaFingerprints.computeSchemaFingerprint(table);
+            Integer existing = childSchemaFingerprints.get(table.id());
+            if (existing == null || existing != fingerprint) {
+                // First time or schema changed — register the full table object
+                tables().overwriteTable(table);
+                childSchemaFingerprints.put(table.id(), fingerprint);
+            }
+            // Otherwise skip: schema is unchanged, no need to rebuild Table object
+        } else {
+            super.applySchemaChangesForTable(relationId, table);
+        }
+        if (!isFilteredOut(table.id()) && dispatcher != null) {
             dispatcher.dispatch(table);
         }
+        NewPartitionListener listener = this.partitionListener;
+        if (listener != null) {
+            listener.onRelationSeen(table.id());
+        }
+    }
+
+    @Override
+    public Table tableFor(int relationId) {
+        Table table = super.tableFor(relationId);
+        if (table != null) {
+            return table;
+        }
+        // Fallback to filtered relation index (child partitions)
+        TableId filteredTableId = filteredRelationIdToTableId.get(relationId);
+        return filteredTableId == null ? null : tables().forTable(filteredTableId);
+    }
+
+    @Override
+    public Table tableFor(TableId id) {
+        Table table = super.tableFor(id);
+        if (table != null) {
+            return table;
+        }
+        // O(1) lookup via dedicated Set instead of O(N) containsValue scan
+        return filteredTableIds.contains(id) ? tables().forTable(id) : null;
     }
 
     @Override
     public void buildAndRegisterSchema(Table table) {
         super.buildAndRegisterSchema(table);
+    }
+
+    /**
+     * Registers a parent table schema synthesized from a child partition's schema.
+     *
+     * <p>When {@code publish_via_partition_root=false}, PostgreSQL never sends a Relation message
+     * for the parent table. This method creates the parent table entry in the schema registry using
+     * the child's column structure (including its primary key column list, since PG10 partition
+     * parents cannot define a PK themselves), enabling Debezium's EventDispatcher to find the
+     * schema when processing routed (child→parent) data change events.
+     *
+     * <p>Behavior:
+     *
+     * <ul>
+     *   <li>If the parent is already registered, validates PK consistency between the new child and
+     *       the previously synthesized parent and emits a WARN if they differ. Does not overwrite
+     *       the existing parent.
+     *   <li>If the child has no primary key, logs an INFO note: UPDATE/DELETE events will have null
+     *       record keys unless REPLICA IDENTITY FULL is configured.
+     *   <li>Mirrors the child's TOAST column list onto the parent so that unchanged-TOAST
+     *       placeholders in routed UPDATE events are handled correctly.
+     * </ul>
+     *
+     * @param childId the child table whose schema to use as template
+     * @param parentId the parent table to register
+     * @return true if the parent was registered, false if already registered or child not found
+     */
+    public boolean registerParentTableFromChild(TableId childId, TableId parentId) {
+        Table childTable = tableFor(childId);
+        if (childTable == null) {
+            return false; // Child schema not available yet
+        }
+
+        Table existingParent = tableFor(parentId);
+        if (existingParent != null) {
+            // Already registered — only validate PK consistency across siblings.
+            List<String> existingPk = existingParent.primaryKeyColumnNames();
+            List<String> childPk = childTable.primaryKeyColumnNames();
+            if (!existingPk.equals(childPk)) {
+                LOG.warn(
+                        "Partition '{}' PK {} differs from previously synthesized parent '{}' PK {}. "
+                                + "Key encoding will continue to use the first child's PK definition; "
+                                + "this is unsafe if downstream relies on stable record keys.",
+                        childId,
+                        childPk,
+                        parentId,
+                        existingPk);
+            }
+            // Always keep TOAST list in sync — extend with any newly seen TOAST columns.
+            mergeToastableColumns(parentId, childId);
+            return false;
+        }
+
+        if (childTable.primaryKeyColumnNames().isEmpty()) {
+            LOG.info(
+                    "Synthesizing parent '{}' from child '{}' without primary key. "
+                            + "UPDATE/DELETE events will have null record keys unless "
+                            + "REPLICA IDENTITY FULL is configured on every child partition.",
+                    parentId,
+                    childId);
+        }
+
+        Table parentTable = childTable.edit().tableId(parentId).create();
+        tables().overwriteTable(parentTable);
+        buildAndRegisterSchema(parentTable);
+        mergeToastableColumns(parentId, childId);
+        return true;
+    }
+
+    private void mergeToastableColumns(TableId parentId, TableId childId) {
+        List<String> childToastable = super.getToastableColumnsForTableId(childId);
+        if (childToastable.isEmpty()) {
+            return;
+        }
+        List<String> existing = syntheticToastableColumns.get(parentId);
+        if (existing == null) {
+            syntheticToastableColumns.put(
+                    parentId, Collections.unmodifiableList(new ArrayList<>(childToastable)));
+            return;
+        }
+        // Union the column sets so that any TOAST column from any sibling is honored.
+        LinkedHashSet<String> union = new LinkedHashSet<>(existing);
+        boolean changed = union.addAll(childToastable);
+        if (changed) {
+            syntheticToastableColumns.put(
+                    parentId, Collections.unmodifiableList(new ArrayList<>(union)));
+        }
+    }
+
+    @Override
+    public List<String> getToastableColumnsForTableId(TableId tableId) {
+        List<String> base = super.getToastableColumnsForTableId(tableId);
+        if (!base.isEmpty()) {
+            return base;
+        }
+        List<String> synthesized = syntheticToastableColumns.get(tableId);
+        return synthesized == null ? base : synthesized;
     }
 }

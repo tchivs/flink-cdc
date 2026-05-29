@@ -26,6 +26,7 @@ import org.slf4j.LoggerFactory;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -55,5 +56,47 @@ public class TableDiscoveryUtils {
                 capturedTables.stream().map(TableId::toString).collect(Collectors.joining(",")));
 
         return new ArrayList<>(capturedTables);
+    }
+
+    /**
+     * Discovers partition mappings and determines whether partition routing should be enabled.
+     *
+     * <p>Routing is enabled when:
+     *
+     * <ul>
+     *   <li>{@code includePartitionedTables} is true, AND
+     *   <li>At least one parent table has child partitions in pg_inherits
+     * </ul>
+     *
+     * @param parentTableIds the parent tables discovered by {@link #listTables}
+     * @param jdbc the JDBC connection
+     * @param includePartitionedTables whether the user opted into partitioned table support
+     * @param publicationName the publication name (for validation), may be null
+     * @return a fully-initialized {@link PartitionCaptureState}
+     */
+    public static PartitionCaptureState discoverPartitionState(
+            List<TableId> parentTableIds,
+            JdbcConnection jdbc,
+            boolean includePartitionedTables,
+            String publicationName)
+            throws SQLException {
+        if (!includePartitionedTables) {
+            return PartitionCaptureState.EMPTY;
+        }
+
+        Map<TableId, List<TableId>> parentToChildren =
+                PartitionMapper.discoverPartitionMappings(parentTableIds, jdbc, true);
+
+        if (parentToChildren.isEmpty()) {
+            LOG.info("No child partitions found for configured parent tables.");
+            return PartitionCaptureState.EMPTY;
+        }
+
+        LOG.info(
+                "Partition routing enabled: {} parents with {} total children",
+                parentToChildren.size(),
+                parentToChildren.values().stream().mapToInt(List::size).sum());
+
+        return PartitionCaptureState.of(parentToChildren, true, publicationName);
     }
 }

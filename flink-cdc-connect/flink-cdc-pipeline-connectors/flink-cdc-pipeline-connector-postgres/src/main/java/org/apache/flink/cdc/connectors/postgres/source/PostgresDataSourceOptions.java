@@ -281,4 +281,14 @@ public class PostgresDataSourceOptions {
                     .defaultValue(false)
                     .withDescription(
                             "Whether to infer CDC column types when processing pgoutput Relation messages.");
+
+    @Experimental
+    public static final ConfigOption<Boolean> SCAN_INCLUDE_PARTITIONED_TABLES =
+            ConfigOptions.key("scan.include-partitioned-tables.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether to include partitioned tables and route child partition "
+                                    + "events to their parent table. When enabled, child partition "
+                                    + "DML events are automatically routed to the parent table ID.");
 }

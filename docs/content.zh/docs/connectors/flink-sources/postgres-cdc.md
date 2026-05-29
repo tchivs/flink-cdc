@@ -286,10 +286,20 @@ Connector Options
       <td style="word-wrap: break-word;">false</td>
       <td>Boolean</td>
       <td>
-        Whether to enable reading partitioned tables via partition root.<br>
-        If enabled:
-          (1) PUBLICATION must be created beforehand with parameter publish_via_partition_root=true
-          (2) Table list (regex or predefined list) should only match the parent table name, if table list matches both parent and child tables, snapshot data will be read twice.
+        是否启用通过 partition root 读取分区表。<br>
+        启用后，连接器会发现子分区，并将子分区的 CDC 事件路由到父表。该能力适用于所有 PostgreSQL 版本。<br>
+        PG11+ 推荐在 PUBLICATION 上设置 <code>publish_via_partition_root=true</code> 以获得最佳性能；如果未设置，连接器会自动完成路由。PG10 <strong>不</strong>支持 <code>publish_via_partition_root</code> 选项，连接器会自动将子分区事件路由到父表，并在运行时为新增子分区维护 publication 成员关系。<br>
+        表过滤列表（正则或预定义列表）只应匹配父表名；若同时匹配到父表与子表，快照数据会被读取两次。
+      </td>
+    </tr>
+    <tr>
+      <td>scan.partition-discovery.poll-interval</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">10 min</td>
+      <td>Duration</td>
+      <td>
+        流式阶段连接器轮询系统目录以发现新增子分区的时间间隔。基于 WAL 的 reconciler 可以实时检测新分区；本轮询作为兜底机制，对 PG10 而言则是主要的发现通道（必须先刷新 publication 成员关系，<code>pgoutput</code> 才能为新子表发出 <code>Relation</code> 消息）。<br>
+        仅在 <code>scan.include-partitioned-tables.enabled = true</code> 时生效。
       </td>
     </tr>
     </tbody>

@@ -41,6 +41,9 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
     private final boolean includePartitionedTables;
     private final boolean includeDatabaseInTableId;
 
+    // Partition discovery settings
+    private final Duration partitionDiscoveryPollInterval;
+
     public PostgresSourceConfig(
             int subtaskId,
             StartupOptions startupOptions,
@@ -71,7 +74,8 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
             int lsnCommitCheckpointsDelay,
             boolean assignUnboundedChunkFirst,
             boolean includePartitionedTables,
-            boolean includeDatabaseInTableId) {
+            boolean includeDatabaseInTableId,
+            Duration partitionDiscoveryPollInterval) {
         super(
                 startupOptions,
                 databaseList,
@@ -103,6 +107,7 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
         this.lsnCommitCheckpointsDelay = lsnCommitCheckpointsDelay;
         this.includePartitionedTables = includePartitionedTables;
         this.includeDatabaseInTableId = includeDatabaseInTableId;
+        this.partitionDiscoveryPollInterval = partitionDiscoveryPollInterval;
     }
 
     /**
@@ -155,5 +160,10 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
     /** Returns whether to include database in the generated Table ID. */
     public boolean isIncludeDatabaseInTableId() {
         return includeDatabaseInTableId;
+    }
+
+    /** Returns the poll interval for partition discovery during streaming. */
+    public Duration getPartitionDiscoveryPollInterval() {
+        return partitionDiscoveryPollInterval;
     }
 }

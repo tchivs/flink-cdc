@@ -37,9 +37,10 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
+import java.util.Set;
 
 /** A CustomPostgresSchema similar to PostgresSchema with customization. */
 public class CustomPostgresSchema {
@@ -82,7 +83,7 @@ public class CustomPostgresSchema {
 
         if (!unMatchTableIds.isEmpty()) {
             try {
-                readTableSchema(tableIds);
+                readTableSchema(unMatchTableIds);
             } catch (SQLException e) {
                 throw new FlinkRuntimeException("Failed to read table schema", e);
             }
@@ -98,47 +99,85 @@ public class CustomPostgresSchema {
         return tableChanges;
     }
 
-    private List<TableChange> readTableSchema(List<TableId> tableIds) throws SQLException {
+    /**
+     * Reads table schemas from the database and populates the cache.
+     *
+     * <p>Uses a combined filter that unions the configured data-collection filter with the
+     * explicitly requested table IDs. This ensures:
+     *
+     * <ul>
+     *   <li>On the first invocation, ALL configured captured tables are loaded and cached at once,
+     *       eliminating O(N²) repeated pg_catalog scans (fixes the performance issue from PR
+     *       #4403).
+     *   <li>Partition child tables (which may not be in the config filter) are also loaded when
+     *       explicitly requested.
+     * </ul>
+     *
+     * <p>Every table discovered by readSchema is cached, while only the originally-requested subset
+     * is returned.
+     */
+    protected List<TableChange> readTableSchema(List<TableId> tableIds) throws SQLException {
         List<TableChange> tableChanges = new ArrayList<>();
 
         final PostgresOffsetContext offsetContext =
                 PostgresOffsetContext.initialContext(dbzConfig, jdbcConnection, Clock.SYSTEM);
 
         PostgresPartition partition = new PostgresPartition(dbzConfig.getLogicalName());
+        Set<TableId> requestedTableIds = new LinkedHashSet<>(tableIds);
 
+        // Combined filter: configured captured tables + explicitly requested tables.
+        // This loads all configured tables eagerly on first call (for cache warmup)
+        // while also covering partition children not in the config filter.
         Tables tables = new Tables();
         try {
             jdbcConnection.readSchema(
                     tables,
                     dbzConfig.databaseName(),
                     null,
-                    dbzConfig.getTableFilters().dataCollectionFilter(),
+                    tableId ->
+                            dbzConfig.getTableFilters().dataCollectionFilter().isIncluded(tableId)
+                                    || requestedTableIds.contains(tableId),
                     null,
                     false);
         } catch (SQLException e) {
             throw new FlinkRuntimeException("Failed to read schema", e);
         }
 
-        for (TableId tableId : tableIds) {
-            Table table = Objects.requireNonNull(tables.forTable(tableId));
-            // set the events to populate proper sourceInfo into offsetContext
-            offsetContext.event(tableId, Instant.now());
-
-            // TODO: check whether we always set isFromSnapshot = true
+        // Cache ALL discovered tables — subsequent splits are served entirely from cache.
+        for (TableId discoveredId : tables.tableIds()) {
+            if (schemasByTableId.containsKey(discoveredId)) {
+                continue;
+            }
+            Table table = tables.forTable(discoveredId);
+            if (table == null) {
+                continue;
+            }
+            offsetContext.event(discoveredId, Instant.now());
             SchemaChangeEvent schemaChangeEvent =
                     SchemaChangeEvent.ofCreate(
                             partition,
                             offsetContext,
                             dbzConfig.databaseName(),
-                            tableId.schema(),
+                            discoveredId.schema(),
                             null,
                             table,
                             true);
-
             for (TableChanges.TableChange tableChange : schemaChangeEvent.getTableChanges()) {
-                this.schemasByTableId.put(tableId, tableChange);
+                this.schemasByTableId.put(discoveredId, tableChange);
             }
-            tableChanges.add(this.schemasByTableId.get(tableId));
+        }
+
+        // Return only the originally-requested subset.
+        for (TableId tableId : tableIds) {
+            TableChange cached = this.schemasByTableId.get(tableId);
+            if (cached == null) {
+                throw new FlinkRuntimeException(
+                        String.format(
+                                "Table '%s' was not found in pg_catalog. "
+                                        + "Verify the table exists and is accessible.",
+                                tableId));
+            }
+            tableChanges.add(cached);
         }
         return tableChanges;
     }

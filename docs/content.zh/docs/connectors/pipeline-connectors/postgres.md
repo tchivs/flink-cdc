@@ -282,6 +282,18 @@ pipeline:
         默认值为 false。
       </td>
     </tr>
+    <tr>
+      <td>scan.include-partitioned-tables.enabled</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">false</td>
+      <td>Boolean</td>
+      <td>
+        是否包含分区表，并将子分区事件路由到父表。<br>
+        启用后，连接器在启动时发现子分区，并把子分区的 CDC 事件改写为父表标识下发，该能力适用于所有 PostgreSQL 版本。<br>
+        PG11+ 推荐在 PUBLICATION 上设置 <code>publish_via_partition_root=true</code> 以获得最佳性能；未设置时，连接器会自动完成路由。PG10 <strong>不</strong>支持 <code>publish_via_partition_root</code> 选项，连接器会自动路由事件到父表，并在运行时为新增子分区维护 publication 成员关系。<br>
+        <code>tables</code> 列表应只匹配父表名。此为实验性选项。
+      </td>
+    </tr>
     </tbody>
 </table>
 </div>

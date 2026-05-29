@@ -462,7 +462,8 @@ public class PostgresSourceBuilder<T> {
                     deserializationSchema,
                     sourceReaderMetrics,
                     sourceConfig.isIncludeSchemaChanges(),
-                    offsetFactory);
+                    offsetFactory,
+                    ((PostgresDialect) dataSourceDialect)::getChildToParentMapping);
         }
 
         public static <T> PostgresSourceBuilder<T> builder() {
