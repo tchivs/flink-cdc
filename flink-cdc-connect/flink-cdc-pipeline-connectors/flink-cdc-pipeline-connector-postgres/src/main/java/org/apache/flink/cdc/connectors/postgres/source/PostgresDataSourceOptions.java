@@ -53,6 +53,15 @@ public class PostgresDataSourceOptions {
                     .withDescription(
                             "Password to use when connecting to the PostgreSQL database server.");
 
+    public static final ConfigOption<String> DATABASE =
+            ConfigOptions.key("database")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Name of the PostgreSQL database to connect to. "
+                                    + "If set, the 'tables' parameter can use 'schema.table' format (two segments). "
+                                    + "If not set, database name must be specified in 'tables' using 'database.schema.table' format (three segments).");
+
     public static final ConfigOption<String> TABLES =
             ConfigOptions.key("tables")
                     .stringType()
@@ -62,7 +71,8 @@ public class PostgresDataSourceOptions {
                                     + "It is important to note that the dot (.) is treated as a delimiter for database and table names. "
                                     + "If there is a need to use a dot (.) in a regular expression to match any character, "
                                     + "it is necessary to escape the dot with a backslash."
-                                    + "eg. db0.\\.*, db1.user_table_[0-9]+, db[1-2].[app|web]_order_\\.*");
+                                    + "eg. db0.\\.*, db1.user_table_[0-9]+, db[1-2].[app|web]_order_\\.*\\n"
+                                    + "When 'database' option is set, tables can be specified in 'schema.table' format.");
 
     public static final ConfigOption<String> DECODING_PLUGIN_NAME =
             ConfigOptions.key("decoding.plugin.name")

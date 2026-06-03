@@ -45,6 +45,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.DATABASE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.HOSTNAME;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PARTITION_DISCOVERY_POLL_INTERVAL;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PASSWORD;
@@ -357,6 +358,68 @@ public class PostgresDataSourceFactoryTest extends PostgresTestBase {
         // Should not throw ValidationException for unsupported options.
         PostgresDataSource dataSource = (PostgresDataSource) factory.createDataSource(context);
         assertThat(dataSource).isNotNull();
+    }
+
+    @Test
+    public void testCreateDataSourceWithDatabaseOption() {
+        Map<String, String> options = new HashMap<>();
+        options.put(HOSTNAME.key(), POSTGRES_CONTAINER.getHost());
+        options.put(
+                PG_PORT.key(), String.valueOf(POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT)));
+        options.put(USERNAME.key(), TEST_USER);
+        options.put(PASSWORD.key(), TEST_PASSWORD);
+        // Use 'database' option + 'schema.table' format (two-segment)
+        options.put(DATABASE.key(), POSTGRES_CONTAINER.getDatabaseName());
+        options.put(TABLES.key(), "inventory.prod\\.*");
+        options.put(SLOT_NAME.key(), slotName);
+        Factory.Context context = new MockContext(Configuration.fromMap(options));
+        PostgresDataSourceFactory factory = new PostgresDataSourceFactory();
+        PostgresDataSource dataSource = (PostgresDataSource) factory.createDataSource(context);
+        assertThat(dataSource.getPostgresSourceConfig().getTableList())
+                .isEqualTo(Arrays.asList("inventory.products"));
+    }
+
+    @Test
+    public void testDatabaseOptionWithTableExclude() {
+        Map<String, String> options = new HashMap<>();
+        options.put(HOSTNAME.key(), POSTGRES_CONTAINER.getHost());
+        options.put(
+                PG_PORT.key(), String.valueOf(POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT)));
+        options.put(USERNAME.key(), TEST_USER);
+        options.put(PASSWORD.key(), TEST_PASSWORD);
+        // Use 'database' option + two-segment tables format
+        options.put(DATABASE.key(), POSTGRES_CONTAINER.getDatabaseName());
+        options.put(TABLES.key(), "inventory.\\.*");
+        options.put(TABLES_EXCLUDE.key(), "inventory.orders");
+        options.put(SLOT_NAME.key(), slotName);
+        Factory.Context context = new MockContext(Configuration.fromMap(options));
+
+        PostgresDataSourceFactory factory = new PostgresDataSourceFactory();
+        PostgresDataSource dataSource = (PostgresDataSource) factory.createDataSource(context);
+        List<String> actualTableList =
+                new ArrayList<>(dataSource.getPostgresSourceConfig().getTableList());
+        Collections.sort(actualTableList);
+        assertThat(actualTableList)
+                .isNotEqualTo(Collections.singletonList("inventory.orders"))
+                .contains("inventory.products", "inventory.customers");
+    }
+
+    @Test
+    public void testDatabaseOptionBackwardCompatible() {
+        // Without 'database' option, the old three-segment format should still work
+        Map<String, String> options = new HashMap<>();
+        options.put(HOSTNAME.key(), POSTGRES_CONTAINER.getHost());
+        options.put(
+                PG_PORT.key(), String.valueOf(POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT)));
+        options.put(USERNAME.key(), TEST_USER);
+        options.put(PASSWORD.key(), TEST_PASSWORD);
+        options.put(TABLES.key(), POSTGRES_CONTAINER.getDatabaseName() + ".inventory.prod\\.*");
+        options.put(SLOT_NAME.key(), slotName);
+        Factory.Context context = new MockContext(Configuration.fromMap(options));
+        PostgresDataSourceFactory factory = new PostgresDataSourceFactory();
+        PostgresDataSource dataSource = (PostgresDataSource) factory.createDataSource(context);
+        assertThat(dataSource.getPostgresSourceConfig().getTableList())
+                .isEqualTo(Arrays.asList("inventory.products"));
     }
 
     class MockContext implements Factory.Context {

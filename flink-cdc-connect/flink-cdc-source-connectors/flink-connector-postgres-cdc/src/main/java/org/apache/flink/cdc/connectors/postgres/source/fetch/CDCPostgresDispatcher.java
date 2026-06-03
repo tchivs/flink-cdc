@@ -354,6 +354,9 @@ public class CDCPostgresDispatcher extends PostgresEventDispatcher<TableId>
      */
     @Override
     public TableId preRouteTableId(TableId tableId) {
+        if (tableId == null) {
+            return null;
+        }
         TableId routed = routeTableId(tableId);
         if (!routed.equals(tableId)) {
             if (!ensureParentSchemaRegistered(tableId, routed)) {

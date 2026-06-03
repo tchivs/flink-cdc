@@ -60,6 +60,7 @@ import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSource
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CONNECTION_POOL_SIZE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CONNECT_MAX_RETRIES;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CONNECT_TIMEOUT;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.DATABASE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.DECODING_PLUGIN_NAME;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.HEARTBEAT_INTERVAL;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.HOSTNAME;
@@ -156,7 +157,8 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         validateDistributionFactorLower(distributionFactorLower);
 
         Map<String, String> configMap = config.toMap();
-        Optional<String> databaseName = getValidateDatabaseName(tables);
+        String databaseFromConfig = config.get(DATABASE);
+        Optional<String> databaseName = getValidateDatabaseName(tables, databaseFromConfig);
 
         PostgresSourceConfigFactory configFactory =
                 PostgresSourceBuilder.PostgresIncrementalSource.<RowData>builder()
@@ -285,6 +287,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
     @Override
     public Set<ConfigOption<?>> optionalOptions() {
         Set<ConfigOption<?>> options = new HashSet<>();
+        options.add(DATABASE);
         options.add(PG_PORT);
         options.add(TABLES_EXCLUDE);
         options.add(DECODING_PLUGIN_NAME);
@@ -440,20 +443,31 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
     /**
      * Get the database name.
      *
-     * @param tables Table name list, format is "db.schema.table,db.schema.table,..." Each table
-     *     name consists of three parts separated by ".", which are database name, schema name, and
-     *     table name.
+     * @param tables Table name list, format is "db.schema.table,db.schema.table,..." or
+     *     "schema.table" when databaseFromConfig is set. Each table name consists of two or three
+     *     parts separated by ".", which are database name, schema name, and table name.
+     * @param databaseFromConfig Database name from the 'database' config option, or null if not set
      * @return Database name if found, otherwise returns Optional.empty()
      * @throws IllegalArgumentException If the input parameter is null or does not match the
      *     expected format, or if database names are inconsistent.
      */
-    private Optional<String> getValidateDatabaseName(String tables) {
+    private Optional<String> getValidateDatabaseName(
+            String tables, @Nullable String databaseFromConfig) {
         // Input validation
         if (tables == null || tables.trim().isEmpty()) {
             throw new IllegalArgumentException("Parameter tables cannot be null or empty");
         }
 
-        // Split table name list
+        // If database is explicitly set from config, validate and use it directly
+        if (databaseFromConfig != null && !databaseFromConfig.trim().isEmpty()) {
+            checkState(
+                    isValidPostgresDbName(databaseFromConfig),
+                    String.format(
+                            "%s is not a valid PostgreSQL database name", databaseFromConfig));
+            return Optional.of(databaseFromConfig);
+        }
+
+        // Otherwise, extract database name from tables (three-segment format required)
         String[] tableNames = tables.split(",");
         String dbName = null;
 
