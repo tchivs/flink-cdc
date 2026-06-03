@@ -31,6 +31,7 @@ import org.apache.flink.cdc.common.event.TruncateTableEvent;
 import org.apache.flink.cdc.common.schema.Schema;
 import org.apache.flink.cdc.common.utils.Preconditions;
 import org.apache.flink.cdc.common.utils.SchemaUtils;
+import org.apache.flink.cdc.connectors.paimon.sink.utils.PaimonCatalogRetryUtils;
 import org.apache.flink.cdc.connectors.paimon.sink.v2.OperatorIDGenerator;
 import org.apache.flink.cdc.connectors.paimon.sink.v2.PaimonWriterHelper;
 import org.apache.flink.cdc.connectors.paimon.sink.v2.TableSchemaInfo;
@@ -46,7 +47,6 @@ import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.streaming.runtime.tasks.StreamTask;
 
 import org.apache.paimon.catalog.Catalog;
-import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.flink.FlinkCatalogFactory;
 import org.apache.paimon.index.BucketAssigner;
@@ -54,6 +54,7 @@ import org.apache.paimon.index.HashBucketAssigner;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.Table;
 import org.apache.paimon.table.sink.RowKeyExtractor;
 import org.apache.paimon.table.sink.RowPartitionKeyExtractor;
 import org.apache.paimon.utils.MathUtils;
@@ -65,7 +66,15 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 
-/** Assign bucket for every given {@link DataChangeEvent}. */
+/**
+ * Assign bucket for every given {@link DataChangeEvent}.
+ *
+ * <p>All catalog table lookups use bounded retries to tolerate transient visibility delays between
+ * the JobManager-side {@code PaimonMetadataApplier} creating the physical table and the
+ * TaskManager-visible filesystem catalog reflecting it. When the catalog is still not visible after
+ * retries, the operator falls back to the upstream-derived schema for schema-event conversion, so
+ * the job can keep running instead of failing fast with {@code TableNotExistException}.
+ */
 public class BucketAssignOperator extends AbstractStreamOperatorAdapter<Event>
         implements OneInputStreamOperator<Event, Event> {
 
@@ -231,9 +240,7 @@ public class BucketAssignOperator extends AbstractStreamOperatorAdapter<Event>
         if (!SchemaUtils.isSchemaChangeEventRedundant(upstreamSchema, schemaChangeEvent)) {
             upstreamSchema = SchemaUtils.applySchemaChangeEvent(upstreamSchema, schemaChangeEvent);
         }
-        Schema physicalSchema =
-                PaimonWriterHelper.deduceSchemaForPaimonTable(
-                        catalog.getTable(PaimonWriterHelper.identifierFromTableId(tableId)));
+        Schema physicalSchema = derivePhysicalSchema(tableId, schemaChangeEvent, upstreamSchema);
         MixedSchemaInfo mixedSchemaInfo =
                 new MixedSchemaInfo(
                         new TableSchemaInfo(upstreamSchema, zoneId),
@@ -262,15 +269,25 @@ public class BucketAssignOperator extends AbstractStreamOperatorAdapter<Event>
                 schema = Optional.empty();
             }
             if (schema.isPresent()) {
+                Schema physicalSchema;
+                try {
+                    physicalSchema =
+                            PaimonWriterHelper.deduceSchemaForPaimonTable(
+                                    catalogGetTableWithRetry(tableId));
+                } catch (Exception e) {
+                    LOGGER.warn(
+                            "Failed to load Paimon physical schema for {} from catalog, "
+                                    + "falling back to upstream schema. Data precision "
+                                    + "differences may go undetected. Cause: {}",
+                            tableId,
+                            e.getMessage(),
+                            e);
+                    physicalSchema = schema.get();
+                }
                 MixedSchemaInfo mixedSchemaInfo =
                         new MixedSchemaInfo(
                                 new TableSchemaInfo(schema.get(), zoneId),
-                                new TableSchemaInfo(
-                                        PaimonWriterHelper.deduceSchemaForPaimonTable(
-                                                catalog.getTable(
-                                                        PaimonWriterHelper.identifierFromTableId(
-                                                                tableId))),
-                                        zoneId));
+                                new TableSchemaInfo(physicalSchema, zoneId));
                 if (!mixedSchemaInfo.isSameColumnsIgnoringCommentAndDefaultValue()) {
                     LOGGER.warn(
                             "Upstream schema of {} is {}, which is different with paimon physical table schema {}. Data precision loss and truncation may occur.",
@@ -327,12 +344,7 @@ public class BucketAssignOperator extends AbstractStreamOperatorAdapter<Event>
     private Tuple4<BucketMode, RowKeyExtractor, BucketAssigner, RowPartitionKeyExtractor>
             getTableInfo(TableId tableId) {
         Preconditions.checkNotNull(tableId, "Invalid tableId in given event.");
-        FileStoreTable table;
-        try {
-            table = (FileStoreTable) catalog.getTable(Identifier.fromString(tableId.toString()));
-        } catch (Catalog.TableNotExistException e) {
-            throw new RuntimeException(e);
-        }
+        FileStoreTable table = (FileStoreTable) catalogGetTableWithRetry(tableId);
         long targetRowNum = table.coreOptions().dynamicBucketTargetRowNum();
         Integer numAssigners = table.coreOptions().dynamicBucketInitialBuckets();
         Integer maxBucketsNum = table.coreOptions().dynamicBucketMaxBuckets();
@@ -350,6 +362,59 @@ public class BucketAssignOperator extends AbstractStreamOperatorAdapter<Event>
                         targetRowNum,
                         maxBucketsNum),
                 new RowPartitionKeyExtractor(table.schema()));
+    }
+
+    /**
+     * Derive the Paimon physical schema for the given {@link SchemaChangeEvent} without eagerly
+     * hitting the catalog when possible.
+     *
+     * <ul>
+     *   <li>If we already cached a physical schema for the table, apply the change incrementally on
+     *       top of it (or just return it for redundant changes / re-creates).
+     *   <li>For a brand new {@link CreateTableEvent} we directly use the schema carried by the
+     *       event, since {@code PaimonMetadataApplier#applyCreateTable} creates the table from
+     *       exactly that schema. This avoids racing with the metadata applier.
+     *   <li>Otherwise we fall back to a bounded-retry catalog lookup; if the table still cannot be
+     *       loaded we use the upstream schema as a last resort and log a warning.
+     * </ul>
+     */
+    private Schema derivePhysicalSchema(
+            TableId tableId, SchemaChangeEvent event, Schema upstreamSchema) {
+        if (schemaMaps.containsKey(tableId)) {
+            Schema previousPhysical = schemaMaps.get(tableId).getPaimonSchemaInfo().getSchema();
+            if (event instanceof CreateTableEvent) {
+                return ((CreateTableEvent) event).getSchema();
+            }
+            if (!SchemaUtils.isSchemaChangeEventRedundant(previousPhysical, event)) {
+                return SchemaUtils.applySchemaChangeEvent(previousPhysical, event);
+            }
+            return previousPhysical;
+        }
+        if (event instanceof CreateTableEvent) {
+            // PaimonMetadataApplier creates the physical table using exactly this schema, so it
+            // is safe (and required for correctness across non-shared filesystem catalogs) to use
+            // the event-carried schema directly without consulting the catalog.
+            return ((CreateTableEvent) event).getSchema();
+        }
+        try {
+            return PaimonWriterHelper.deduceSchemaForPaimonTable(catalogGetTableWithRetry(tableId));
+        } catch (Exception e) {
+            LOGGER.warn(
+                    "Failed to load Paimon physical schema for {} from catalog after retries, falling back to upstream schema. Cause: {}",
+                    tableId,
+                    e.getMessage());
+            return upstreamSchema;
+        }
+    }
+
+    /**
+     * Look up a Paimon table from the catalog with bounded retries. The TaskManager-side catalog
+     * may briefly lag behind the JobManager-side metadata applier, especially for filesystem
+     * catalogs without a shared warehouse volume.
+     */
+    private Table catalogGetTableWithRetry(TableId tableId) {
+        return PaimonCatalogRetryUtils.getTableWithRetry(
+                catalog, PaimonWriterHelper.identifierFromTableId(tableId), "BucketAssignOperator");
     }
 
     /** MixedSchemaInfo is used to store the mixed schema info of upstream and paimon table. */
