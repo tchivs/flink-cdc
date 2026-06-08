@@ -6,6 +6,8 @@
 
 package io.debezium.connector.postgresql.connection;
 
+import org.apache.flink.cdc.connectors.postgres.source.utils.PublicationManager;
+
 import io.debezium.DebeziumException;
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.connector.postgresql.PostgresSchema;
@@ -47,6 +49,7 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import static java.lang.Math.toIntExact;
+import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfigFactory.FLINK_CDC_INCLUDE_PARTITIONED_TABLES;
 
 /**
  * Copied from Debezium 1.9.8.Final
@@ -289,7 +292,25 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
             }
         }
 
-        return capturedTables.stream()
+        // PostgreSQL 10 rejects partitioned parent tables in publication membership. Keep the
+        // connector-level filter unchanged and rewrite only the table list used by publication SQL.
+        // This JDBC-heavy rewrite is only needed when partition routing is enabled; skip it for the
+        // common case to avoid unnecessary catalog queries.
+        boolean includePartitionedTables =
+                Boolean.parseBoolean(
+                        connectorConfig
+                                .getConfig()
+                                .getString(FLINK_CDC_INCLUDE_PARTITIONED_TABLES));
+        Set<TableId> publicationTables;
+        if (includePartitionedTables) {
+            publicationTables =
+                    PublicationManager.resolveFilteredPublicationTables(
+                            jdbcConnection, publicationName, capturedTables);
+        } else {
+            publicationTables = capturedTables;
+        }
+
+        return publicationTables.stream()
                 .sorted()
                 .collect(Collectors.toCollection(LinkedHashSet::new));
     }

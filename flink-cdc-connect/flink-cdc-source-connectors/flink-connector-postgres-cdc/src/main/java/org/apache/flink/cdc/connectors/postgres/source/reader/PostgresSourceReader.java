@@ -43,6 +43,7 @@ import org.apache.flink.connector.base.source.reader.synchronization.FutureCompl
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
@@ -100,6 +101,7 @@ public class PostgresSourceReader extends IncrementalSourceReaderWithCommit {
 
     @Override
     protected SourceSplitState initializedState(SourceSplitBase split) {
+        initializeSnapshotPartitionRouting(split);
         if (recordEmitter instanceof IncrementalSourceRecordEmitter) {
             ((IncrementalSourceRecordEmitter) recordEmitter).applySplit(split);
         }
@@ -108,6 +110,21 @@ public class PostgresSourceReader extends IncrementalSourceReaderWithCommit {
         } else {
             return new StreamSplitState(split.asStreamSplit());
         }
+    }
+
+    private void initializeSnapshotPartitionRouting(SourceSplitBase split) {
+        if (!split.isSnapshotSplit()
+                || !(dialect instanceof PostgresDialect)
+                || !((PostgresSourceConfig) sourceConfig).includePartitionedTables()) {
+            return;
+        }
+
+        PostgresDialect postgresDialect = (PostgresDialect) dialect;
+        if (!postgresDialect.getChildToParentMapping().isEmpty()) {
+            return;
+        }
+        postgresDialect.discoverPartitionState(
+                Collections.singletonList(split.asSnapshotSplit().getTableId()));
     }
 
     @Override

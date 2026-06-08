@@ -42,6 +42,9 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
 
     private static final String JDBC_DRIVER = "org.postgresql.Driver";
 
+    public static final String FLINK_CDC_INCLUDE_PARTITIONED_TABLES =
+            "flink.cdc.include.partitioned.tables";
+
     private String pluginName = "decoderbufs";
 
     private String slotName = "flink";
@@ -56,6 +59,10 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
 
     private boolean includeDatabaseInTableId =
             PostgresSourceOptions.TABLE_ID_INCLUDE_DATABASE.defaultValue();
+
+    // Partition discovery settings
+    private Duration partitionDiscoveryPollInterval =
+            PostgresSourceOptions.PARTITION_DISCOVERY_POLL_INTERVAL.defaultValue();
 
     /** Creates a new {@link PostgresSourceConfig} for the given subtask {@code subtaskId}. */
     @Override
@@ -105,6 +112,11 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
             props.putAll(dbzProperties);
         }
 
+        // Internal Flink CDC switch consumed by the forked replication connection. Set it after
+        // user Debezium properties so the public source option remains the single source of truth.
+        props.setProperty(
+                FLINK_CDC_INCLUDE_PARTITIONED_TABLES, String.valueOf(includePartitionedTables));
+
         // The PostgresSource will do snapshot according to its StartupMode.
         // Do not need debezium to do the snapshot work.
         props.setProperty("snapshot.mode", "never");
@@ -140,7 +152,8 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
                 lsnCommitCheckpointsDelay,
                 assignUnboundedChunkFirst,
                 includePartitionedTables,
-                includeDatabaseInTableId);
+                includeDatabaseInTableId,
+                partitionDiscoveryPollInterval);
     }
 
     /**
@@ -197,5 +210,10 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
     /** Set whether to include database in the generated Table ID. */
     public void setIncludeDatabaseInTableId(boolean includeDatabaseInTableId) {
         this.includeDatabaseInTableId = includeDatabaseInTableId;
+    }
+
+    /** Set the poll interval for partition discovery. */
+    public void setPartitionDiscoveryPollInterval(Duration interval) {
+        this.partitionDiscoveryPollInterval = interval;
     }
 }

@@ -5,6 +5,9 @@
  */
 package io.debezium.connector.postgresql;
 
+import org.apache.flink.cdc.connectors.postgres.source.fetch.PartitionReconciliationRequiredException;
+import org.apache.flink.cdc.connectors.postgres.source.fetch.PartitionRouteAware;
+
 import io.debezium.DebeziumException;
 import io.debezium.connector.postgresql.connection.LogicalDecodingMessage;
 import io.debezium.connector.postgresql.connection.Lsn;
@@ -84,6 +87,8 @@ public class PostgresStreamingChangeEventSource
     private long numberOfEventsSinceLastEventSentOrWalGrowingWarning = 0;
 
     private Lsn lastCompletelyProcessedLsn;
+
+    private volatile Map<String, ?> partitionReconciliationRestartOffset;
 
     public PostgresStreamingChangeEventSource(
             PostgresConnectorConfig connectorConfig,
@@ -210,6 +215,10 @@ public class PostgresStreamingChangeEventSource
                                 KEEP_ALIVE_THREAD_NAME));
             }
             processMessages(context, partition, offsetContext, stream);
+        } catch (PartitionReconciliationRequiredException e) {
+            LOGGER.info(
+                    "Stopping PostgreSQL streaming session for partition reconciliation: {}",
+                    e.getTableId());
         } catch (Throwable e) {
             errorHandler.setProducerThrowable(e);
         } finally {
@@ -253,102 +262,132 @@ public class PostgresStreamingChangeEventSource
                                         offsetContext.getStreamingStoppingLsn())
                                 < 0))) {
 
-            boolean receivedMessage =
-                    stream.readPending(
-                            message -> {
-                                final Lsn lsn = stream.lastReceivedLsn();
+            boolean receivedMessage;
+            try {
+                receivedMessage =
+                        stream.readPending(
+                                message -> {
+                                    final Lsn lsn = stream.lastReceivedLsn();
 
-                                if (message.isLastEventForLsn()) {
-                                    lastCompletelyProcessedLsn = lsn;
-                                }
+                                    if (message.isLastEventForLsn()) {
+                                        lastCompletelyProcessedLsn = lsn;
+                                    }
 
-                                // Tx BEGIN/END event
-                                if (message.isTransactionalMessage()) {
-                                    if (!connectorConfig.shouldProvideTransactionMetadata()) {
-                                        LOGGER.trace("Received transactional message {}", message);
-                                        // Don't skip on BEGIN message as it would flush LSN for the
-                                        // whole transaction
-                                        // too early
-                                        if (message.getOperation() == Operation.COMMIT) {
+                                    // Tx BEGIN/END event
+                                    if (message.isTransactionalMessage()) {
+                                        if (!connectorConfig.shouldProvideTransactionMetadata()) {
+                                            LOGGER.trace(
+                                                    "Received transactional message {}", message);
+                                            // Don't skip on BEGIN message as it would flush LSN for
+                                            // the
+                                            // whole transaction
+                                            // too early
+                                            if (message.getOperation() == Operation.COMMIT) {
+                                                commitMessage(partition, offsetContext, lsn);
+                                            }
+                                            return;
+                                        }
+
+                                        offsetContext.updateWalPosition(
+                                                lsn,
+                                                lastCompletelyProcessedLsn,
+                                                message.getCommitTime(),
+                                                toLong(message.getTransactionId()),
+                                                taskContext.getSlotXmin(connection),
+                                                null);
+                                        if (message.getOperation() == Operation.BEGIN) {
+                                            dispatcher.dispatchTransactionStartedEvent(
+                                                    partition,
+                                                    toString(message.getTransactionId()),
+                                                    offsetContext);
+                                        } else if (message.getOperation() == Operation.COMMIT) {
+                                            commitMessage(partition, offsetContext, lsn);
+                                            dispatcher.dispatchTransactionCommittedEvent(
+                                                    partition, offsetContext);
+                                        }
+                                        maybeWarnAboutGrowingWalBacklog(true);
+                                    } else if (message.getOperation() == Operation.MESSAGE) {
+                                        offsetContext.updateWalPosition(
+                                                lsn,
+                                                lastCompletelyProcessedLsn,
+                                                message.getCommitTime(),
+                                                toLong(message.getTransactionId()),
+                                                taskContext.getSlotXmin(connection));
+
+                                        // non-transactional message that will not be followed by a
+                                        // COMMIT message
+                                        if (message.isLastEventForLsn()) {
                                             commitMessage(partition, offsetContext, lsn);
                                         }
-                                        return;
-                                    }
 
-                                    offsetContext.updateWalPosition(
-                                            lsn,
-                                            lastCompletelyProcessedLsn,
-                                            message.getCommitTime(),
-                                            toLong(message.getTransactionId()),
-                                            taskContext.getSlotXmin(connection),
-                                            null);
-                                    if (message.getOperation() == Operation.BEGIN) {
-                                        dispatcher.dispatchTransactionStartedEvent(
+                                        dispatcher.dispatchLogicalDecodingMessage(
                                                 partition,
-                                                toString(message.getTransactionId()),
-                                                offsetContext);
-                                    } else if (message.getOperation() == Operation.COMMIT) {
-                                        commitMessage(partition, offsetContext, lsn);
-                                        dispatcher.dispatchTransactionCommittedEvent(
-                                                partition, offsetContext);
+                                                offsetContext,
+                                                clock.currentTimeAsInstant().toEpochMilli(),
+                                                (LogicalDecodingMessage) message);
+
+                                        maybeWarnAboutGrowingWalBacklog(true);
                                     }
-                                    maybeWarnAboutGrowingWalBacklog(true);
-                                } else if (message.getOperation() == Operation.MESSAGE) {
-                                    offsetContext.updateWalPosition(
-                                            lsn,
-                                            lastCompletelyProcessedLsn,
-                                            message.getCommitTime(),
-                                            toLong(message.getTransactionId()),
-                                            taskContext.getSlotXmin(connection));
+                                    // DML event
+                                    else {
+                                        TableId tableId = null;
+                                        if (message.getOperation() != Operation.NOOP) {
+                                            tableId = PostgresSchema.parse(message.getTable());
+                                            Objects.requireNonNull(tableId);
+                                        }
 
-                                    // non-transactional message that will not be followed by a
-                                    // COMMIT message
-                                    if (message.isLastEventForLsn()) {
-                                        commitMessage(partition, offsetContext, lsn);
+                                        // Pre-route child partition tableId to parent BEFORE
+                                        // updating the offset context and creating the emitter.
+                                        // This ensures:
+                                        // 1. The emitter's schema.tableFor(tableId) uses the
+                                        //    routed (parent) tableId with registered schema.
+                                        // 2. The SourceRecord's source struct carries parent
+                                        //    table info, eliminating redundant Flink-level
+                                        //    re-routing in PostgresSourceRecordEmitter and
+                                        //    PostgresSourceFetchTaskContext.getTableId().
+                                        //
+                                        // We use the PartitionRouteAware capability rather than
+                                        // an instanceof check on CDCPostgresDispatcher so that
+                                        // any future dispatcher (or test mock) implementing the
+                                        // capability can opt in without changes here. The default
+                                        // no-op implementation in PartitionRouteAware keeps
+                                        // non-routing deployments free.
+                                        TableId emitterTableId =
+                                                (dispatcher instanceof PartitionRouteAware)
+                                                        ? ((PartitionRouteAware) dispatcher)
+                                                                .preRouteTableId(tableId)
+                                                        : tableId;
+
+                                        offsetContext.updateWalPosition(
+                                                lsn,
+                                                lastCompletelyProcessedLsn,
+                                                message.getCommitTime(),
+                                                toLong(message.getTransactionId()),
+                                                taskContext.getSlotXmin(connection),
+                                                emitterTableId);
+
+                                        boolean dispatched =
+                                                message.getOperation() != Operation.NOOP
+                                                        && dispatcher.dispatchDataChangeEvent(
+                                                                partition,
+                                                                emitterTableId,
+                                                                new PostgresChangeRecordEmitter(
+                                                                        partition,
+                                                                        offsetContext,
+                                                                        clock,
+                                                                        connectorConfig,
+                                                                        schema,
+                                                                        connection,
+                                                                        emitterTableId,
+                                                                        message));
+
+                                        maybeWarnAboutGrowingWalBacklog(dispatched);
                                     }
-
-                                    dispatcher.dispatchLogicalDecodingMessage(
-                                            partition,
-                                            offsetContext,
-                                            clock.currentTimeAsInstant().toEpochMilli(),
-                                            (LogicalDecodingMessage) message);
-
-                                    maybeWarnAboutGrowingWalBacklog(true);
-                                }
-                                // DML event
-                                else {
-                                    TableId tableId = null;
-                                    if (message.getOperation() != Operation.NOOP) {
-                                        tableId = PostgresSchema.parse(message.getTable());
-                                        Objects.requireNonNull(tableId);
-                                    }
-
-                                    offsetContext.updateWalPosition(
-                                            lsn,
-                                            lastCompletelyProcessedLsn,
-                                            message.getCommitTime(),
-                                            toLong(message.getTransactionId()),
-                                            taskContext.getSlotXmin(connection),
-                                            tableId);
-
-                                    boolean dispatched =
-                                            message.getOperation() != Operation.NOOP
-                                                    && dispatcher.dispatchDataChangeEvent(
-                                                            partition,
-                                                            tableId,
-                                                            new PostgresChangeRecordEmitter(
-                                                                    partition,
-                                                                    offsetContext,
-                                                                    clock,
-                                                                    connectorConfig,
-                                                                    schema,
-                                                                    connection,
-                                                                    tableId,
-                                                                    message));
-
-                                    maybeWarnAboutGrowingWalBacklog(dispatched);
-                                }
-                            });
+                                });
+            } catch (PartitionReconciliationRequiredException e) {
+                partitionReconciliationRestartOffset = offsetContext.getOffset();
+                throw e;
+            }
 
             probeConnectionIfNeeded();
 
@@ -498,6 +537,10 @@ public class PostgresStreamingChangeEventSource
         } catch (SQLException e) {
             throw new ConnectException(e);
         }
+    }
+
+    public Map<String, ?> getPartitionReconciliationRestartOffset() {
+        return partitionReconciliationRestartOffset;
     }
 
     /**

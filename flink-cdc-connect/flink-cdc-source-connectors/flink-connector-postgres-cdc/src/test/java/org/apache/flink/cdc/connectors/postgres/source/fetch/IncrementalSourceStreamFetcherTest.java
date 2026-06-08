@@ -96,10 +96,10 @@ public class IncrementalSourceStreamFetcherTest extends PostgresTestBase {
         StreamSplit split = createStreamSplit(sourceConfig, dialect);
         PostgresStreamFetchTask fetchTask =
                 (PostgresStreamFetchTask) dialect.createFetchTask(split);
-        StoppableChangeEventSourceContext changeEventSourceContext =
-                fetchTask.getChangeEventSourceContext();
 
         fetcher.submitTask(fetchTask);
+        StoppableChangeEventSourceContext changeEventSourceContext =
+                waitForChangeEventSourceContext(fetchTask);
         // Mock an exception occurring during stream split reading by setting the error handler
         // and stopping the change event source to test exception handling
         taskContext
@@ -229,5 +229,17 @@ public class IncrementalSourceStreamFetcherTest extends PostgresTestBase {
         }
         LOG.debug("Records polled: {}", records);
         return records;
+    }
+
+    private static StoppableChangeEventSourceContext waitForChangeEventSourceContext(
+            PostgresStreamFetchTask fetchTask) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 10_000L;
+        StoppableChangeEventSourceContext context = fetchTask.getChangeEventSourceContext();
+        while (context == null && System.currentTimeMillis() < deadline) {
+            Thread.sleep(50L);
+            context = fetchTask.getChangeEventSourceContext();
+        }
+        assertThat(context).isNotNull();
+        return context;
     }
 }

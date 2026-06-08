@@ -30,6 +30,7 @@ import org.apache.flink.cdc.connectors.base.source.reader.external.FetchTask;
 import org.apache.flink.cdc.connectors.base.source.reader.external.IncrementalSourceScanFetcher;
 import org.apache.flink.cdc.connectors.base.source.utils.hooks.SnapshotPhaseHook;
 import org.apache.flink.cdc.connectors.base.source.utils.hooks.SnapshotPhaseHooks;
+import org.apache.flink.cdc.connectors.base.utils.SourceRecordUtils;
 import org.apache.flink.cdc.connectors.postgres.PostgresTestBase;
 import org.apache.flink.cdc.connectors.postgres.source.PostgresDialect;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
@@ -73,6 +74,13 @@ class PostgresScanFetchTaskTest extends PostgresTestBase {
                     POSTGRES_CONTAINER,
                     "postgres",
                     "customer",
+                    POSTGRES_CONTAINER.getUsername(),
+                    POSTGRES_CONTAINER.getPassword());
+    private final UniqueDatabase inventoryPartitionedDatabase =
+            new UniqueDatabase(
+                    POSTGRES_CONTAINER,
+                    "postgres_partitioned",
+                    "inventory_partitioned",
                     POSTGRES_CONTAINER.getUsername(),
                     POSTGRES_CONTAINER.getPassword());
 
@@ -283,6 +291,66 @@ class PostgresScanFetchTaskTest extends PostgresTestBase {
         }
     }
 
+    @Test
+    void testPartitionedParentSnapshotSplitsUseChildTables() throws Exception {
+        inventoryPartitionedDatabase.createAndInitialize();
+        PostgresSourceConfigFactory sourceConfigFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "products", 10);
+        sourceConfigFactory.setIncludePartitionedTables(true);
+        PostgresSourceConfig sourceConfig = sourceConfigFactory.create(0);
+        PostgresDialect postgresDialect = new PostgresDialect(sourceConfig);
+
+        List<SnapshotSplit> snapshotSplits = getSnapshotSplits(sourceConfig, postgresDialect);
+
+        assertThat(snapshotSplits)
+                .extracting(split -> split.getTableId().toString())
+                .contains("inventory_partitioned.products_uk", "inventory_partitioned.products_us")
+                .doesNotContain("inventory_partitioned.products");
+    }
+
+    @Test
+    void testPartitionedSnapshotRecordsAreRoutedToParentTable() throws Exception {
+        inventoryPartitionedDatabase.createAndInitialize();
+        PostgresSourceConfigFactory sourceConfigFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "products", 10);
+        sourceConfigFactory.setIncludePartitionedTables(true);
+        PostgresSourceConfig sourceConfig = sourceConfigFactory.create(0);
+        PostgresDialect postgresDialect = new PostgresDialect(sourceConfig);
+        List<SnapshotSplit> snapshotSplits = getSnapshotSplits(sourceConfig, postgresDialect);
+        SnapshotSplit usPartitionSplit =
+                snapshotSplits.stream()
+                        .filter(split -> "products_us".equals(split.getTableId().table()))
+                        .findFirst()
+                        .orElseThrow(
+                                () ->
+                                        new AssertionError(
+                                                "Expected snapshot split for products_us"));
+        PostgresSourceFetchTaskContext taskContext =
+                new PostgresSourceFetchTaskContext(sourceConfig, postgresDialect);
+
+        List<SourceRecord> sourceRecords =
+                collectSnapshotRecords(
+                        Collections.singletonList(usPartitionSplit),
+                        taskContext,
+                        1,
+                        SnapshotPhaseHooks.empty());
+
+        assertThat(sourceRecords)
+                .filteredOn(SourceRecordUtils::isDataChangeRecord)
+                .extracting(SourceRecordUtils::getTableId)
+                .allSatisfy(
+                        tableId -> {
+                            assertThat(tableId.schema()).isEqualTo("inventory_partitioned");
+                            assertThat(tableId.table()).isEqualTo("products");
+                        });
+        assertThat(sourceRecords)
+                .filteredOn(SourceRecordUtils::isDataChangeRecord)
+                .extracting(SourceRecord::topic)
+                .allSatisfy(topic -> assertThat(topic).endsWith(".inventory_partitioned.products"));
+    }
+
     private List<String> getDataInSnapshotScan(
             String[] changingDataSql,
             String schemaName,
@@ -341,6 +409,18 @@ class PostgresScanFetchTaskTest extends PostgresTestBase {
             DataType dataType,
             SnapshotPhaseHooks snapshotPhaseHooks)
             throws Exception {
+        return formatResult(
+                collectSnapshotRecords(
+                        snapshotSplits, taskContext, scanSplitsNum, snapshotPhaseHooks),
+                dataType);
+    }
+
+    private List<SourceRecord> collectSnapshotRecords(
+            List<SnapshotSplit> snapshotSplits,
+            PostgresSourceFetchTaskContext taskContext,
+            int scanSplitsNum,
+            SnapshotPhaseHooks snapshotPhaseHooks)
+            throws Exception {
         IncrementalSourceScanFetcher sourceScanFetcher =
                 new IncrementalSourceScanFetcher(taskContext, 0);
 
@@ -367,7 +447,7 @@ class PostgresScanFetchTaskTest extends PostgresTestBase {
         assertThat(sourceScanFetcher.getExecutorService()).isNotNull();
         assertThat(sourceScanFetcher.getExecutorService().isTerminated()).isTrue();
 
-        return formatResult(result, dataType);
+        return result;
     }
 
     private List<String> formatResult(List<SourceRecord> records, DataType dataType) {

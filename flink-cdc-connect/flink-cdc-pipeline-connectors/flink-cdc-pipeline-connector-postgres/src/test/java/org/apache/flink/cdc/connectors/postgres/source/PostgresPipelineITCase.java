@@ -73,6 +73,8 @@ import org.slf4j.LoggerFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
@@ -97,6 +99,13 @@ public class PostgresPipelineITCase extends PostgresTestBase {
     private final UniqueDatabase inventoryDatabase =
             new UniqueDatabase(
                     POSTGRES_CONTAINER, "inventory", "inventory", TEST_USER, TEST_PASSWORD);
+    private final UniqueDatabase inventoryPartitionedDatabase =
+            new UniqueDatabase(
+                    POSTGRES_CONTAINER,
+                    "postgres3",
+                    "inventory_partitioned",
+                    TEST_USER,
+                    TEST_PASSWORD);
     private static final StreamExecutionEnvironment env =
             StreamExecutionEnvironment.getExecutionEnvironment();
     private String slotName;
@@ -230,8 +239,9 @@ public class PostgresPipelineITCase extends PostgresTestBase {
                             + "VALUES ('football', 'A leather football', 0.45)");
         }
 
-        // Wait for the pipeline to process the insert events
-        Thread.sleep(5000);
+        // Wait until the pipeline has processed the insert events before taking the savepoint.
+        List<Event> beforeSavepointEvents = collectDataChangeEvents(iterator, 2, 30_000L);
+        assertThat(beforeSavepointEvents).hasSize(2);
 
         // Trigger a savepoint and cancel the job
         LOG.info("Triggering savepoint");
@@ -283,14 +293,8 @@ public class PostgresPipelineITCase extends PostgresTestBase {
                             + "VALUES ('new_product_1', 'New product description', 1.0)");
         }
 
-        // Wait for the pipeline to stabilize and process events
-        Thread.sleep(10000);
-
         // Fetch results and check for CreateTableEvent and data change events
-        List<Event> restoreAfterEvents = new ArrayList<>();
-        while (restoreAfterEvents.size() < 2 && restoredIterator.hasNext()) {
-            restoreAfterEvents.add(restoredIterator.next());
-        }
+        List<Event> restoreAfterEvents = collectEvents(restoredIterator, 2, 30_000L);
         restoredIterator.close();
         restoredJobClient.cancel().get();
 
@@ -1215,5 +1219,302 @@ public class PostgresPipelineITCase extends PostgresTestBase {
                         .physicalColumn("weight", DataTypes.DOUBLE())
                         .primaryKey(Collections.singletonList("id"))
                         .build());
+    }
+
+    // ==================== Partition Routing Tests ====================
+
+    private CreateTableEvent getPartitionedProductsCreateTableEvent(TableId tableId) {
+        return new CreateTableEvent(
+                tableId,
+                Schema.newBuilder()
+                        .physicalColumn(
+                                "id",
+                                DataTypes.INT().notNull(),
+                                null,
+                                "nextval('inventory_partitioned.products_id_seq'::regclass)")
+                        .physicalColumn(
+                                "name",
+                                DataTypes.VARCHAR(255).notNull(),
+                                null,
+                                "'flink'::character varying")
+                        .physicalColumn("description", DataTypes.VARCHAR(512))
+                        .physicalColumn("weight", DataTypes.DOUBLE())
+                        .physicalColumn("country", DataTypes.VARCHAR(20).notNull())
+                        .primaryKey(Arrays.asList("id", "country"))
+                        .build());
+    }
+
+    @Test
+    public void testPartitionRoutingWithInitialMode() throws Exception {
+        inventoryPartitionedDatabase.createAndInitialize();
+        PostgresSourceConfigFactory configFactory =
+                (PostgresSourceConfigFactory)
+                        new PostgresSourceConfigFactory()
+                                .hostname(POSTGRES_CONTAINER.getHost())
+                                .port(POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT))
+                                .username(TEST_USER)
+                                .password(TEST_PASSWORD)
+                                .databaseList(inventoryPartitionedDatabase.getDatabaseName())
+                                .tableList("inventory_partitioned.products")
+                                .startupOptions(StartupOptions.initial())
+                                .serverTimeZone("UTC");
+        configFactory.database(inventoryPartitionedDatabase.getDatabaseName());
+        configFactory.slotName(slotName);
+        configFactory.decodingPluginName("pgoutput");
+        configFactory.setIncludePartitionedTables(true);
+
+        FlinkSourceProvider sourceProvider =
+                (FlinkSourceProvider)
+                        new PostgresDataSource(configFactory).getEventSourceProvider();
+
+        CloseableIterator<Event> events =
+                env.fromSource(
+                                sourceProvider.getSource(),
+                                WatermarkStrategy.noWatermarks(),
+                                PostgresDataSourceFactory.IDENTIFIER,
+                                new EventTypeInfo())
+                        .executeAndCollect();
+
+        // The parent table should be the tableId for all events
+        TableId tableId = TableId.tableId("inventory_partitioned", "products");
+
+        // Expect 9 snapshot rows from child partitions reported under parent
+        List<Event> snapshotExpected = getPartitionedSnapshotExpected(tableId);
+
+        // Use the same pattern as testInitialStartupMode: filter out CreateTableEvents
+        CreateTableEvent createTableEvent = getPartitionedProductsCreateTableEvent(tableId);
+        List<Event> actual = fetchResultsExcept(events, snapshotExpected.size(), createTableEvent);
+        assertThat(actual).containsExactlyInAnyOrderElementsOf(snapshotExpected);
+
+        inventoryPartitionedDatabase.removeSlot(slotName);
+    }
+
+    @Test
+    public void testPartitionRoutingWithLatestOffsetMode() throws Exception {
+        inventoryPartitionedDatabase.createAndInitialize();
+        PostgresSourceConfigFactory configFactory =
+                (PostgresSourceConfigFactory)
+                        new PostgresSourceConfigFactory()
+                                .hostname(POSTGRES_CONTAINER.getHost())
+                                .port(POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT))
+                                .username(TEST_USER)
+                                .password(TEST_PASSWORD)
+                                .databaseList(inventoryPartitionedDatabase.getDatabaseName())
+                                .tableList("inventory_partitioned.products")
+                                .startupOptions(StartupOptions.latest())
+                                .serverTimeZone("UTC");
+        configFactory.database(inventoryPartitionedDatabase.getDatabaseName());
+        configFactory.slotName(slotName);
+        configFactory.decodingPluginName("pgoutput");
+        configFactory.setIncludePartitionedTables(true);
+
+        FlinkSourceProvider sourceProvider =
+                (FlinkSourceProvider)
+                        new PostgresDataSource(configFactory).getEventSourceProvider();
+
+        CloseableIterator<Event> events =
+                env.fromSource(
+                                sourceProvider.getSource(),
+                                WatermarkStrategy.noWatermarks(),
+                                PostgresDataSourceFactory.IDENTIFIER,
+                                new EventTypeInfo())
+                        .executeAndCollect();
+
+        waitUntilReplicationSlotActive(inventoryPartitionedDatabase, 30_000L);
+
+        TableId tableId = TableId.tableId("inventory_partitioned", "products");
+
+        // Make DML changes on child partitions
+        try (Connection conn =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER,
+                                inventoryPartitionedDatabase.getDatabaseName());
+                Statement stat = conn.createStatement()) {
+            stat.execute("SET search_path TO inventory_partitioned");
+            stat.execute(
+                    "INSERT INTO products VALUES (110, 'backpack', 'waterproof backpack', 3.0, 'us')");
+            stat.execute(
+                    "INSERT INTO products VALUES (111, 'umbrella', 'foldable umbrella', 0.5, 'uk')");
+        }
+
+        // Collect streaming events (2 INSERTs). The iterator acts as the readiness signal for
+        // latest-offset mode, avoiding a fixed sleep before producing changes.
+        List<Event> streamEvents = collectDataChangeEvents(events, 2, 30_000L);
+        assertThat(streamEvents).hasSize(2);
+
+        // All events should be routed to parent tableId
+        for (Event event : streamEvents) {
+            assertThat(((DataChangeEvent) event).tableId()).isEqualTo(tableId);
+        }
+
+        inventoryPartitionedDatabase.removeSlot(slotName);
+    }
+
+    private static List<Event> collectDataChangeEvents(
+            Iterator<Event> events, int expectedSize, long timeoutMillis) {
+        List<Event> dataChangeEvents = new ArrayList<>();
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (dataChangeEvents.size() < expectedSize && System.currentTimeMillis() < deadline) {
+            if (events.hasNext()) {
+                Event event = events.next();
+                if (event instanceof DataChangeEvent) {
+                    dataChangeEvents.add(event);
+                }
+            }
+        }
+        return dataChangeEvents;
+    }
+
+    private static List<Event> collectEvents(
+            Iterator<Event> events, int expectedSize, long timeoutMillis) {
+        List<Event> collectedEvents = new ArrayList<>();
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (collectedEvents.size() < expectedSize && System.currentTimeMillis() < deadline) {
+            if (events.hasNext()) {
+                collectedEvents.add(events.next());
+            }
+        }
+        return collectedEvents;
+    }
+
+    private void waitUntilReplicationSlotActive(UniqueDatabase database, long timeoutMillis)
+            throws Exception {
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (System.currentTimeMillis() < deadline) {
+            if (isReplicationSlotActive(database)) {
+                return;
+            }
+            Thread.sleep(500L);
+        }
+        throw new AssertionError("Timed out waiting for replication slot " + slotName + " active");
+    }
+
+    private boolean isReplicationSlotActive(UniqueDatabase database) throws Exception {
+        try (Connection conn = getJdbcConnection(POSTGRES_CONTAINER, database.getDatabaseName());
+                PreparedStatement ps =
+                        conn.prepareStatement(
+                                "SELECT active FROM pg_replication_slots WHERE slot_name = ?")) {
+            ps.setString(1, slotName);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && rs.getBoolean("active");
+            }
+        }
+    }
+
+    private List<Event> getPartitionedSnapshotExpected(TableId tableId) {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {
+                            DataTypes.INT().notNull(),
+                            DataTypes.VARCHAR(255).notNull(),
+                            DataTypes.VARCHAR(512),
+                            DataTypes.DOUBLE(),
+                            DataTypes.VARCHAR(20).notNull()
+                        },
+                        new String[] {"id", "name", "description", "weight", "country"});
+        BinaryRecordDataGenerator generator = new BinaryRecordDataGenerator(rowType);
+        List<Event> expected = new ArrayList<>();
+        expected.add(
+                DataChangeEvent.insertEvent(
+                        tableId,
+                        generator.generate(
+                                new Object[] {
+                                    101,
+                                    BinaryStringData.fromString("scooter"),
+                                    BinaryStringData.fromString("Small 2-wheel scooter"),
+                                    3.14,
+                                    BinaryStringData.fromString("us")
+                                })));
+        expected.add(
+                DataChangeEvent.insertEvent(
+                        tableId,
+                        generator.generate(
+                                new Object[] {
+                                    102,
+                                    BinaryStringData.fromString("car battery"),
+                                    BinaryStringData.fromString("12V car battery"),
+                                    8.1,
+                                    BinaryStringData.fromString("us")
+                                })));
+        expected.add(
+                DataChangeEvent.insertEvent(
+                        tableId,
+                        generator.generate(
+                                new Object[] {
+                                    103,
+                                    BinaryStringData.fromString("12-pack drill bits"),
+                                    BinaryStringData.fromString(
+                                            "12-pack of drill bits with sizes ranging from #40 to #3"),
+                                    0.8,
+                                    BinaryStringData.fromString("us")
+                                })));
+        expected.add(
+                DataChangeEvent.insertEvent(
+                        tableId,
+                        generator.generate(
+                                new Object[] {
+                                    104,
+                                    BinaryStringData.fromString("hammer"),
+                                    BinaryStringData.fromString("12oz carpenter's hammer"),
+                                    0.75,
+                                    BinaryStringData.fromString("us")
+                                })));
+        expected.add(
+                DataChangeEvent.insertEvent(
+                        tableId,
+                        generator.generate(
+                                new Object[] {
+                                    105,
+                                    BinaryStringData.fromString("hammer"),
+                                    BinaryStringData.fromString("14oz carpenter's hammer"),
+                                    0.875,
+                                    BinaryStringData.fromString("us")
+                                })));
+        expected.add(
+                DataChangeEvent.insertEvent(
+                        tableId,
+                        generator.generate(
+                                new Object[] {
+                                    106,
+                                    BinaryStringData.fromString("hammer"),
+                                    BinaryStringData.fromString("16oz carpenter's hammer"),
+                                    1.0,
+                                    BinaryStringData.fromString("uk")
+                                })));
+        expected.add(
+                DataChangeEvent.insertEvent(
+                        tableId,
+                        generator.generate(
+                                new Object[] {
+                                    107,
+                                    BinaryStringData.fromString("rocks"),
+                                    BinaryStringData.fromString("box of assorted rocks"),
+                                    5.3,
+                                    BinaryStringData.fromString("uk")
+                                })));
+        expected.add(
+                DataChangeEvent.insertEvent(
+                        tableId,
+                        generator.generate(
+                                new Object[] {
+                                    108,
+                                    BinaryStringData.fromString("jacket"),
+                                    BinaryStringData.fromString(
+                                            "water resistent black wind breaker"),
+                                    0.1,
+                                    BinaryStringData.fromString("uk")
+                                })));
+        expected.add(
+                DataChangeEvent.insertEvent(
+                        tableId,
+                        generator.generate(
+                                new Object[] {
+                                    109,
+                                    BinaryStringData.fromString("spare tire"),
+                                    BinaryStringData.fromString("24 inch spare tire"),
+                                    22.2,
+                                    BinaryStringData.fromString("uk")
+                                })));
+        return expected;
     }
 }

@@ -31,6 +31,9 @@ import org.apache.flink.table.factories.DynamicTableFactory;
 import org.apache.flink.table.factories.DynamicTableSourceFactory;
 import org.apache.flink.table.factories.FactoryUtil;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.time.Duration;
 import java.util.HashSet;
 import java.util.Set;
@@ -54,6 +57,7 @@ import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSou
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.CONNECT_TIMEOUT;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.DECODING_PLUGIN_NAME;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.HEARTBEAT_INTERVAL;
+import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.PARTITION_DISCOVERY_POLL_INTERVAL;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.PG_PORT;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_KEY_COLUMN;
@@ -74,7 +78,10 @@ import static org.apache.flink.util.Preconditions.checkState;
 /** Factory for creating configured instance of {@link PostgreSQLTableSource}. */
 public class PostgreSQLTableFactory implements DynamicTableSourceFactory {
 
+    private static final Logger LOG = LoggerFactory.getLogger(PostgreSQLTableFactory.class);
+
     private static final String IDENTIFIER = "postgres-cdc";
+    private static final String PGOUTPUT_PLUGIN = "pgoutput";
 
     @Override
     public DynamicTableSource createDynamicTableSource(DynamicTableFactory.Context context) {
@@ -119,6 +126,8 @@ public class PostgreSQLTableFactory implements DynamicTableSourceFactory {
         boolean isScanNewlyAddedTableEnabled = config.get(SCAN_NEWLY_ADDED_TABLE_ENABLED);
         int lsnCommitCheckpointsDelay = config.get(SCAN_LSN_COMMIT_CHECKPOINTS_DELAY);
         boolean includePartitionedTables = config.get(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED);
+        warnIfPartitionRoutingUsesNonPgoutputPlugin(includePartitionedTables, pluginName);
+        Duration partitionDiscoveryPollInterval = config.get(PARTITION_DISCOVERY_POLL_INTERVAL);
         boolean assignUnboundedChunkFirst =
                 config.get(SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED);
         boolean appendOnly = config.get(SCAN_READ_CHANGELOG_AS_APPEND_ONLY_ENABLED);
@@ -135,6 +144,11 @@ public class PostgreSQLTableFactory implements DynamicTableSourceFactory {
             checkState(
                     !StartupMode.LATEST_OFFSET.equals(startupOptions.startupMode),
                     "The Postgres CDC connector does not support 'latest-offset' startup mode when 'scan.incremental.snapshot.enabled' is disabled, you can enable 'scan.incremental.snapshot.enabled' to use this startup mode.");
+            checkState(
+                    !includePartitionedTables,
+                    "Partition routing ('scan.include-partitioned-tables.enabled=true') requires "
+                            + "'scan.incremental.snapshot.enabled=true'. The legacy SourceFunction "
+                            + "path does not support partition-aware CDC.");
         }
 
         OptionUtils.printOptions(IDENTIFIER, config.toMap());
@@ -170,7 +184,23 @@ public class PostgreSQLTableFactory implements DynamicTableSourceFactory {
                 lsnCommitCheckpointsDelay,
                 assignUnboundedChunkFirst,
                 appendOnly,
-                includePartitionedTables);
+                includePartitionedTables,
+                partitionDiscoveryPollInterval);
+    }
+
+    private static void warnIfPartitionRoutingUsesNonPgoutputPlugin(
+            boolean includePartitionedTables, String pluginName) {
+        if (includePartitionedTables && !PGOUTPUT_PLUGIN.equalsIgnoreCase(pluginName)) {
+            LOG.warn(
+                    "Postgres partition routing is enabled, but decoding.plugin.name is '{}'. "
+                            + "WAL-driven zero-delay partition discovery requires '{}'. With '{}' "
+                            + "the connector can route known partitions, but dynamic partition "
+                            + "discovery depends on JDBC lazy routing and PostgreSQL publication "
+                            + "management is not available.",
+                    pluginName,
+                    PGOUTPUT_PLUGIN,
+                    pluginName);
+        }
     }
 
     @Override
@@ -216,6 +246,7 @@ public class PostgreSQLTableFactory implements DynamicTableSourceFactory {
         options.add(SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED);
         options.add(SCAN_READ_CHANGELOG_AS_APPEND_ONLY_ENABLED);
         options.add(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED);
+        options.add(PARTITION_DISCOVERY_POLL_INTERVAL);
         return options;
     }
 

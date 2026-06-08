@@ -284,9 +284,19 @@ SELECT * FROM shipments;
       <td>Boolean</td>
       <td>
         Whether to enable reading partitioned tables via partition root.<br>
-        If enabled:
-          (1) PUBLICATION must be created beforehand with parameter publish_via_partition_root=true
-          (2) Table list (regex or predefined list) should only match the parent table name, if table list matches both parent and child tables, snapshot data will be read twice.
+        When enabled, the connector discovers child partitions and routes their CDC events to the parent table. This works on all PostgreSQL versions.<br>
+        For PG11+, setting <code>publish_via_partition_root=true</code> on the PUBLICATION is recommended for best performance; when this is not set, the connector will route child events to the parent automatically. PG10 does <strong>not</strong> support <code>publish_via_partition_root</code>; the connector still routes events to the parent and additionally maintains publication membership for newly created child partitions.<br>
+        The table list (regex or predefined list) should only match the parent table name; if it matches both parent and child tables, snapshot data will be read twice.
+      </td>
+    </tr>
+    <tr>
+      <td>scan.partition-discovery.poll-interval</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">10 min</td>
+      <td>Duration</td>
+      <td>
+        The interval at which the connector polls the catalog for newly created child partitions during streaming. The WAL-based reconciler detects new partitions in real time; this poller is a secondary safety net and is the primary discovery channel on PG10 (publication membership must be refreshed before <code>pgoutput</code> can emit <code>Relation</code> messages for a new child).<br>
+        Only effective when <code>scan.include-partitioned-tables.enabled = true</code>.
       </td>
     </tr>
     </tbody>

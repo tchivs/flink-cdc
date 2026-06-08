@@ -21,6 +21,7 @@ import org.apache.flink.api.common.JobID;
 import org.apache.flink.cdc.common.test.utils.TestUtils;
 import org.apache.flink.cdc.connectors.mysql.testutils.MySqlContainer;
 import org.apache.flink.cdc.connectors.mysql.testutils.UniqueDatabase;
+import org.apache.flink.cdc.pipeline.tests.utils.PaimonE2eTestUtils;
 import org.apache.flink.cdc.pipeline.tests.utils.PipelineTestEnvironment;
 import org.apache.flink.cdc.pipeline.tests.utils.TarballFetcher;
 
@@ -33,9 +34,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.testcontainers.containers.Container;
-import org.testcontainers.images.builder.Transferable;
-import org.testcontainers.utility.MountableFile;
 
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -48,7 +46,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 import java.util.function.Function;
-import java.util.stream.Collectors;
 
 /**
  * E2e cases for stopping & restarting jobs of `MySQL source to Paimon sink` from previous state.
@@ -70,13 +67,8 @@ class MySqlToPaimonMigrationITCase extends PipelineTestEnvironment {
         mysqlInventoryDatabase =
                 new UniqueDatabase(MYSQL, "mysql_inventory", MYSQL_TEST_USER, MYSQL_TEST_PASSWORD);
         mysqlInventoryDatabase.createAndInitialize();
-        jobManager.copyFileToContainer(
-                MountableFile.forHostPath(
-                        TestUtils.getResource(getPaimonSQLConnectorResourceName())),
-                sharedVolume.toString() + "/" + getPaimonSQLConnectorResourceName());
-        jobManager.copyFileToContainer(
-                MountableFile.forHostPath(TestUtils.getResource("flink-shade-hadoop.jar")),
-                sharedVolume.toString() + "/flink-shade-hadoop.jar");
+        PaimonE2eTestUtils.copySqlClientDependencies(
+                jobManager, sharedVolume.toString(), flinkVersion);
     }
 
     @AfterEach
@@ -434,7 +426,14 @@ class MySqlToPaimonMigrationITCase extends PipelineTestEnvironment {
         List<String> results = Collections.emptyList();
         while (System.currentTimeMillis() < deadline) {
             try {
-                results = fetchPaimonTableRows(warehouse, database, table);
+                results =
+                        PaimonE2eTestUtils.fetchTableRows(
+                                jobManager,
+                                sharedVolume.toString(),
+                                flinkVersion,
+                                warehouse,
+                                database,
+                                table);
                 Assertions.assertThat(results).containsExactlyInAnyOrderElementsOf(expected);
                 LOG.info(
                         "Successfully verified {} records in {} seconds.",
@@ -454,52 +453,5 @@ class MySqlToPaimonMigrationITCase extends PipelineTestEnvironment {
             Thread.sleep(1000L);
         }
         Assertions.assertThat(results).containsExactlyInAnyOrderElementsOf(expected);
-    }
-
-    private List<String> fetchPaimonTableRows(String warehouse, String database, String table)
-            throws Exception {
-        String template =
-                readLines("docker/peek-paimon.sql").stream()
-                        .filter(line -> !line.startsWith("--"))
-                        .collect(Collectors.joining("\n"));
-        String sql = String.format(template, warehouse, database, table);
-        String containerSqlPath = sharedVolume.toString() + "/peek.sql";
-        jobManager.copyFileToContainer(Transferable.of(sql), containerSqlPath);
-
-        Container.ExecResult result =
-                jobManager.execInContainer(
-                        "/opt/flink/bin/sql-client.sh",
-                        "--jar",
-                        sharedVolume.toString() + "/" + getPaimonSQLConnectorResourceName(),
-                        "--jar",
-                        sharedVolume.toString() + "/flink-shade-hadoop.jar",
-                        "-f",
-                        containerSqlPath);
-        if (result.getExitCode() != 0) {
-            throw new RuntimeException(
-                    "Failed to execute peek script. Stdout: "
-                            + result.getStdout()
-                            + "; Stderr: "
-                            + result.getStderr());
-        }
-
-        return Arrays.stream(result.getStdout().split("\n"))
-                .filter(line -> line.startsWith("|"))
-                .skip(1)
-                .map(MySqlToPaimonMigrationITCase::extractRow)
-                .map(row -> String.format("%s", String.join(", ", row)))
-                .collect(Collectors.toList());
-    }
-
-    private static String[] extractRow(String row) {
-        return Arrays.stream(row.split("\\|"))
-                .map(String::trim)
-                .filter(col -> !col.isEmpty())
-                .map(col -> col.equals("<NULL>") ? "null" : col)
-                .toArray(String[]::new);
-    }
-
-    protected String getPaimonSQLConnectorResourceName() {
-        return String.format("paimon-sql-connector-%s.jar", flinkVersion);
     }
 }

@@ -19,13 +19,16 @@ package org.apache.flink.cdc.connectors.postgres.source;
 
 import org.apache.flink.cdc.connectors.postgres.PostgresTestBase;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfigFactory;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionCaptureState;
 import org.apache.flink.cdc.connectors.postgres.testutils.UniqueDatabase;
 
 import io.debezium.relational.TableId;
+import io.debezium.relational.history.TableChanges;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 
 /** Tests for {@link PostgresDialect}. */
 class PostgresDialectTest extends PostgresTestBase {
@@ -112,7 +115,57 @@ class PostgresDialectTest extends PostgresTestBase {
         List<TableId> tableIdsOfInventoryPartitionedDatabase =
                 dialectOfInventoryPartitionedDatabase.discoverDataCollections(
                         configFactoryOfInventoryPartitionedDatabase.create(0));
-        Assertions.assertThat(tableIdsOfInventoryPartitionedDatabase.get(0))
-                .hasToString("inventory_partitioned.products");
+        Assertions.assertThat(tableIdsOfInventoryPartitionedDatabase)
+                .extracting(TableId::toString)
+                .containsExactlyInAnyOrder(
+                        "inventory_partitioned.products_uk", "inventory_partitioned.products_us");
+
+        TableId parent = new TableId(null, "inventory_partitioned", "products");
+        TableId childUk = new TableId(null, "inventory_partitioned", "products_uk");
+        TableId childUs = new TableId(null, "inventory_partitioned", "products_us");
+        Assertions.assertThat(dialectOfInventoryPartitionedDatabase.getChildToParentMapping())
+                .containsEntry(childUk, parent)
+                .containsEntry(childUs, parent);
+
+        Map<TableId, TableChanges.TableChange> tableSchemas =
+                dialectOfInventoryPartitionedDatabase.discoverDataCollectionSchemas(
+                        configFactoryOfInventoryPartitionedDatabase.create(0));
+        Assertions.assertThat(tableSchemas)
+                .containsOnlyKeys(parent)
+                .doesNotContainKeys(childUk, childUs);
+
+        PartitionCaptureState childResolvedState =
+                dialectOfInventoryPartitionedDatabase.discoverPartitionState(
+                        tableIdsOfInventoryPartitionedDatabase);
+        Assertions.assertThat(childResolvedState.getChildToParent())
+                .containsEntry(childUk, parent)
+                .containsEntry(childUs, parent);
+    }
+
+    @Test
+    void testPartitionChildSplitMatchesParentTableFilter() {
+        inventoryPartitionedDatabase.createAndInitialize();
+
+        PostgresSourceConfigFactory configFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "products", 10);
+        configFactory.setIncludePartitionedTables(true);
+        PostgresDialect dialect = new PostgresDialect(configFactory.create(0));
+        TableId childUk = new TableId(null, "inventory_partitioned", "products_uk");
+        TableId childUs = new TableId(null, "inventory_partitioned", "products_us");
+
+        Assertions.assertThat(dialect.isIncludeDataCollection(configFactory.create(0), childUk))
+                .isTrue();
+        Assertions.assertThat(dialect.isIncludeDataCollection(configFactory.create(0), childUs))
+                .isTrue();
+
+        PostgresSourceConfigFactory disabledConfigFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "products", 10);
+        PostgresDialect disabledDialect = new PostgresDialect(disabledConfigFactory.create(0));
+        Assertions.assertThat(
+                        disabledDialect.isIncludeDataCollection(
+                                disabledConfigFactory.create(0), childUk))
+                .isFalse();
     }
 }

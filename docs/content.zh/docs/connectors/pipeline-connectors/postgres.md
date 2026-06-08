@@ -282,6 +282,32 @@ pipeline:
         默认值为 false。
       </td>
     </tr>
+    <tr>
+      <td>scan.include-partitioned-tables.enabled</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">false</td>
+      <td>Boolean</td>
+      <td>
+        是否包含分区表，并将子分区事件路由到父表。<br>
+        启用后，连接器在启动时发现子分区，并把子分区的 CDC 事件改写为父表标识下发，该能力适用于所有 PostgreSQL 版本。<br>
+        推荐配合 <code>decoding.plugin.name = pgoutput</code> 使用。使用 <code>pgoutput</code> 时，连接器可以基于 WAL 中的 Relation 消息低延迟发现分区，并为运行时新增的子分区维护 publication 成员关系。使用 <code>decoderbufs</code> 等其他解码插件时，连接器无法管理 publication，动态分区发现会退化为在收到未知子分区的第一条事件时通过 JDBC 懒加载查询父子关系。<br>
+        PG11+ 推荐在 PUBLICATION 上设置 <code>publish_via_partition_root=true</code> 以获得最佳性能；未设置时，连接器会自动完成路由。PG10 <strong>不</strong>支持 <code>publish_via_partition_root</code> 选项；使用 <code>pgoutput</code> 时，连接器仍会自动路由事件到父表，并在运行时为新增子分区维护 publication 成员关系。<br>
+        在 <code>scan.startup.mode = snapshot</code> 的有界模式下，不会启动动态分区发现和 publication 轮询；只会路由有界 stream split 开始前已发现的分区。<br>
+        <code>tables</code> 列表应匹配父表名。此为实验性选项。
+      </td>
+    </tr>
+    <tr>
+      <td>scan.partition-discovery.poll-interval</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">10min</td>
+      <td>Duration</td>
+      <td>
+        流式阶段连接器轮询系统目录以发现新增子分区的时间间隔。<br>
+        使用 <code>pgoutput</code> 时，基于 WAL 的 reconciler 可以实时检测新分区；本轮询作为兜底机制。PG10 配合 <code>pgoutput</code> 时，本轮询是主要发现通道，因为必须先刷新 publication 成员关系，PostgreSQL 才能为新子表发出 <code>Relation</code> 消息。对 <code>decoderbufs</code> 等非 <code>pgoutput</code> 解码插件，该选项不会产生 publication 管理效果。<br>
+        间隔越短，新分区被发现的速度越快，但会增加系统目录查询负载；间隔越长，开销越低，但新分区数据的捕获会相应延迟。<br>
+        仅在 <code>scan.include-partitioned-tables.enabled = true</code> 时生效。
+      </td>
+    </tr>
     </tbody>
 </table>
 </div>

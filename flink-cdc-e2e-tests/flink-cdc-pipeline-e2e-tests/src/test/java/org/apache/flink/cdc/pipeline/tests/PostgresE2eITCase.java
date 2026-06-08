@@ -19,8 +19,10 @@ package org.apache.flink.cdc.pipeline.tests;
 
 import org.apache.flink.cdc.common.test.utils.TestUtils;
 import org.apache.flink.cdc.connectors.postgres.testutils.UniqueDatabase;
+import org.apache.flink.cdc.pipeline.tests.utils.PaimonE2eTestUtils;
 import org.apache.flink.cdc.pipeline.tests.utils.PipelineTestEnvironment;
 
+import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -36,6 +38,10 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.UUID;
 import java.util.function.Function;
 
 import static org.apache.flink.cdc.connectors.postgres.PostgresTestBase.getJdbcConnection;
@@ -44,6 +50,7 @@ import static org.apache.flink.cdc.connectors.postgres.PostgresTestBase.getSlotN
 /** End-to-end tests for postgres cdc pipeline job. */
 public class PostgresE2eITCase extends PipelineTestEnvironment {
     private static final Logger LOG = LoggerFactory.getLogger(PostgresE2eITCase.class);
+    private static final Duration PAIMON_TESTCASE_TIMEOUT = Duration.ofMinutes(3);
 
     // ------------------------------------------------------------------------------------------
     // Postgres Variables (we always use Postgres as the data source for easier verifying)
@@ -216,5 +223,195 @@ public class PostgresE2eITCase extends PipelineTestEnvironment {
                 "RenameColumnEvent{tableId=inventory.products, nameMapping={category=product_category}}");
         waitUntilSpecificEvent(
                 "DataChangeEvent{tableId=inventory.products, before=[], after=[112, gizmo, A fancy gizmo, gadgets], op=INSERT, meta=()}");
+    }
+
+    @Test
+    void testPartitionedTableSnapshotAndStreamingToPaimon() throws Exception {
+        UniqueDatabase postgresPartitionedInventoryDatabase =
+                new UniqueDatabase(
+                        POSTGRES_CONTAINER,
+                        "postgres_partitioned_paimon",
+                        "inventory_partitioned",
+                        POSTGRES_TEST_USER,
+                        POSTGRES_TEST_PASSWORD);
+        String partitionedSlotName = getSlotName();
+        String warehouse = sharedVolume.toString() + "/" + "paimon_" + UUID.randomUUID();
+        String pipelineJob =
+                String.format(
+                        "source:\n"
+                                + "  type: postgres\n"
+                                + "  hostname: %s\n"
+                                + "  port: %d\n"
+                                + "  username: %s\n"
+                                + "  password: %s\n"
+                                + "  database: %s\n"
+                                + "  tables: inventory_partitioned.products\n"
+                                + "  slot.name: %s\n"
+                                + "  scan.startup.mode: initial\n"
+                                + "  scan.incremental.snapshot.chunk.size: 2\n"
+                                + "  scan.incremental.close-idle-reader.enabled: true\n"
+                                + "  scan.include-partitioned-tables.enabled: true\n"
+                                + "  server-time-zone: UTC\n"
+                                + "  connect.timeout: 120s\n"
+                                + "  schema-change.enabled: true\n"
+                                + "\n"
+                                + "sink:\n"
+                                + "  type: paimon\n"
+                                + "  catalog.properties.warehouse: %s\n"
+                                + "  catalog.properties.metastore: filesystem\n"
+                                + "  catalog.properties.cache-enabled: false\n"
+                                + "\n"
+                                + "pipeline:\n"
+                                + "  schema.change.behavior: evolve\n"
+                                + "  parallelism: %d",
+                        INTER_CONTAINER_POSTGRES_ALIAS,
+                        5432,
+                        POSTGRES_TEST_USER,
+                        POSTGRES_TEST_PASSWORD,
+                        postgresPartitionedInventoryDatabase.getDatabaseName(),
+                        partitionedSlotName,
+                        warehouse,
+                        parallelism);
+
+        try {
+            postgresPartitionedInventoryDatabase.createAndInitialize();
+            PaimonE2eTestUtils.copySqlClientDependencies(
+                    jobManager, sharedVolume.toString(), flinkVersion);
+
+            Path postgresCdcJar = TestUtils.getResource("postgres-cdc-pipeline-connector.jar");
+            Path paimonCdcConnector = TestUtils.getResource("paimon-cdc-pipeline-connector.jar");
+            Path hadoopJar = TestUtils.getResource("flink-shade-hadoop.jar");
+            submitPipelineJob(pipelineJob, postgresCdcJar, paimonCdcConnector, hadoopJar);
+            waitUntilJobRunning(Duration.ofSeconds(30));
+            LOG.info("Postgres partitioned table to Paimon pipeline job is running");
+
+            validatePaimonSinkResult(
+                    warehouse,
+                    "inventory_partitioned",
+                    "products",
+                    Arrays.asList(
+                            "101, scooter, Small 2-wheel scooter, 3.14, us",
+                            "102, car battery, 12V car battery, 8.1, us",
+                            "103, 12-pack drill bits, 12-pack of drill bits with sizes ranging from #40 to #3, 0.8, us",
+                            "104, hammer, 12oz carpenter's hammer, 0.75, us",
+                            "105, hammer, 14oz carpenter's hammer, 0.875, us",
+                            "106, hammer, 16oz carpenter's hammer, 1.0, uk",
+                            "107, rocks, box of assorted rocks, 5.3, uk",
+                            "108, jacket, water resistent black wind breaker, 0.1, uk",
+                            "109, spare tire, 24 inch spare tire, 22.2, uk"));
+            assertPaimonTableDoesNotExist(warehouse, "inventory_partitioned", "products_us");
+            assertPaimonTableDoesNotExist(warehouse, "inventory_partitioned", "products_uk");
+
+            try (Connection conn =
+                            getJdbcConnection(
+                                    POSTGRES_CONTAINER,
+                                    postgresPartitionedInventoryDatabase.getDatabaseName());
+                    Statement stat = conn.createStatement()) {
+                stat.execute(
+                        "INSERT INTO inventory_partitioned.products VALUES "
+                                + "(default,'jacket','water resistent white wind breaker',0.2, 'us');");
+                stat.execute(
+                        "INSERT INTO inventory_partitioned.products VALUES "
+                                + "(default,'scooter','Big 2-wheel scooter',5.18, 'uk');");
+            }
+
+            validatePaimonSinkResult(
+                    warehouse,
+                    "inventory_partitioned",
+                    "products",
+                    Arrays.asList(
+                            "101, scooter, Small 2-wheel scooter, 3.14, us",
+                            "102, car battery, 12V car battery, 8.1, us",
+                            "103, 12-pack drill bits, 12-pack of drill bits with sizes ranging from #40 to #3, 0.8, us",
+                            "104, hammer, 12oz carpenter's hammer, 0.75, us",
+                            "105, hammer, 14oz carpenter's hammer, 0.875, us",
+                            "106, hammer, 16oz carpenter's hammer, 1.0, uk",
+                            "107, rocks, box of assorted rocks, 5.3, uk",
+                            "108, jacket, water resistent black wind breaker, 0.1, uk",
+                            "109, spare tire, 24 inch spare tire, 22.2, uk",
+                            "110, jacket, water resistent white wind breaker, 0.2, us",
+                            "111, scooter, Big 2-wheel scooter, 5.18, uk"));
+            assertPaimonTableDoesNotExist(warehouse, "inventory_partitioned", "products_us");
+            assertPaimonTableDoesNotExist(warehouse, "inventory_partitioned", "products_uk");
+        } finally {
+            postgresPartitionedInventoryDatabase.removeSlot(partitionedSlotName);
+            dropSchemaCascade(
+                    postgresPartitionedInventoryDatabase.getDatabaseName(),
+                    "inventory_partitioned");
+        }
+    }
+
+    private void dropSchemaCascade(String database, String schema) {
+        try (Connection conn = getJdbcConnection(POSTGRES_CONTAINER, database);
+                Statement stat = conn.createStatement()) {
+            stat.execute("DROP SCHEMA IF EXISTS " + schema + " CASCADE");
+        } catch (Exception e) {
+            LOG.warn("Failed to drop Postgres schema {}.{}.", database, schema, e);
+        }
+    }
+
+    private void validatePaimonSinkResult(
+            String warehouse, String database, String table, List<String> expected)
+            throws InterruptedException {
+        LOG.info("Verifying Paimon {}::{}::{} results...", warehouse, database, table);
+        long deadline = System.currentTimeMillis() + PAIMON_TESTCASE_TIMEOUT.toMillis();
+        List<String> results = Collections.emptyList();
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                results =
+                        PaimonE2eTestUtils.fetchTableRows(
+                                jobManager,
+                                sharedVolume.toString(),
+                                flinkVersion,
+                                warehouse,
+                                database,
+                                table);
+                Assertions.assertThat(results).containsExactlyInAnyOrderElementsOf(expected);
+                LOG.info("Successfully verified {} Paimon records.", expected.size());
+                return;
+            } catch (Exception e) {
+                LOG.warn("Validate failed, waiting for the next loop...", e);
+            } catch (AssertionError ignored) {
+                LOG.warn(
+                        "Results mismatch, expected {} records, but got {} actually. Waiting for the next loop...",
+                        expected.size(),
+                        results.size());
+            }
+            Thread.sleep(1000L);
+        }
+        logPaimonWarehouseLayout(warehouse);
+        LOG.warn(
+                "JobManager logs before Paimon validation failure:\n{}",
+                jobManagerConsumer.toUtf8String());
+        LOG.warn(
+                "TaskManager logs before Paimon validation failure:\n{}",
+                taskManagerConsumer.toUtf8String());
+        Assertions.assertThat(results).containsExactlyInAnyOrderElementsOf(expected);
+    }
+
+    private void logPaimonWarehouseLayout(String warehouse) {
+        try {
+            org.testcontainers.containers.Container.ExecResult result =
+                    jobManager.execInContainer("find", warehouse, "-maxdepth", "5", "-type", "f");
+            LOG.warn(
+                    "Paimon warehouse file layout for {}. Exit code: {}, stdout:\n{}\nstderr:\n{}",
+                    warehouse,
+                    result.getExitCode(),
+                    result.getStdout(),
+                    result.getStderr());
+        } catch (Exception e) {
+            LOG.warn("Failed to list Paimon warehouse {}.", warehouse, e);
+        }
+    }
+
+    private void assertPaimonTableDoesNotExist(String warehouse, String database, String table)
+            throws Exception {
+        List<String> tables =
+                PaimonE2eTestUtils.fetchTables(
+                        jobManager, sharedVolume.toString(), flinkVersion, warehouse, database);
+        Assertions.assertThat(tables)
+                .as("Paimon tables in database " + database)
+                .doesNotContain(table);
+        LOG.info("Paimon table {}.{} does not exist as expected.", database, table);
     }
 }

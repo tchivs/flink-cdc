@@ -18,6 +18,7 @@
 package org.apache.flink.cdc.connectors.postgres.table;
 
 import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.cdc.common.annotation.VisibleForTesting;
 import org.apache.flink.cdc.connectors.base.options.StartupOptions;
 import org.apache.flink.cdc.connectors.base.source.jdbc.JdbcIncrementalSource;
 import org.apache.flink.cdc.connectors.postgres.PostgreSQLSource;
@@ -88,6 +89,7 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
     private final boolean assignUnboundedChunkFirst;
     private final boolean appendOnly;
     private final boolean includePartitionedTables;
+    private final Duration partitionDiscoveryPollInterval;
 
     // --------------------------------------------------------------------------------------------
     // Mutable attributes
@@ -99,6 +101,11 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
     /** Metadata that is appended at the end of a physical source row. */
     protected List<String> metadataKeys;
 
+    /**
+     * Backward-compatible constructor without {@code partitionDiscoveryPollInterval}. External
+     * callers (including downstream extensions) can use this overload; partition discovery defaults
+     * to 10 minutes.
+     */
     public PostgreSQLTableSource(
             ResolvedSchema physicalSchema,
             int port,
@@ -131,6 +138,74 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
             boolean assignUnboundedChunkFirst,
             boolean appendOnly,
             boolean includePartitionedTables) {
+        this(
+                physicalSchema,
+                port,
+                hostname,
+                database,
+                schemaName,
+                tableName,
+                username,
+                password,
+                pluginName,
+                slotName,
+                changelogMode,
+                dbzProperties,
+                enableParallelRead,
+                splitSize,
+                splitMetaGroupSize,
+                fetchSize,
+                connectTimeout,
+                connectMaxRetries,
+                connectionPoolSize,
+                distributionFactorUpper,
+                distributionFactorLower,
+                heartbeatInterval,
+                startupOptions,
+                chunkKeyColumn,
+                closeIdleReaders,
+                skipSnapshotBackfill,
+                isScanNewlyAddedTableEnabled,
+                lsnCommitCheckpointsDelay,
+                assignUnboundedChunkFirst,
+                appendOnly,
+                includePartitionedTables,
+                Duration.ofMinutes(10));
+    }
+
+    public PostgreSQLTableSource(
+            ResolvedSchema physicalSchema,
+            int port,
+            String hostname,
+            String database,
+            String schemaName,
+            String tableName,
+            String username,
+            String password,
+            String pluginName,
+            String slotName,
+            DebeziumChangelogMode changelogMode,
+            Properties dbzProperties,
+            boolean enableParallelRead,
+            int splitSize,
+            int splitMetaGroupSize,
+            int fetchSize,
+            Duration connectTimeout,
+            int connectMaxRetries,
+            int connectionPoolSize,
+            double distributionFactorUpper,
+            double distributionFactorLower,
+            Duration heartbeatInterval,
+            StartupOptions startupOptions,
+            @Nullable String chunkKeyColumn,
+            boolean closeIdleReaders,
+            boolean skipSnapshotBackfill,
+            boolean isScanNewlyAddedTableEnabled,
+            int lsnCommitCheckpointsDelay,
+            boolean assignUnboundedChunkFirst,
+            boolean appendOnly,
+            boolean includePartitionedTables,
+            Duration partitionDiscoveryPollInterval) {
         this.physicalSchema = physicalSchema;
         this.port = port;
         this.hostname = checkNotNull(hostname);
@@ -165,6 +240,7 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
         this.assignUnboundedChunkFirst = assignUnboundedChunkFirst;
         this.appendOnly = appendOnly;
         this.includePartitionedTables = includePartitionedTables;
+        this.partitionDiscoveryPollInterval = partitionDiscoveryPollInterval;
     }
 
     @Override
@@ -210,7 +286,7 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
                             .port(port)
                             .database(database)
                             .schemaList(schemaName)
-                            .tableList(schemaName + "." + tableName)
+                            .tableList(qualifyTableList(schemaName, tableName))
                             .username(username)
                             .password(password)
                             .decodingPluginName(pluginName)
@@ -234,6 +310,7 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
                             .lsnCommitCheckpointsDelay(lsnCommitCheckpointsDelay)
                             .assignUnboundedChunkFirst(assignUnboundedChunkFirst)
                             .includePartitionedTables(includePartitionedTables)
+                            .partitionDiscoveryPollInterval(partitionDiscoveryPollInterval)
                             .build();
             return SourceProvider.of(parallelSource);
         } else {
@@ -243,7 +320,7 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
                             .port(port)
                             .database(database)
                             .schemaList(schemaName)
-                            .tableList(schemaName + "." + tableName)
+                            .tableList(qualifyTableList(schemaName, tableName))
                             .username(username)
                             .password(password)
                             .decodingPluginName(pluginName)
@@ -253,6 +330,83 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
                             .build();
             return SourceFunctionProvider.of(sourceFunction, false);
         }
+    }
+
+    /**
+     * Splits the user-provided {@code tableName} on commas and ensures every entry is prefixed with
+     * the configured {@code schemaName}, so downstream Debezium filters see fully-qualified {@code
+     * schema.table} regex patterns.
+     *
+     * <p>Each entry that already starts with {@code schemaName + "."} is returned unchanged;
+     * entries without a schema prefix (including regex patterns such as {@code "products_.*"}) are
+     * prepended with {@code schemaName + "."}.
+     *
+     * <p><b>Single-schema contract.</b> The PostgreSQL CDC connector exposes a single {@code
+     * schema-name} option, so every entry must belong to that schema. If an entry looks like a
+     * fully-qualified {@code identifier.identifier} name but is qualified with a different schema
+     * (e.g. {@code "analytics.events"} when {@code schemaName} is {@code "public"}), an {@link
+     * IllegalArgumentException} is thrown to fail fast rather than silently producing a
+     * doubly-qualified pattern like {@code "public.analytics.events"} that matches no table.
+     *
+     * <p>Package-private for unit testing.
+     */
+    @VisibleForTesting
+    static String[] qualifyTableList(String schemaName, String tableName) {
+        String schemaPrefix = schemaName + ".";
+        return Stream.of(tableName.split(","))
+                .map(String::trim)
+                .filter(name -> !name.isEmpty())
+                .map(name -> qualifyOne(schemaName, schemaPrefix, name))
+                .toArray(String[]::new);
+    }
+
+    private static String qualifyOne(String schemaName, String schemaPrefix, String name) {
+        if (name.startsWith(schemaPrefix)) {
+            return name;
+        }
+        // Detect an obvious cross-schema fully-qualified name: '<id>.<id>'. Regex patterns such
+        // as 'products_.*' are intentionally NOT treated as qualified, since the second segment
+        // ('*') is not a valid PostgreSQL identifier.
+        int firstDot = name.indexOf('.');
+        if (firstDot > 0
+                && firstDot < name.length() - 1
+                && isSimplePostgresIdentifier(name.substring(0, firstDot))
+                && isSimplePostgresIdentifier(name.substring(firstDot + 1))) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "Table name '%s' is qualified with a schema that does not match the "
+                                    + "configured 'schema-name' = '%s'. The PostgreSQL CDC "
+                                    + "connector supports a single schema; either drop the schema "
+                                    + "prefix or reconfigure 'schema-name'.",
+                            name, schemaName));
+        }
+        return schemaPrefix + name;
+    }
+
+    /**
+     * Returns true if {@code s} is a simple unquoted PostgreSQL identifier, i.e. starts with a
+     * letter or underscore and contains only letters, digits, underscores or '$'. Quoted
+     * identifiers (with embedded dots, dashes, etc.) are intentionally not recognised here because
+     * the caller treats them as opaque regex patterns.
+     */
+    private static boolean isSimplePostgresIdentifier(String s) {
+        if (s.isEmpty()) {
+            return false;
+        }
+        if (!isIdentifierStart(s.charAt(0))) {
+            return false;
+        }
+        for (int i = 1; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (!isIdentifierStart(c) && !(c >= '0' && c <= '9') && c != '$') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isIdentifierStart(char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
     }
 
     private MetadataConverter[] getMetadataConverters() {
@@ -305,7 +459,8 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
                         lsnCommitCheckpointsDelay,
                         assignUnboundedChunkFirst,
                         appendOnly,
-                        includePartitionedTables);
+                        includePartitionedTables,
+                        partitionDiscoveryPollInterval);
         source.metadataKeys = metadataKeys;
         source.producedDataType = producedDataType;
         return source;
@@ -351,7 +506,9 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
                 && Objects.equals(scanNewlyAddedTableEnabled, that.scanNewlyAddedTableEnabled)
                 && Objects.equals(assignUnboundedChunkFirst, that.assignUnboundedChunkFirst)
                 && Objects.equals(appendOnly, that.appendOnly)
-                && Objects.equals(includePartitionedTables, that.includePartitionedTables);
+                && Objects.equals(includePartitionedTables, that.includePartitionedTables)
+                && Objects.equals(
+                        partitionDiscoveryPollInterval, that.partitionDiscoveryPollInterval);
     }
 
     @Override
@@ -388,7 +545,8 @@ public class PostgreSQLTableSource implements ScanTableSource, SupportsReadingMe
                 scanNewlyAddedTableEnabled,
                 assignUnboundedChunkFirst,
                 appendOnly,
-                includePartitionedTables);
+                includePartitionedTables,
+                partitionDiscoveryPollInterval);
     }
 
     @Override

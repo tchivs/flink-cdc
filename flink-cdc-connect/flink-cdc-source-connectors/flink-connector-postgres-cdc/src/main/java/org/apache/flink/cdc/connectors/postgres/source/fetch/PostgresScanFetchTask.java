@@ -43,6 +43,7 @@ import io.debezium.relational.RelationalSnapshotChangeEventSource;
 import io.debezium.relational.SnapshotChangeRecordEmitter;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
+import io.debezium.relational.history.TableChanges.TableChange;
 import io.debezium.util.Clock;
 import io.debezium.util.ColumnUtils;
 import io.debezium.util.Strings;
@@ -252,9 +253,18 @@ public class PostgresScanFetchTask extends AbstractScanFetchTask {
             ctx.offset = offsetContext;
 
             refreshSchema(databaseSchema, jdbcConnection, true);
+            restoreSplitTableSchemas();
             createDataEvents(ctx, snapshotSplit.getTableId());
 
             return SnapshotResult.completed(ctx.offset);
+        }
+
+        private void restoreSplitTableSchemas() {
+            TableChange tableChange =
+                    snapshotSplit.getTableSchemas().get(snapshotSplit.getTableId());
+            if (tableChange != null && tableChange.getTable() != null) {
+                databaseSchema.refresh(tableChange.getTable());
+            }
         }
 
         private void createDataEvents(PostgresSnapshotContext snapshotContext, TableId tableId)
@@ -338,12 +348,13 @@ public class PostgresScanFetchTask extends AbstractScanFetchTask {
                                 snapshotContext.partition, table.id(), rows);
                         logTimer = getTableScanLogTimer();
                     }
-                    snapshotContext.offset.event(table.id(), clock.currentTime());
+                    TableId routedTableId = preRouteTableId(table.id());
+                    snapshotContext.offset.event(routedTableId, clock.currentTime());
                     SnapshotChangeRecordEmitter<PostgresPartition> emitter =
                             new SnapshotChangeRecordEmitter<>(
                                     snapshotContext.partition, snapshotContext.offset, row, clock);
                     eventDispatcher.dispatchSnapshotEvent(
-                            snapshotContext.partition, table.id(), emitter, snapshotReceiver);
+                            snapshotContext.partition, routedTableId, emitter, snapshotReceiver);
                 }
                 LOG.info(
                         "Finished exporting {} records for split '{}', total duration '{}'",
@@ -354,6 +365,13 @@ public class PostgresScanFetchTask extends AbstractScanFetchTask {
                 throw new FlinkRuntimeException(
                         "Snapshotting of table " + table.id() + " failed", e);
             }
+        }
+
+        private TableId preRouteTableId(TableId tableId) {
+            if (eventDispatcher instanceof PartitionRouteAware) {
+                return ((PartitionRouteAware) eventDispatcher).preRouteTableId(tableId);
+            }
+            return tableId;
         }
 
         private Threads.Timer getTableScanLogTimer() {

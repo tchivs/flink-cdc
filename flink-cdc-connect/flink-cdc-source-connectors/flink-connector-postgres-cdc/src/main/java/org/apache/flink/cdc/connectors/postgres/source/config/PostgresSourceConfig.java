@@ -41,6 +41,81 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
     private final boolean includePartitionedTables;
     private final boolean includeDatabaseInTableId;
 
+    // Partition discovery settings
+    private final Duration partitionDiscoveryPollInterval;
+
+    /**
+     * Backward-compatible constructor without partition routing parameters. External callers using
+     * the DataStream API can use this overload; partition routing defaults to disabled.
+     */
+    public PostgresSourceConfig(
+            int subtaskId,
+            StartupOptions startupOptions,
+            List<String> databaseList,
+            List<String> schemaList,
+            List<String> tableList,
+            int splitSize,
+            int splitMetaGroupSize,
+            double distributionFactorUpper,
+            double distributionFactorLower,
+            boolean includeSchemaChanges,
+            boolean closeIdleReaders,
+            Properties dbzProperties,
+            Configuration dbzConfiguration,
+            String driverClassName,
+            String hostname,
+            int port,
+            String username,
+            String password,
+            int fetchSize,
+            String serverTimeZone,
+            Duration connectTimeout,
+            int connectMaxRetries,
+            int connectionPoolSize,
+            @Nullable String chunkKeyColumn,
+            boolean skipSnapshotBackfill,
+            boolean isScanNewlyAddedTableEnabled,
+            int lsnCommitCheckpointsDelay,
+            boolean assignUnboundedChunkFirst) {
+        this(
+                subtaskId,
+                startupOptions,
+                databaseList,
+                schemaList,
+                tableList,
+                splitSize,
+                splitMetaGroupSize,
+                distributionFactorUpper,
+                distributionFactorLower,
+                includeSchemaChanges,
+                closeIdleReaders,
+                dbzProperties,
+                dbzConfiguration,
+                driverClassName,
+                hostname,
+                port,
+                username,
+                password,
+                fetchSize,
+                serverTimeZone,
+                connectTimeout,
+                connectMaxRetries,
+                connectionPoolSize,
+                chunkKeyColumn,
+                skipSnapshotBackfill,
+                isScanNewlyAddedTableEnabled,
+                lsnCommitCheckpointsDelay,
+                assignUnboundedChunkFirst,
+                false,
+                false,
+                PostgresSourceOptions.PARTITION_DISCOVERY_POLL_INTERVAL.defaultValue());
+    }
+
+    /**
+     * Backward-compatible full-parameter constructor without {@code
+     * partitionDiscoveryPollInterval}. External callers using the DataStream API can use this
+     * overload; partition discovery defaults to 10 minutes.
+     */
     public PostgresSourceConfig(
             int subtaskId,
             StartupOptions startupOptions,
@@ -72,6 +147,72 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
             boolean assignUnboundedChunkFirst,
             boolean includePartitionedTables,
             boolean includeDatabaseInTableId) {
+        this(
+                subtaskId,
+                startupOptions,
+                databaseList,
+                schemaList,
+                tableList,
+                splitSize,
+                splitMetaGroupSize,
+                distributionFactorUpper,
+                distributionFactorLower,
+                includeSchemaChanges,
+                closeIdleReaders,
+                dbzProperties,
+                dbzConfiguration,
+                driverClassName,
+                hostname,
+                port,
+                username,
+                password,
+                fetchSize,
+                serverTimeZone,
+                connectTimeout,
+                connectMaxRetries,
+                connectionPoolSize,
+                chunkKeyColumn,
+                skipSnapshotBackfill,
+                isScanNewlyAddedTableEnabled,
+                lsnCommitCheckpointsDelay,
+                assignUnboundedChunkFirst,
+                includePartitionedTables,
+                includeDatabaseInTableId,
+                PostgresSourceOptions.PARTITION_DISCOVERY_POLL_INTERVAL.defaultValue());
+    }
+
+    public PostgresSourceConfig(
+            int subtaskId,
+            StartupOptions startupOptions,
+            List<String> databaseList,
+            List<String> schemaList,
+            List<String> tableList,
+            int splitSize,
+            int splitMetaGroupSize,
+            double distributionFactorUpper,
+            double distributionFactorLower,
+            boolean includeSchemaChanges,
+            boolean closeIdleReaders,
+            Properties dbzProperties,
+            Configuration dbzConfiguration,
+            String driverClassName,
+            String hostname,
+            int port,
+            String username,
+            String password,
+            int fetchSize,
+            String serverTimeZone,
+            Duration connectTimeout,
+            int connectMaxRetries,
+            int connectionPoolSize,
+            @Nullable String chunkKeyColumn,
+            boolean skipSnapshotBackfill,
+            boolean isScanNewlyAddedTableEnabled,
+            int lsnCommitCheckpointsDelay,
+            boolean assignUnboundedChunkFirst,
+            boolean includePartitionedTables,
+            boolean includeDatabaseInTableId,
+            Duration partitionDiscoveryPollInterval) {
         super(
                 startupOptions,
                 databaseList,
@@ -103,6 +244,7 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
         this.lsnCommitCheckpointsDelay = lsnCommitCheckpointsDelay;
         this.includePartitionedTables = includePartitionedTables;
         this.includeDatabaseInTableId = includeDatabaseInTableId;
+        this.partitionDiscoveryPollInterval = partitionDiscoveryPollInterval;
     }
 
     /**
@@ -155,5 +297,10 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
     /** Returns whether to include database in the generated Table ID. */
     public boolean isIncludeDatabaseInTableId() {
         return includeDatabaseInTableId;
+    }
+
+    /** Returns the poll interval for partition discovery during streaming. */
+    public Duration getPartitionDiscoveryPollInterval() {
+        return partitionDiscoveryPollInterval;
     }
 }

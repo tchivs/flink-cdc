@@ -274,6 +274,32 @@ pipeline:
         Defaults to false.
       </td>
     </tr>
+    <tr>
+      <td>scan.include-partitioned-tables.enabled</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">false</td>
+      <td>Boolean</td>
+      <td>
+        Whether to include partitioned tables and route child partition events to the parent table.<br>
+        When enabled, the connector discovers child partitions at startup and rewrites their CDC events to the parent table identity. This works on all PostgreSQL versions.<br>
+        Using <code>decoding.plugin.name = pgoutput</code> is recommended. With <code>pgoutput</code>, the connector can use WAL Relation messages for low-latency partition discovery and can maintain publication membership for newly created child partitions. With other decoding plugins such as <code>decoderbufs</code>, publication management is unavailable and dynamic partition discovery falls back to lazy JDBC lookup when the first event from an unknown child partition is received.<br>
+        For PG11+, setting <code>publish_via_partition_root=true</code> on the PUBLICATION is recommended for best performance; when not set, the connector routes events automatically. PG10 does <strong>not</strong> support <code>publish_via_partition_root</code>; when using <code>pgoutput</code>, the connector still routes events to the parent and additionally maintains publication membership for newly created child partitions.<br>
+        In <code>scan.startup.mode = snapshot</code>, the bounded stream phase does not start dynamic partition discovery or publication polling; only partitions discovered before the bounded stream split are routed.<br>
+        The <code>tables</code> list should match the parent table name. Experimental option.
+      </td>
+    </tr>
+    <tr>
+      <td>scan.partition-discovery.poll-interval</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">10min</td>
+      <td>Duration</td>
+      <td>
+        The interval at which the connector polls the catalog for newly created child partitions during streaming.<br>
+        With <code>pgoutput</code>, the WAL-based reconciler detects new partitions in real time and this poller acts as a secondary safety net. On PG10 with <code>pgoutput</code>, it is the primary discovery channel because publication membership must be refreshed before PostgreSQL can emit <code>Relation</code> messages for a new child. This option has no publication-management effect for non-<code>pgoutput</code> decoding plugins such as <code>decoderbufs</code>.<br>
+        A shorter interval means faster discovery of new partitions but increases catalog query load; a longer interval reduces overhead but delays new partition capture.<br>
+        Only effective when <code>scan.include-partitioned-tables.enabled = true</code>.
+      </td>
+    </tr>
     </tbody>
 </table>
 </div>
