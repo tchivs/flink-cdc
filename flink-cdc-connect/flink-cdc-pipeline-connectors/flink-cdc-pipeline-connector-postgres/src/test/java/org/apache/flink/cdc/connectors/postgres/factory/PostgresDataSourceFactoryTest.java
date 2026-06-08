@@ -48,6 +48,8 @@ import java.util.stream.Collectors;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.HOSTNAME;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PASSWORD;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PG_PORT;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_PARTITION_PUBLICATION_REFRESH_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SLOT_NAME;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.TABLES;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.TABLES_EXCLUDE;
@@ -95,6 +97,7 @@ public class PostgresDataSourceFactoryTest extends PostgresTestBase {
         PostgresDataSource dataSource = (PostgresDataSource) factory.createDataSource(context);
         assertThat(dataSource.getPostgresSourceConfig().getTableList())
                 .isEqualTo(Arrays.asList("inventory.products"));
+        assertThat(dataSource.getPostgresSourceConfig().includePartitionedTables()).isFalse();
     }
 
     @Test
@@ -231,7 +234,8 @@ public class PostgresDataSourceFactoryTest extends PostgresTestBase {
         options.put(PASSWORD.key(), TEST_PASSWORD);
         options.put(TABLES.key(), POSTGRES_CONTAINER.getDatabaseName() + ".inventory.prod\\.*");
         options.put(SLOT_NAME.key(), slotName);
-        options.put(TABLES_EXCLUDE.key(), "true");
+        options.put(
+                TABLES_EXCLUDE.key(), POSTGRES_CONTAINER.getDatabaseName() + ".inventory.orders");
 
         Factory.Context context = new MockContext(Configuration.fromMap(options));
         PostgresDataSourceFactory factory = new PostgresDataSourceFactory();
@@ -240,6 +244,82 @@ public class PostgresDataSourceFactoryTest extends PostgresTestBase {
         PostgresDataSource dataSource = (PostgresDataSource) factory.createDataSource(context);
         assertThat(dataSource.getPostgresSourceConfig().getPort())
                 .isEqualTo(POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT));
+    }
+
+    @Test
+    public void testNormalizeTablePatternsRejectsShortNames() {
+        assertThatThrownBy(
+                        () ->
+                                PostgresDataSourceFactory.normalizeTablePatterns(
+                                        "orders", TABLES.key(), "postgres"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("database.schema.table");
+
+        assertThatThrownBy(
+                        () ->
+                                PostgresDataSourceFactory.normalizeTablePatterns(
+                                        "public.orders", TABLES_EXCLUDE.key(), "postgres"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("database.schema.table");
+    }
+
+    @Test
+    public void testNormalizeTablePatternsRejectsMixedDatabase() {
+        assertThatThrownBy(
+                        () ->
+                                PostgresDataSourceFactory.normalizeTablePatterns(
+                                        "other.public.orders", TABLES.key(), "postgres"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("database 'postgres'");
+    }
+
+    @Test
+    public void testNormalizeTablePatternsDropsDatabase() {
+        assertThat(
+                        PostgresDataSourceFactory.normalizeTablePatterns(
+                                "postgres.public.orders,postgres.public.order_\\.*",
+                                TABLES.key(),
+                                "postgres"))
+                .isEqualTo("public.orders,public.order_\\.*");
+    }
+
+    @Test
+    public void testIncludePartitionedTablesPassesThroughToSourceConfig() {
+        Map<String, String> options = new HashMap<>();
+        options.put(HOSTNAME.key(), POSTGRES_CONTAINER.getHost());
+        options.put(
+                PG_PORT.key(), String.valueOf(POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT)));
+        options.put(USERNAME.key(), TEST_USER);
+        options.put(PASSWORD.key(), TEST_PASSWORD);
+        options.put(TABLES.key(), POSTGRES_CONTAINER.getDatabaseName() + ".inventory.prod\\.*");
+        options.put(SLOT_NAME.key(), slotName);
+        options.put(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED.key(), "true");
+        Factory.Context context = new MockContext(Configuration.fromMap(options));
+
+        PostgresDataSourceFactory factory = new PostgresDataSourceFactory();
+        PostgresDataSource dataSource = (PostgresDataSource) factory.createDataSource(context);
+
+        assertThat(dataSource.getPostgresSourceConfig().includePartitionedTables()).isTrue();
+    }
+
+    @Test
+    public void testPublicationRefreshPassesThroughToSourceConfig() {
+        Map<String, String> options = new HashMap<>();
+        options.put(HOSTNAME.key(), POSTGRES_CONTAINER.getHost());
+        options.put(
+                PG_PORT.key(), String.valueOf(POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT)));
+        options.put(USERNAME.key(), TEST_USER);
+        options.put(PASSWORD.key(), TEST_PASSWORD);
+        options.put(TABLES.key(), POSTGRES_CONTAINER.getDatabaseName() + ".inventory.prod\\.*");
+        options.put(SLOT_NAME.key(), slotName);
+        options.put(SCAN_PARTITION_PUBLICATION_REFRESH_ENABLED.key(), "true");
+        Factory.Context context = new MockContext(Configuration.fromMap(options));
+
+        PostgresDataSourceFactory factory = new PostgresDataSourceFactory();
+        PostgresDataSource dataSource = (PostgresDataSource) factory.createDataSource(context);
+
+        assertThat(dataSource.getPostgresSourceConfig().partitionPublicationRefreshEnabled())
+                .isTrue();
     }
 
     @Test

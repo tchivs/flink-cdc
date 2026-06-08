@@ -66,12 +66,14 @@ import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSource
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.METADATA_LIST;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PASSWORD;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PG_PORT;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_CLOSE_IDLE_READER_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_BACKFILL_SKIP;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_KEY_COLUMN;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_LSN_COMMIT_CHECKPOINTS_DELAY;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_PARTITION_PUBLICATION_REFRESH_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_SNAPSHOT_FETCH_SIZE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_STARTUP_MODE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCHEMA_CHANGE_ENABLED;
@@ -133,6 +135,9 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         int lsnCommitCheckpointsDelay = config.get(SCAN_LSN_COMMIT_CHECKPOINTS_DELAY);
         boolean tableIdIncludeDatabase = config.get(TABLE_ID_INCLUDE_DATABASE);
         boolean includeSchemaChanges = config.get(SCHEMA_CHANGE_ENABLED);
+        boolean includePartitionedTables = config.get(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED);
+        boolean partitionPublicationRefreshEnabled =
+                config.get(SCAN_PARTITION_PUBLICATION_REFRESH_ENABLED);
 
         validateIntegerOption(SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE, splitSize, 1);
         validateIntegerOption(CHUNK_META_GROUP_SIZE, splitMetaGroupSize, 1);
@@ -144,6 +149,12 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
 
         Map<String, String> configMap = config.toMap();
         Optional<String> databaseName = getValidateDatabaseName(tables);
+        String normalizedTables = normalizeTablePatterns(tables, TABLES.key(), databaseName.get());
+        String normalizedTablesExclude =
+                tablesExclude == null
+                        ? null
+                        : normalizeTablePatterns(
+                                tablesExclude, TABLES_EXCLUDE.key(), databaseName.get());
 
         PostgresSourceConfigFactory configFactory =
                 PostgresSourceBuilder.PostgresIncrementalSource.<RowData>builder()
@@ -173,13 +184,16 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
                         .skipSnapshotBackfill(skipSnapshotBackfill)
                         .lsnCommitCheckpointsDelay(lsnCommitCheckpointsDelay)
                         .assignUnboundedChunkFirst(isAssignUnboundedChunkFirst)
+                        .includePartitionedTables(includePartitionedTables)
+                        .partitionPublicationRefreshEnabled(partitionPublicationRefreshEnabled)
                         .includeDatabaseInTableId(tableIdIncludeDatabase)
                         .includeSchemaChanges(includeSchemaChanges)
                         .getConfigFactory();
 
         List<TableId> tableIds = PostgresSchemaUtils.listTables(configFactory.create(0), null);
 
-        Selectors selectors = new Selectors.SelectorsBuilder().includeTables(tables).build();
+        Selectors selectors =
+                new Selectors.SelectorsBuilder().includeTables(normalizedTables).build();
         List<String> capturedTables = getTableList(tableIds, selectors);
         if (capturedTables.isEmpty()) {
             throw new IllegalArgumentException(
@@ -187,7 +201,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         }
         if (tablesExclude != null) {
             Selectors selectExclude =
-                    new Selectors.SelectorsBuilder().includeTables(tablesExclude).build();
+                    new Selectors.SelectorsBuilder().includeTables(normalizedTablesExclude).build();
             List<String> excludeTables = getTableList(tableIds, selectExclude);
             if (!excludeTables.isEmpty()) {
                 capturedTables.removeAll(excludeTables);
@@ -264,6 +278,8 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         options.add(SCAN_LSN_COMMIT_CHECKPOINTS_DELAY);
         options.add(METADATA_LIST);
         options.add(SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED);
+        options.add(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED);
+        options.add(SCAN_PARTITION_PUBLICATION_REFRESH_ENABLED);
         options.add(TABLE_ID_INCLUDE_DATABASE);
         options.add(SCHEMA_CHANGE_ENABLED);
         return options;
@@ -280,6 +296,33 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
                 .filter(selectors::isMatch)
                 .map(TableId::toString)
                 .collect(Collectors.toList());
+    }
+
+    static String normalizeTablePatterns(String patterns, String optionName, String databaseName) {
+        if (patterns == null || patterns.trim().isEmpty()) {
+            throw new IllegalArgumentException(
+                    String.format("Parameter %s cannot be null or empty", optionName));
+        }
+        return Arrays.stream(patterns.split(","))
+                .map(String::trim)
+                .map(pattern -> normalizeTablePattern(pattern, optionName, databaseName))
+                .collect(Collectors.joining(","));
+    }
+
+    private static String normalizeTablePattern(
+            String pattern, String optionName, String databaseName) {
+        String[] parts = pattern.split("(?<!\\\\)\\.", -1);
+        checkState(
+                parts.length == 3,
+                String.format(
+                        "The value of option '%s' must use database.schema.table format, but was: %s",
+                        optionName, pattern));
+        checkState(
+                databaseName.equals(parts[0]),
+                String.format(
+                        "The value of option '%s' must use database '%s', but found: %s",
+                        optionName, databaseName, pattern));
+        return parts[1] + "." + parts[2];
     }
 
     /** Checks the value of given integer option is valid. */
@@ -371,10 +414,6 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         for (String tableName : tableNames) {
             // Trim whitespace and split table name
             String trimmedTableName = tableName.trim();
-            if (!trimmedTableName.contains(".")) {
-                continue; // Skip table names that do not match the expected format
-            }
-
             String[] tableNameParts =
                     trimmedTableName.split(
                             "(?<!\\\\)\\.", -1); // Use -1 to avoid ignoring trailing empty elements
@@ -382,8 +421,8 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
             checkState(
                     tableNameParts.length == 3,
                     String.format(
-                            "Tables format must db.schema.table, can not 'tables' = %s",
-                            TABLES.key()));
+                            "The value of option '%s' must use database.schema.table format, but was: %s",
+                            TABLES.key(), trimmedTableName));
             String currentDbName = tableNameParts[0];
 
             checkState(

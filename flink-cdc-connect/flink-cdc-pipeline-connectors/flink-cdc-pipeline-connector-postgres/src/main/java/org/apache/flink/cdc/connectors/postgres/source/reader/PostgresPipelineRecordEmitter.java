@@ -30,7 +30,7 @@ import org.apache.flink.cdc.connectors.base.source.metrics.SourceReaderMetrics;
 import org.apache.flink.cdc.connectors.postgres.source.PostgresDialect;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
 import org.apache.flink.cdc.connectors.postgres.source.schema.PostgresSchemaRecord;
-import org.apache.flink.cdc.connectors.postgres.source.utils.TableDiscoveryUtils;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresTableIdRouter;
 import org.apache.flink.cdc.connectors.postgres.utils.PostgresSchemaUtils;
 import org.apache.flink.cdc.debezium.DebeziumDeserializationSchema;
 import org.apache.flink.cdc.debezium.event.DebeziumEventDeserializationSchema;
@@ -47,12 +47,13 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.sql.SQLException;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 
 import static io.debezium.connector.AbstractSourceInfo.SCHEMA_NAME_KEY;
 import static io.debezium.connector.AbstractSourceInfo.TABLE_NAME_KEY;
@@ -88,7 +89,8 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
                 debeziumDeserializationSchema,
                 sourceReaderMetrics,
                 sourceConfig.isIncludeSchemaChanges(),
-                offsetFactory);
+                offsetFactory,
+                PostgresTableIdRouter.of(postgresDialect::routingState));
         this.sourceConfig = sourceConfig;
         this.includeDatabaseInTableId = sourceConfig.isIncludeDatabaseInTableId();
         this.postgresDialect = postgresDialect;
@@ -96,7 +98,7 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
         this.createTableEventCache =
                 ((DebeziumEventDeserializationSchema) debeziumDeserializationSchema)
                         .getCreateTableEventCache();
-        generateCreateTableEvent(sourceConfig);
+        this.createTableEventCache.putAll(generateCreateTableEvent(sourceConfig));
         this.isBounded = StartupOptions.snapshot().equals(sourceConfig.getStartupOptions());
     }
 
@@ -110,11 +112,12 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
                     split.getTableSchemas().entrySet()) {
                 TableChanges.TableChange tableChange = entry.getValue();
 
-                Table table = tableChange.getTable();
+                Table table = routePartitionTable(tableChange.getTable());
                 CreateTableEvent createTableEvent =
                         toCreateTableEvent(table, sourceConfig, postgresDialect);
                 ((DebeziumEventDeserializationSchema) debeziumDeserializationSchema)
                         .applyChangeEvent(createTableEvent);
+                createTableEventCache.putIfAbsent(table.id(), createTableEvent);
             }
         }
     }
@@ -142,7 +145,7 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
     }
 
     private void handleDataChangeRecord(SourceRecord element, SourceOutput<T> output) {
-        TableId tableId = getTableId(element);
+        TableId tableId = routePartitionTableId(getTableId(element));
         maybeSendCreateTableEventFromCache(tableId, output);
         // In rare case, we may miss some CreateTableEvents before DataChangeEvents.
         // Don't send CreateTableEvent for SchemaChangeEvents as it's the latest schema.
@@ -164,11 +167,17 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
         Map<TableId, TableChanges.TableChange> existedTableSchemas =
                 splitState.toSourceSplit().getTableSchemas();
         PostgresSchemaRecord schemaRecord = (PostgresSchemaRecord) element;
-        Table schemaAfter = schemaRecord.getTable();
+        Table originalSchemaAfter = schemaRecord.getTable();
+        Table schemaAfter = routePartitionTable(originalSchemaAfter);
         maybeSendCreateTableEventFromCache(schemaAfter.id(), output);
         Table schemaBefore = null;
         if (existedTableSchemas.containsKey(schemaAfter.id())) {
             schemaBefore = existedTableSchemas.get(schemaAfter.id()).getTable();
+        } else if (!schemaAfter.id().equals(originalSchemaAfter.id())
+                && existedTableSchemas.containsKey(originalSchemaAfter.id())) {
+            schemaBefore =
+                    routePartitionTable(
+                            existedTableSchemas.get(originalSchemaAfter.id()).getTable());
         }
         List<SchemaChangeEvent> schemaChangeEvents =
                 inferSchemaChangeEvent(
@@ -178,12 +187,13 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
     }
 
     private void maybeSendCreateTableEventFromCache(TableId tableId, SourceOutput<T> output) {
-        if (!alreadySendCreateTableTables.contains(tableId)) {
-            CreateTableEvent createTableEvent = createTableEventCache.get(tableId);
+        TableId routedTableId = routePartitionTableId(tableId);
+        if (!alreadySendCreateTableTables.contains(routedTableId)) {
+            CreateTableEvent createTableEvent = createTableEventCache.get(routedTableId);
             if (createTableEvent != null) {
                 sendCreateTableEvent(createTableEvent, output);
+                alreadySendCreateTableTables.add(routedTableId);
             }
-            alreadySendCreateTableTables.add(tableId);
         }
     }
 
@@ -194,10 +204,11 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
     private CreateTableEvent getCreateTableEvent(
             PostgresSourceConfig sourceConfig, TableId tableId) {
         try (PostgresConnection jdbc = postgresDialect.openJdbcConnection()) {
-            Schema schema = PostgresSchemaUtils.getTableSchema(tableId, sourceConfig, jdbc);
+            TableId routedTableId = routePartitionTableId(tableId);
+            Schema schema = PostgresSchemaUtils.getTableSchema(routedTableId, sourceConfig, jdbc);
             return new CreateTableEvent(
                     toCdcTableId(
-                            tableId,
+                            routedTableId,
                             sourceConfig.getDatabaseList().get(0),
                             includeDatabaseInTableId),
                     schema);
@@ -218,28 +229,49 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
 
     private Map<TableId, CreateTableEvent> generateCreateTableEvent(
             PostgresSourceConfig sourceConfig) {
-        try (PostgresConnection jdbc = postgresDialect.openJdbcConnection()) {
-            Map<TableId, CreateTableEvent> createTableEventCache = new HashMap<>();
-            List<TableId> capturedTableIds =
-                    TableDiscoveryUtils.listTables(
-                            sourceConfig.getDatabaseList().get(0),
-                            jdbc,
-                            sourceConfig.getTableFilters(),
-                            sourceConfig.includePartitionedTables());
-            for (TableId tableId : capturedTableIds) {
-                Schema schema = PostgresSchemaUtils.getTableSchema(tableId, sourceConfig, jdbc);
-                createTableEventCache.put(
-                        tableId,
-                        new CreateTableEvent(
-                                toCdcTableId(
-                                        tableId,
-                                        this.sourceConfig.getDatabaseList().get(0),
-                                        includeDatabaseInTableId),
-                                schema));
-            }
-            return createTableEventCache;
-        } catch (SQLException e) {
-            throw new RuntimeException("Cannot start emitter to fetch table schema.", e);
+        Map<TableId, CreateTableEvent> createTableEventCache = new HashMap<>();
+        Map<TableId, TableChanges.TableChange> tableSchemas =
+                postgresDialect.discoverDataCollectionSchemas(sourceConfig);
+        for (Table table :
+                selectCreateTableSchemas(tableSchemas, postgresDialect::routeToLogicalTable)
+                        .values()) {
+            createTableEventCache.put(
+                    table.id(), toCreateTableEvent(table, sourceConfig, postgresDialect));
         }
+        return createTableEventCache;
+    }
+
+    static Map<TableId, Table> selectCreateTableSchemas(
+            Map<TableId, TableChanges.TableChange> tableSchemas,
+            Function<TableId, TableId> tableIdRouter) {
+        Map<TableId, Table> selectedTables = new LinkedHashMap<>();
+        for (TableChanges.TableChange tableSchema : tableSchemas.values()) {
+            Table table = tableSchema.getTable();
+            TableId routedTableId = tableIdRouter.apply(table.id());
+            if (routedTableId.equals(table.id())) {
+                selectedTables.put(routedTableId, table);
+            }
+        }
+        for (TableChanges.TableChange tableSchema : tableSchemas.values()) {
+            Table table = tableSchema.getTable();
+            TableId routedTableId = tableIdRouter.apply(table.id());
+            if (!routedTableId.equals(table.id())) {
+                selectedTables.putIfAbsent(
+                        routedTableId, table.edit().tableId(routedTableId).create());
+            }
+        }
+        return selectedTables;
+    }
+
+    private Table routePartitionTable(Table table) {
+        TableId routedTableId = routePartitionTableId(table.id());
+        if (routedTableId.equals(table.id())) {
+            return table;
+        }
+        return table.edit().tableId(routedTableId).create();
+    }
+
+    private TableId routePartitionTableId(TableId tableId) {
+        return postgresDialect.routeToLogicalTable(tableId);
     }
 }

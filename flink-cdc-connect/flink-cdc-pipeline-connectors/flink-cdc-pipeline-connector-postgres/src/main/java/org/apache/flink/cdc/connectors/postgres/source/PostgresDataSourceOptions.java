@@ -237,6 +237,23 @@ public class PostgresDataSourceOptions {
                                     + "it is necessary to escape the dot with a backslash."
                                     + "eg. db0.\\.*, db1.user_table_[0-9]+, db[1-2].[app|web]_order_\\.*");
 
+    @Experimental
+    public static final ConfigOption<Boolean> SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED =
+            ConfigOptions.key("scan.include-partitioned-tables.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether to discover child partitions for captured partitioned tables and route emitted records to the partition root table.");
+
+    @Experimental
+    public static final ConfigOption<Boolean> SCAN_PARTITION_PUBLICATION_REFRESH_ENABLED =
+            ConfigOptions.key("scan.partition.publication.refresh.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether to automatically add newly discovered partition child tables to the configured PostgreSQL publication. "
+                                    + "This option is only valid for pgoutput partition routing, requires privileges to alter the publication, and is disabled by default.");
+
     public static final ConfigOption<Integer> SCAN_LSN_COMMIT_CHECKPOINTS_DELAY =
             ConfigOptions.key("scan.lsn-commit.checkpoints-num-delay")
                     .intType()

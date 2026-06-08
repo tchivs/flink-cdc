@@ -27,6 +27,7 @@ import org.apache.flink.cdc.debezium.table.DebeziumChangelogMode;
 import org.apache.flink.table.data.TimestampData;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.debezium.connector.AbstractSourceInfo;
 import io.debezium.data.Envelope;
 import io.debezium.data.geometry.Geography;
 import io.debezium.data.geometry.Geometry;
@@ -105,6 +106,19 @@ public class PostgresEventDeserializer extends DebeziumEventDeserializationSchem
 
     @Override
     protected TableId getTableId(SourceRecord record) {
+        Struct value = (Struct) record.value();
+        Struct source = value == null ? null : value.getStruct(Envelope.FieldName.SOURCE);
+        if (source != null && source.schema().field(AbstractSourceInfo.TABLE_NAME_KEY) != null) {
+            String schemaName =
+                    source.schema().field(AbstractSourceInfo.SCHEMA_NAME_KEY) == null
+                            ? null
+                            : source.getString(AbstractSourceInfo.SCHEMA_NAME_KEY);
+            String tableName = source.getString(AbstractSourceInfo.TABLE_NAME_KEY);
+            if (includeDatabaseInTableId && databaseName != null) {
+                return TableId.tableId(databaseName, schemaName, tableName);
+            }
+            return TableId.tableId(schemaName, tableName);
+        }
         String[] parts = record.topic().split("\\.");
         if (includeDatabaseInTableId && databaseName != null) {
             return TableId.tableId(databaseName, parts[1], parts[2]);
