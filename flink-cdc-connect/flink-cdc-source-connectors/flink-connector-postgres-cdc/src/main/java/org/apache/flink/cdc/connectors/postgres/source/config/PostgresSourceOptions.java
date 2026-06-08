@@ -98,6 +98,14 @@ public class PostgresSourceOptions extends JdbcSourceOptions {
                                     + "(1) PUBLICATION must be created beforehand with parameter publish_via_partition_root=true\n"
                                     + "(2) Table list (regex or predefined list) should only match the parent table name, if table list matches both parent and child tables, snapshot data will be read twice.");
 
+    public static final ConfigOption<Boolean> SCAN_PARTITION_PUBLICATION_REFRESH_ENABLED =
+            ConfigOptions.key("scan.partition.publication.refresh.enabled")
+                    .booleanType()
+                    .defaultValue(Boolean.FALSE)
+                    .withDescription(
+                            "Whether to automatically add newly discovered partition child tables to the configured PostgreSQL publication. "
+                                    + "This option is only valid for pgoutput partition routing, requires privileges to alter the publication, and is disabled by default.");
+
     public static final ConfigOption<Boolean> TABLE_ID_INCLUDE_DATABASE =
             ConfigOptions.key("table-id.include-database")
                     .booleanType()

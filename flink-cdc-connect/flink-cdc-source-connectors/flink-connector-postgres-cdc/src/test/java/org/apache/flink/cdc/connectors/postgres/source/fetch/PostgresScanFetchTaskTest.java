@@ -30,6 +30,7 @@ import org.apache.flink.cdc.connectors.base.source.reader.external.FetchTask;
 import org.apache.flink.cdc.connectors.base.source.reader.external.IncrementalSourceScanFetcher;
 import org.apache.flink.cdc.connectors.base.source.utils.hooks.SnapshotPhaseHook;
 import org.apache.flink.cdc.connectors.base.source.utils.hooks.SnapshotPhaseHooks;
+import org.apache.flink.cdc.connectors.base.utils.SourceRecordUtils;
 import org.apache.flink.cdc.connectors.postgres.PostgresTestBase;
 import org.apache.flink.cdc.connectors.postgres.source.PostgresDialect;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
@@ -44,6 +45,7 @@ import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.types.DataType;
 
 import io.debezium.connector.postgresql.connection.PostgresConnection;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.Test;
 
@@ -57,6 +59,9 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Properties;
 
+import static io.debezium.connector.AbstractSourceInfo.SCHEMA_NAME_KEY;
+import static io.debezium.connector.AbstractSourceInfo.TABLE_NAME_KEY;
+import static io.debezium.data.Envelope.FieldName.SOURCE;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for {@link PostgresScanFetchTask}. */
@@ -73,6 +78,14 @@ class PostgresScanFetchTaskTest extends PostgresTestBase {
                     POSTGRES_CONTAINER,
                     "postgres",
                     "customer",
+                    POSTGRES_CONTAINER.getUsername(),
+                    POSTGRES_CONTAINER.getPassword());
+
+    private final UniqueDatabase inventoryPartitionedDatabase =
+            new UniqueDatabase(
+                    POSTGRES_CONTAINER,
+                    "postgres_partitioned",
+                    "inventory_partitioned",
                     POSTGRES_CONTAINER.getUsername(),
                     POSTGRES_CONTAINER.getPassword());
 
@@ -283,6 +296,36 @@ class PostgresScanFetchTaskTest extends PostgresTestBase {
         }
     }
 
+    @Test
+    void testSnapshotSplitRecordsAreRoutedToParentTable() throws Exception {
+        inventoryPartitionedDatabase.createAndInitialize();
+
+        PostgresSourceConfigFactory sourceConfigFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase,
+                        "inventory_partitioned",
+                        "products",
+                        null,
+                        10,
+                        true);
+        sourceConfigFactory.setIncludePartitionedTables(true);
+        PostgresSourceConfig sourceConfig = sourceConfigFactory.create(0);
+        PostgresDialect postgresDialect = new PostgresDialect(sourceConfigFactory.create(0));
+        List<SnapshotSplit> snapshotSplits = getSnapshotSplits(sourceConfig, postgresDialect);
+
+        assertThat(snapshotSplits)
+                .extracting(split -> split.getTableId().toString())
+                .contains("inventory_partitioned.products_uk");
+
+        PostgresSourceFetchTaskContext taskContext =
+                new PostgresSourceFetchTaskContext(sourceConfig, postgresDialect);
+        List<SourceRecord> records =
+                readRawSnapshotSplits(snapshotSplits, taskContext, snapshotSplits.size());
+        assertThat(records.stream().filter(SourceRecordUtils::isDataChangeRecord))
+                .isNotEmpty()
+                .allSatisfy(this::assertSnapshotRecordIsRoutedToParent);
+    }
+
     private List<String> getDataInSnapshotScan(
             String[] changingDataSql,
             String schemaName,
@@ -368,6 +411,42 @@ class PostgresScanFetchTaskTest extends PostgresTestBase {
         assertThat(sourceScanFetcher.getExecutorService().isTerminated()).isTrue();
 
         return formatResult(result, dataType);
+    }
+
+    private List<SourceRecord> readRawSnapshotSplits(
+            List<SnapshotSplit> snapshotSplits,
+            PostgresSourceFetchTaskContext taskContext,
+            int scanSplitsNum)
+            throws Exception {
+        IncrementalSourceScanFetcher sourceScanFetcher =
+                new IncrementalSourceScanFetcher(taskContext, 0);
+
+        List<SourceRecord> result = new ArrayList<>();
+        for (int i = 0; i < scanSplitsNum; i++) {
+            SnapshotSplit sqlSplit = snapshotSplits.get(i);
+            if (sourceScanFetcher.isFinished()) {
+                FetchTask<SourceSplitBase> fetchTask =
+                        taskContext.getDataSourceDialect().createFetchTask(sqlSplit);
+                sourceScanFetcher.submitTask(fetchTask);
+            }
+            Iterator<SourceRecords> res;
+            while ((res = sourceScanFetcher.pollSplitRecords()) != null) {
+                while (res.hasNext()) {
+                    SourceRecords sourceRecords = res.next();
+                    result.addAll(sourceRecords.getSourceRecordList());
+                }
+            }
+        }
+
+        sourceScanFetcher.close();
+        return result;
+    }
+
+    private void assertSnapshotRecordIsRoutedToParent(SourceRecord sourceRecord) {
+        Struct value = (Struct) sourceRecord.value();
+        Struct source = value.getStruct(SOURCE);
+        assertThat(source.getString(SCHEMA_NAME_KEY)).isEqualTo("inventory_partitioned");
+        assertThat(source.getString(TABLE_NAME_KEY)).isEqualTo("products");
     }
 
     private List<String> formatResult(List<SourceRecord> records, DataType dataType) {

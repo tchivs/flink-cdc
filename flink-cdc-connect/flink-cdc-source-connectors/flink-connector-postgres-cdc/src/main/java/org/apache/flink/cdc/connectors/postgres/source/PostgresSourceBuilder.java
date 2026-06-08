@@ -42,6 +42,8 @@ import org.apache.flink.cdc.connectors.postgres.source.enumerator.PostgresSource
 import org.apache.flink.cdc.connectors.postgres.source.offset.PostgresOffsetFactory;
 import org.apache.flink.cdc.connectors.postgres.source.reader.PostgresSourceReader;
 import org.apache.flink.cdc.connectors.postgres.source.reader.PostgresSourceRecordEmitter;
+import org.apache.flink.cdc.connectors.postgres.source.utils.LogicalDecoderStrategy;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresTableIdRouter;
 import org.apache.flink.cdc.debezium.DebeziumDeserializationSchema;
 import org.apache.flink.connector.base.source.reader.RecordEmitter;
 import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
@@ -65,6 +67,8 @@ public class PostgresSourceBuilder<T> {
     private DebeziumDeserializationSchema<T> deserializer;
 
     private PostgresSourceBuilder() {}
+
+    private static final String PLUGIN_NAME_PROPERTY = "plugin.name";
 
     /**
      * The name of the Postgres logical decoding plug-in installed on the server. Supported values
@@ -309,6 +313,14 @@ public class PostgresSourceBuilder<T> {
         return this;
     }
 
+    /** Whether to automatically refresh child partition membership in PostgreSQL publication. */
+    public PostgresSourceBuilder<T> partitionPublicationRefreshEnabled(
+            boolean partitionPublicationRefreshEnabled) {
+        this.configFactory.setPartitionPublicationRefreshEnabled(
+                partitionPublicationRefreshEnabled);
+        return this;
+    }
+
     /** Whether to include database in the generated Table ID. */
     public PostgresSourceBuilder<T> includeDatabaseInTableId(boolean includeDatabaseInTableId) {
         this.configFactory.setIncludeDatabaseInTableId(includeDatabaseInTableId);
@@ -373,6 +385,7 @@ public class PostgresSourceBuilder<T> {
                             "Failed to discover captured tables for enumerator", e);
                 }
             } else {
+                seedPartitionRoutingForStreamOnlyStartup(sourceConfig);
                 splitAssigner =
                         new StreamSplitAssigner(
                                 sourceConfig, dataSourceDialect, offsetFactory, enumContext);
@@ -402,6 +415,7 @@ public class PostgresSourceBuilder<T> {
                                 offsetFactory,
                                 enumContext);
             } else if (checkpoint instanceof StreamPendingSplitsState) {
+                seedPartitionRoutingForStreamOnlyStartup(sourceConfig);
                 splitAssigner =
                         new StreamSplitAssigner(
                                 sourceConfig,
@@ -420,6 +434,21 @@ public class PostgresSourceBuilder<T> {
                     splitAssigner,
                     (PostgresDialect) dataSourceDialect,
                     getBoundedness());
+        }
+
+        private void seedPartitionRoutingForStreamOnlyStartup(PostgresSourceConfig sourceConfig) {
+            if (!sourceConfig.includePartitionedTables()) {
+                return;
+            }
+            LogicalDecoderStrategy.fromPluginName(
+                            sourceConfig.getDbzProperties().getProperty(PLUGIN_NAME_PROPERTY))
+                    .validateStartupMode(sourceConfig.getStartupOptions());
+            try {
+                dataSourceDialect.discoverDataCollections(sourceConfig);
+            } catch (Exception e) {
+                throw new FlinkRuntimeException(
+                        "Failed to discover captured tables for stream-only partition routing", e);
+            }
         }
 
         @Override
@@ -462,7 +491,9 @@ public class PostgresSourceBuilder<T> {
                     deserializationSchema,
                     sourceReaderMetrics,
                     sourceConfig.isIncludeSchemaChanges(),
-                    offsetFactory);
+                    offsetFactory,
+                    PostgresTableIdRouter.of(
+                            () -> ((PostgresDialect) dataSourceDialect).routingState()));
         }
 
         public static <T> PostgresSourceBuilder<T> builder() {

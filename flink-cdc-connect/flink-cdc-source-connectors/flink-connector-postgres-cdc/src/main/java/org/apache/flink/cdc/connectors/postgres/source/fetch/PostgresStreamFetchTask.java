@@ -19,12 +19,15 @@ package org.apache.flink.cdc.connectors.postgres.source.fetch;
 
 import org.apache.flink.cdc.common.annotation.VisibleForTesting;
 import org.apache.flink.cdc.connectors.base.WatermarkDispatcher;
+import org.apache.flink.cdc.connectors.base.options.StartupOptions;
 import org.apache.flink.cdc.connectors.base.source.meta.offset.Offset;
 import org.apache.flink.cdc.connectors.base.source.meta.split.SourceSplitBase;
 import org.apache.flink.cdc.connectors.base.source.meta.split.StreamSplit;
 import org.apache.flink.cdc.connectors.base.source.meta.wartermark.WatermarkKind;
 import org.apache.flink.cdc.connectors.base.source.reader.external.FetchTask;
 import org.apache.flink.cdc.connectors.postgres.source.offset.PostgresOffset;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionCatalog;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresTableIdRouter;
 import org.apache.flink.util.FlinkRuntimeException;
 
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
@@ -47,6 +50,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.sql.SQLException;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -94,6 +98,9 @@ public class PostgresStreamFetchTask implements FetchTask<SourceSplitBase> {
                         sourceFetchContext.getDatabaseSchema(),
                         sourceFetchContext.getTaskContext(),
                         sourceFetchContext.getReplicationConnection(),
+                        sourceFetchContext.getTableIdRouter(),
+                        sourceFetchContext.getSourceConfig().getStartupOptions(),
+                        sourceFetchContext.getPluginName(),
                         split);
 
         streamSplitReadTask.execute(
@@ -175,6 +182,10 @@ public class PostgresStreamFetchTask implements FetchTask<SourceSplitBase> {
         private final StreamSplit streamSplit;
         private final WatermarkDispatcher watermarkDispatcher;
         private final ErrorHandler errorHandler;
+        private final PostgresConnection connection;
+        private final PostgresTableIdRouter tableIdRouter;
+        private final StartupOptions startupOptions;
+        private final String decoderName;
 
         public ChangeEventSourceContext context;
         public PostgresOffsetContext offsetContext;
@@ -190,6 +201,9 @@ public class PostgresStreamFetchTask implements FetchTask<SourceSplitBase> {
                 PostgresSchema schema,
                 PostgresTaskContext taskContext,
                 ReplicationConnection replicationConnection,
+                PostgresTableIdRouter tableIdRouter,
+                StartupOptions startupOptions,
+                String decoderName,
                 StreamSplit streamSplit) {
 
             super(
@@ -205,6 +219,12 @@ public class PostgresStreamFetchTask implements FetchTask<SourceSplitBase> {
             this.streamSplit = streamSplit;
             this.watermarkDispatcher = watermarkDispatcher;
             this.errorHandler = errorHandler;
+            this.connection = connection;
+            this.tableIdRouter =
+                    tableIdRouter == null ? PostgresTableIdRouter.empty() : tableIdRouter;
+            this.startupOptions =
+                    startupOptions == null ? StartupOptions.initial() : startupOptions;
+            this.decoderName = decoderName;
         }
 
         @Override
@@ -248,6 +268,20 @@ public class PostgresStreamFetchTask implements FetchTask<SourceSplitBase> {
             return !PostgresOffset.NO_STOPPING_OFFSET
                     .getLsn()
                     .equals(((PostgresOffset) streamSplit.getEndingOffset()).getLsn());
+        }
+
+        @Override
+        protected void beforeDispatchDataChangeEvent(TableId tableId) throws SQLException {
+            if (!"decoderbufs".equalsIgnoreCase(decoderName)
+                    || !tableIdRouter.hasRoutingState()
+                    || tableIdRouter.isKnownChild(tableId)) {
+                return;
+            }
+            tableIdRouter.validateKnownChildForDecoderbufs(
+                    tableId,
+                    decoderName,
+                    startupOptions,
+                    PartitionCatalog.resolveParent(connection, tableId));
         }
     }
 }

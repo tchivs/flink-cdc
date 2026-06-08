@@ -21,36 +21,55 @@ import org.apache.flink.cdc.connectors.base.source.meta.offset.OffsetFactory;
 import org.apache.flink.cdc.connectors.base.source.metrics.SourceReaderMetrics;
 import org.apache.flink.cdc.connectors.base.source.reader.IncrementalSourceRecordEmitter;
 import org.apache.flink.cdc.connectors.postgres.source.schema.PostgresSchemaRecord;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresTableIdRouter;
 import org.apache.flink.cdc.debezium.DebeziumDeserializationSchema;
 
 import io.debezium.relational.Table;
 import io.debezium.relational.history.TableChanges;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
 
 import java.io.IOException;
 
+import static org.apache.flink.cdc.connectors.base.utils.SourceRecordUtils.isDataChangeRecord;
+
 /** Record emitter that recognizes {@link PostgresSchemaRecord} as schema change events. */
 public class PostgresSourceRecordEmitter<T> extends IncrementalSourceRecordEmitter<T> {
+
+    private final PostgresTableIdRouter tableIdRouter;
+
     public PostgresSourceRecordEmitter(
             DebeziumDeserializationSchema<T> debeziumDeserializationSchema,
             SourceReaderMetrics sourceReaderMetrics,
             boolean includeSchemaChanges,
-            OffsetFactory offsetFactory) {
+            OffsetFactory offsetFactory,
+            PostgresTableIdRouter tableIdRouter) {
         super(
                 debeziumDeserializationSchema,
                 sourceReaderMetrics,
                 includeSchemaChanges,
                 offsetFactory);
+        this.tableIdRouter = tableIdRouter == null ? PostgresTableIdRouter.empty() : tableIdRouter;
     }
 
     @Override
     protected TableChanges getTableChangeRecord(SourceRecord element) throws IOException {
         if (element instanceof PostgresSchemaRecord) {
             PostgresSchemaRecord schemaRecord = (PostgresSchemaRecord) element;
-            Table table = schemaRecord.getTable();
+            Table table = tableIdRouter.route(schemaRecord.getTable());
             return new TableChanges().create(table);
         } else {
             return super.getTableChangeRecord(element);
         }
+    }
+
+    @Override
+    protected void emitElement(
+            SourceRecord element, org.apache.flink.api.connector.source.SourceOutput<T> output)
+            throws Exception {
+        if (isDataChangeRecord(element) && element.value() instanceof Struct) {
+            tableIdRouter.rewriteSourceStruct((Struct) element.value());
+        }
+        super.emitElement(element, output);
     }
 }

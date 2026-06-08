@@ -35,11 +35,14 @@ import io.debezium.util.Clock;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 /** A CustomPostgresSchema similar to PostgresSchema with customization. */
 public class CustomPostgresSchema {
@@ -48,11 +51,24 @@ public class CustomPostgresSchema {
     private final Map<TableId, TableChange> schemasByTableId = new HashMap<>();
     private final PostgresConnection jdbcConnection;
     private final PostgresConnectorConfig dbzConfig;
+    private final String chunkKeyColumn;
+    private final Supplier<PartitionRoutingState> routingStateSupplier;
 
     public CustomPostgresSchema(
             PostgresConnection jdbcConnection, PostgresSourceConfig sourceConfig) {
+        this(jdbcConnection, sourceConfig, () -> PartitionRoutingState.EMPTY);
+    }
+
+    public CustomPostgresSchema(
+            PostgresConnection jdbcConnection,
+            PostgresSourceConfig sourceConfig,
+            Supplier<PartitionRoutingState> routingStateSupplier) {
         this.jdbcConnection = jdbcConnection;
         this.dbzConfig = sourceConfig.getDbzConnectorConfig();
+        this.chunkKeyColumn = sourceConfig.getChunkKeyColumn();
+        this.routingStateSupplier =
+                Objects.requireNonNull(
+                        routingStateSupplier, "routingStateSupplier must not be null");
     }
 
     public TableChange getTableSchema(TableId tableId) {
@@ -112,34 +128,98 @@ public class CustomPostgresSchema {
                     tables,
                     dbzConfig.databaseName(),
                     null,
-                    dbzConfig.getTableFilters().dataCollectionFilter(),
+                    partitionAwareTableFilter(),
                     null,
                     false);
         } catch (SQLException e) {
             throw new FlinkRuntimeException("Failed to read schema", e);
         }
 
+        PartitionRoutingState routingState = routingStateSupplier.get();
         for (TableId tableId : tableIds) {
-            Table table = Objects.requireNonNull(tables.forTable(tableId));
-            // set the events to populate proper sourceInfo into offsetContext
-            offsetContext.event(tableId, Instant.now());
-
-            // TODO: check whether we always set isFromSnapshot = true
-            SchemaChangeEvent schemaChangeEvent =
-                    SchemaChangeEvent.ofCreate(
-                            partition,
-                            offsetContext,
-                            dbzConfig.databaseName(),
-                            tableId.schema(),
-                            null,
-                            table,
-                            true);
-
-            for (TableChanges.TableChange tableChange : schemaChangeEvent.getTableChanges()) {
-                this.schemasByTableId.put(tableId, tableChange);
-            }
+            Table table = resolveTableSchema(tableId, tables, routingState);
+            cacheSchemaChange(tableId, table, offsetContext, partition);
             tableChanges.add(this.schemasByTableId.get(tableId));
         }
         return tableChanges;
+    }
+
+    static Table resolveTableSchema(
+            TableId tableId,
+            Tables tables,
+            PartitionRoutingState routingState,
+            String chunkKeyColumn) {
+        Table table = tables.forTable(tableId);
+        if (hasUsableKeyOrSplitColumn(table, chunkKeyColumn)) {
+            return table;
+        }
+        if (routingState == null || !routingState.containsParent(tableId)) {
+            return Objects.requireNonNull(table);
+        }
+
+        Collection<TableChange> childSchemas =
+                routingState.childrenOf(tableId).stream()
+                        .map(tables::forTable)
+                        .filter(Objects::nonNull)
+                        .map(
+                                childTable ->
+                                        new TableChange(
+                                                TableChanges.TableChangeType.CREATE, childTable))
+                        .collect(Collectors.toList());
+        Table synthesized = PartitionSchemaProjector.synthesizeFromChildren(tableId, childSchemas);
+        if (!hasUsableKeyOrSplitColumn(synthesized, chunkKeyColumn)) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "Cannot synthesize usable partition schema for parent %s: child schemas do not provide %s",
+                            tableId,
+                            chunkKeyColumn == null
+                                    ? "primary-key metadata"
+                                    : "configured chunk key column '" + chunkKeyColumn + "'"));
+        }
+        return synthesized;
+    }
+
+    private Table resolveTableSchema(
+            TableId tableId, Tables tables, PartitionRoutingState routingState) {
+        return resolveTableSchema(tableId, tables, routingState, chunkKeyColumn);
+    }
+
+    private Tables.TableFilter partitionAwareTableFilter() {
+        return new PartitionAwareTableFilter(
+                dbzConfig.getTableFilters().dataCollectionFilter(), routingStateSupplier);
+    }
+
+    private static boolean hasUsableKeyOrSplitColumn(Table table, String chunkKeyColumn) {
+        if (table == null) {
+            return false;
+        }
+        if (chunkKeyColumn != null) {
+            return table.columnWithName(chunkKeyColumn) != null;
+        }
+        return !table.primaryKeyColumnNames().isEmpty();
+    }
+
+    private void cacheSchemaChange(
+            TableId tableId,
+            Table table,
+            PostgresOffsetContext offsetContext,
+            PostgresPartition partition) {
+        // set the events to populate proper sourceInfo into offsetContext
+        offsetContext.event(tableId, Instant.now());
+
+        // TODO: check whether we always set isFromSnapshot = true
+        SchemaChangeEvent schemaChangeEvent =
+                SchemaChangeEvent.ofCreate(
+                        partition,
+                        offsetContext,
+                        dbzConfig.databaseName(),
+                        tableId.schema(),
+                        null,
+                        table,
+                        true);
+
+        for (TableChanges.TableChange tableChange : schemaChangeEvent.getTableChanges()) {
+            this.schemasByTableId.put(tableId, tableChange);
+        }
     }
 }

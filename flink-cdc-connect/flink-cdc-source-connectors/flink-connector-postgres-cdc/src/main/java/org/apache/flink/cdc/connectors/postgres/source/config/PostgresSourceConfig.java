@@ -39,6 +39,7 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
     private final int subtaskId;
     private final int lsnCommitCheckpointsDelay;
     private final boolean includePartitionedTables;
+    private final boolean partitionPublicationRefreshEnabled;
     private final boolean includeDatabaseInTableId;
 
     public PostgresSourceConfig(
@@ -71,6 +72,7 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
             int lsnCommitCheckpointsDelay,
             boolean assignUnboundedChunkFirst,
             boolean includePartitionedTables,
+            boolean partitionPublicationRefreshEnabled,
             boolean includeDatabaseInTableId) {
         super(
                 startupOptions,
@@ -102,6 +104,7 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
         this.subtaskId = subtaskId;
         this.lsnCommitCheckpointsDelay = lsnCommitCheckpointsDelay;
         this.includePartitionedTables = includePartitionedTables;
+        this.partitionPublicationRefreshEnabled = partitionPublicationRefreshEnabled;
         this.includeDatabaseInTableId = includeDatabaseInTableId;
     }
 
@@ -130,6 +133,11 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
      */
     public boolean includePartitionedTables() {
         return includePartitionedTables;
+    }
+
+    /** Returns whether automatic partition publication refresh is enabled. */
+    public boolean partitionPublicationRefreshEnabled() {
+        return partitionPublicationRefreshEnabled;
     }
 
     /**

@@ -6,6 +6,8 @@
 
 package io.debezium.connector.postgresql.connection;
 
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionAwarePostgresConnectorConfig;
+
 import io.debezium.DebeziumException;
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.connector.postgresql.PostgresSchema;
@@ -240,6 +242,13 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
         String createOrUpdatePublicationStmt;
         try {
             Set<TableId> tablesToCapture = determineCapturedTables();
+            if (tableFilter
+                    instanceof PartitionAwarePostgresConnectorConfig.PublicationMemberResolver) {
+                tablesToCapture =
+                        ((PartitionAwarePostgresConnectorConfig.PublicationMemberResolver)
+                                        tableFilter)
+                                .resolvePublicationMembers(tablesToCapture);
+            }
             tableFilterString =
                     tablesToCapture.stream()
                             .map(TableId::toDoubleQuotedString)

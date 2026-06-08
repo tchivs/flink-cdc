@@ -32,6 +32,9 @@ import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresScanFetchTa
 import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresSourceFetchTaskContext;
 import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresStreamFetchTask;
 import org.apache.flink.cdc.connectors.postgres.source.utils.CustomPostgresSchema;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionCatalog;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionPublicationRefresher;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionRoutingState;
 import org.apache.flink.cdc.connectors.postgres.source.utils.TableDiscoveryUtils;
 import org.apache.flink.util.FlinkRuntimeException;
 
@@ -52,8 +55,12 @@ import io.debezium.schema.TopicSelector;
 import javax.annotation.Nullable;
 
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 import static io.debezium.connector.postgresql.PostgresConnectorConfig.PLUGIN_NAME;
 import static io.debezium.connector.postgresql.PostgresConnectorConfig.SLOT_NAME;
@@ -69,6 +76,8 @@ public class PostgresDialect implements JdbcDataSourceDialect {
     private final PostgresSourceConfig sourceConfig;
     private transient Tables.TableFilter filters;
     private transient CustomPostgresSchema schema;
+    private final AtomicReference<PartitionRoutingState> routingState =
+            new AtomicReference<>(PartitionRoutingState.EMPTY);
     @Nullable private PostgresStreamFetchTask streamFetchTask;
 
     public PostgresDialect(PostgresSourceConfig sourceConfig) {
@@ -176,26 +185,88 @@ public class PostgresDialect implements JdbcDataSourceDialect {
     @Override
     public List<TableId> discoverDataCollections(JdbcSourceConfig sourceConfig) {
         try (JdbcConnection jdbc = openJdbcConnection(sourceConfig)) {
-            boolean includePartitionedTables =
-                    ((PostgresSourceConfig) sourceConfig).includePartitionedTables();
-            return TableDiscoveryUtils.listTables(
-                    // there is always a single database provided
-                    sourceConfig.getDatabaseList().get(0),
-                    jdbc,
-                    sourceConfig.getTableFilters(),
-                    includePartitionedTables);
+            PostgresSourceConfig postgresSourceConfig = (PostgresSourceConfig) sourceConfig;
+            boolean includePartitionedTables = postgresSourceConfig.includePartitionedTables();
+            List<TableId> capturedTableIds =
+                    TableDiscoveryUtils.listTables(
+                            // there is always a single database provided
+                            sourceConfig.getDatabaseList().get(0),
+                            jdbc,
+                            sourceConfig.getTableFilters(),
+                            includePartitionedTables);
+            if (!includePartitionedTables) {
+                routingState.compareAndSet(routingState.get(), PartitionRoutingState.EMPTY);
+                return capturedTableIds;
+            }
+
+            PartitionRoutingState discoveredRoutingState =
+                    PartitionCatalog.discoverRoutingState(jdbc, capturedTableIds);
+            Set<TableId> ambiguousTables =
+                    discoveredRoutingState.findMixedParentChildCaptures(capturedTableIds);
+            if (!ambiguousTables.isEmpty()) {
+                throw new FlinkRuntimeException(
+                        String.format(
+                                "Ambiguous PostgreSQL partition capture detected: %s. "
+                                        + "When scan.include-partitioned-tables.enabled is true, configure partition parents or child partitions, but not both.",
+                                ambiguousTables.stream()
+                                        .map(TableId::toString)
+                                        .sorted()
+                                        .collect(Collectors.joining(", "))));
+            }
+            validatePartitionPublicationTopology(
+                    jdbc, postgresSourceConfig, discoveredRoutingState);
+            routingState.set(discoveredRoutingState);
+            return PartitionCatalog.expandParentsToChildren(
+                    capturedTableIds, discoveredRoutingState);
         } catch (SQLException e) {
             throw new FlinkRuntimeException("Error to discover tables: " + e.getMessage(), e);
         }
     }
 
+    public PartitionRoutingState routingState() {
+        return routingState.get();
+    }
+
+    public boolean compareAndSetRoutingState(
+            PartitionRoutingState previousState, PartitionRoutingState nextState) {
+        return routingState.compareAndSet(previousState, nextState);
+    }
+
+    public TableId routeToLogicalTable(TableId physicalTableId) {
+        return routingState.get().routeToLogicalTable(physicalTableId);
+    }
+
+    private void validatePartitionPublicationTopology(
+            JdbcConnection jdbc,
+            PostgresSourceConfig postgresSourceConfig,
+            PartitionRoutingState discoveredRoutingState)
+            throws SQLException {
+        if (discoveredRoutingState.isEmpty()) {
+            return;
+        }
+        String publicationName = postgresSourceConfig.getDbzConnectorConfig().publicationName();
+        boolean publishViaPartitionRoot =
+                PartitionPublicationRefresher.isPublishViaPartitionRootEnabled(
+                        jdbc, publicationName);
+        PartitionPublicationRefresher.validatePartitionRoutingSupport(
+                postgresSourceConfig, discoveredRoutingState, publishViaPartitionRoot);
+        PartitionPublicationRefresher.validateExistingPublicationMembership(
+                jdbc, postgresSourceConfig, discoveredRoutingState, publishViaPartitionRoot);
+        PartitionPublicationRefresher.refreshInitialPublicationMembership(
+                jdbc, postgresSourceConfig, discoveredRoutingState, publishViaPartitionRoot);
+    }
+
     @Override
     public Map<TableId, TableChange> discoverDataCollectionSchemas(JdbcSourceConfig sourceConfig) {
         final List<TableId> capturedTableIds = discoverDataCollections(sourceConfig);
+        final List<TableId> schemaTableIds = new ArrayList<>(capturedTableIds);
+        if (!routingState().isEmpty()) {
+            schemaTableIds.addAll(routingState().allParents());
+        }
 
         try (JdbcConnection jdbc = openJdbcConnection(sourceConfig)) {
             // fetch table schemas
-            Map<TableId, TableChange> tableSchemas = queryTableSchema(jdbc, capturedTableIds);
+            Map<TableId, TableChange> tableSchemas = queryTableSchema(jdbc, schemaTableIds);
             return tableSchemas;
         } catch (Exception e) {
             throw new FlinkRuntimeException(
@@ -211,7 +282,9 @@ public class PostgresDialect implements JdbcDataSourceDialect {
     @Override
     public TableChange queryTableSchema(JdbcConnection jdbc, TableId tableId) {
         if (schema == null) {
-            schema = new CustomPostgresSchema((PostgresConnection) jdbc, sourceConfig);
+            schema =
+                    new CustomPostgresSchema(
+                            (PostgresConnection) jdbc, sourceConfig, this::routingState);
         }
         return schema.getTableSchema(tableId);
     }
@@ -219,7 +292,9 @@ public class PostgresDialect implements JdbcDataSourceDialect {
     private Map<TableId, TableChange> queryTableSchema(
             JdbcConnection jdbc, List<TableId> tableIds) {
         if (schema == null) {
-            schema = new CustomPostgresSchema((PostgresConnection) jdbc, sourceConfig);
+            schema =
+                    new CustomPostgresSchema(
+                            (PostgresConnection) jdbc, sourceConfig, this::routingState);
         }
         return schema.getTableSchema(tableIds);
     }

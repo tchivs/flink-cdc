@@ -54,6 +54,9 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
 
     private boolean includePartitionedTables;
 
+    private boolean partitionPublicationRefreshEnabled =
+            PostgresSourceOptions.SCAN_PARTITION_PUBLICATION_REFRESH_ENABLED.defaultValue();
+
     private boolean includeDatabaseInTableId =
             PostgresSourceOptions.TABLE_ID_INCLUDE_DATABASE.defaultValue();
 
@@ -140,6 +143,7 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
                 lsnCommitCheckpointsDelay,
                 assignUnboundedChunkFirst,
                 includePartitionedTables,
+                partitionPublicationRefreshEnabled,
                 includeDatabaseInTableId);
     }
 
@@ -192,6 +196,11 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
     /** Enable include partitioned table. */
     public void setIncludePartitionedTables(boolean includePartitionedTables) {
         this.includePartitionedTables = includePartitionedTables;
+    }
+
+    /** Enable automatic partition publication membership refresh. */
+    public void setPartitionPublicationRefreshEnabled(boolean partitionPublicationRefreshEnabled) {
+        this.partitionPublicationRefreshEnabled = partitionPublicationRefreshEnabled;
     }
 
     /** Set whether to include database in the generated Table ID. */

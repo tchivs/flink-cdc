@@ -19,13 +19,20 @@ package org.apache.flink.cdc.connectors.postgres.source;
 
 import org.apache.flink.cdc.connectors.postgres.PostgresTestBase;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfigFactory;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionPublicationRefresher;
 import org.apache.flink.cdc.connectors.postgres.testutils.UniqueDatabase;
 
+import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.relational.TableId;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
 
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Properties;
 
 /** Tests for {@link PostgresDialect}. */
 class PostgresDialectTest extends PostgresTestBase {
@@ -50,6 +57,14 @@ class PostgresDialectTest extends PostgresTestBase {
             new UniqueDatabase(
                     POSTGRES_CONTAINER,
                     "postgres3",
+                    "inventory_partitioned",
+                    POSTGRES_CONTAINER.getUsername(),
+                    POSTGRES_CONTAINER.getPassword());
+
+    private final UniqueDatabase inventoryPartitionedPublicationDatabase =
+            new UniqueDatabase(
+                    POSTGRES_CONTAINER,
+                    "postgres4",
                     "inventory_partitioned",
                     POSTGRES_CONTAINER.getUsername(),
                     POSTGRES_CONTAINER.getPassword());
@@ -112,7 +127,170 @@ class PostgresDialectTest extends PostgresTestBase {
         List<TableId> tableIdsOfInventoryPartitionedDatabase =
                 dialectOfInventoryPartitionedDatabase.discoverDataCollections(
                         configFactoryOfInventoryPartitionedDatabase.create(0));
-        Assertions.assertThat(tableIdsOfInventoryPartitionedDatabase.get(0))
-                .hasToString("inventory_partitioned.products");
+        Assertions.assertThat(tableIdsOfInventoryPartitionedDatabase)
+                .extracting(TableId::toString)
+                .containsExactlyInAnyOrder(
+                        "inventory_partitioned.products_uk", "inventory_partitioned.products_us");
+        Assertions.assertThat(
+                        dialectOfInventoryPartitionedDatabase
+                                .routingState()
+                                .routeToLogicalTable(
+                                        new TableId(null, "inventory_partitioned", "products_uk")))
+                .isEqualTo(new TableId(null, "inventory_partitioned", "products"));
+    }
+
+    @Test
+    void testDiscoverDataCollectionsRejectsDecoderbufsWithPublishViaPartitionRoot()
+            throws Exception {
+        inventoryPartitionedPublicationDatabase.createAndInitialize();
+        createPublication("cdc_pub_pvpr", true);
+        createPublication("cdc_pub_child_identity", false);
+
+        PostgresSourceConfigFactory decoderbufsConfigFactory =
+                createPartitionedConfigFactory("decoderbufs", "cdc_pub_pvpr");
+        PostgresDialect decoderbufsDialect =
+                new PostgresDialect(decoderbufsConfigFactory.create(0));
+        Assertions.assertThatThrownBy(
+                        () ->
+                                decoderbufsDialect.discoverDataCollections(
+                                        decoderbufsConfigFactory.create(0)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(PartitionPublicationRefresher.ERR_PR_005)
+                .hasMessageContaining("decoding.plugin.name=decoderbufs")
+                .hasMessageContaining("publish_via_partition_root=true");
+
+        PostgresSourceConfigFactory pgoutputConfigFactory =
+                createPartitionedConfigFactory("pgoutput", "cdc_pub_pvpr");
+        PostgresDialect pgoutputDialect = new PostgresDialect(pgoutputConfigFactory.create(0));
+        Assertions.assertThat(
+                        pgoutputDialect.discoverDataCollections(pgoutputConfigFactory.create(0)))
+                .extracting(TableId::toString)
+                .containsExactlyInAnyOrder(
+                        "inventory_partitioned.products_uk", "inventory_partitioned.products_us");
+
+        PostgresSourceConfigFactory decoderbufsWithoutPvprConfigFactory =
+                createPartitionedConfigFactory("decoderbufs", "cdc_pub_child_identity");
+        PostgresDialect decoderbufsWithoutPvprDialect =
+                new PostgresDialect(decoderbufsWithoutPvprConfigFactory.create(0));
+        Assertions.assertThat(
+                        decoderbufsWithoutPvprDialect.discoverDataCollections(
+                                decoderbufsWithoutPvprConfigFactory.create(0)))
+                .extracting(TableId::toString)
+                .containsExactlyInAnyOrder(
+                        "inventory_partitioned.products_uk", "inventory_partitioned.products_us");
+    }
+
+    @Test
+    void testDiscoverDataCollectionsRejectsDecoderbufsWithFilteredPublicationMode() {
+        inventoryPartitionedPublicationDatabase.createAndInitialize();
+
+        PostgresSourceConfigFactory decoderbufsConfigFactory =
+                createPartitionedConfigFactory("decoderbufs", "cdc_pub_filtered");
+        Properties dbzProperties = new Properties();
+        dbzProperties.setProperty(
+                PostgresConnectorConfig.PUBLICATION_NAME.name(), "cdc_pub_filtered");
+        dbzProperties.setProperty(
+                PostgresConnectorConfig.PUBLICATION_AUTOCREATE_MODE.name(), "filtered");
+        decoderbufsConfigFactory.debeziumProperties(dbzProperties);
+        PostgresDialect decoderbufsDialect =
+                new PostgresDialect(decoderbufsConfigFactory.create(0));
+
+        Assertions.assertThatThrownBy(
+                        () ->
+                                decoderbufsDialect.discoverDataCollections(
+                                        decoderbufsConfigFactory.create(0)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(PartitionPublicationRefresher.ERR_PR_006)
+                .hasMessageContaining("decoding.plugin.name=decoderbufs")
+                .hasMessageContaining("debezium.publication.autocreate.mode=filtered")
+                .hasMessageContaining("inventory_partitioned.products")
+                .hasMessageContaining("Remediation");
+    }
+
+    @Test
+    void testDiscoverDataCollectionsRefreshesDisabledPublicationMembership() throws Exception {
+        inventoryPartitionedPublicationDatabase.createAndInitialize();
+        createEmptyPublication("cdc_pub_refresh");
+
+        PostgresSourceConfigFactory pgoutputConfigFactory =
+                createPartitionedConfigFactory("pgoutput", "cdc_pub_refresh");
+        pgoutputConfigFactory.setPartitionPublicationRefreshEnabled(true);
+        Properties dbzProperties = new Properties();
+        dbzProperties.setProperty(
+                PostgresConnectorConfig.PUBLICATION_NAME.name(), "cdc_pub_refresh");
+        dbzProperties.setProperty(
+                PostgresConnectorConfig.PUBLICATION_AUTOCREATE_MODE.name(), "disabled");
+        pgoutputConfigFactory.debeziumProperties(dbzProperties);
+
+        PostgresDialect pgoutputDialect = new PostgresDialect(pgoutputConfigFactory.create(0));
+        Assertions.assertThat(
+                        pgoutputDialect.discoverDataCollections(pgoutputConfigFactory.create(0)))
+                .extracting(TableId::toString)
+                .containsExactlyInAnyOrder(
+                        "inventory_partitioned.products_uk", "inventory_partitioned.products_us");
+        Assertions.assertThat(publicationTables("cdc_pub_refresh"))
+                .containsExactlyInAnyOrder(
+                        "inventory_partitioned.products_uk", "inventory_partitioned.products_us");
+    }
+
+    private PostgresSourceConfigFactory createPartitionedConfigFactory(
+            String pluginName, String publicationName) {
+        PostgresSourceConfigFactory configFactory =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedPublicationDatabase,
+                        "inventory_partitioned",
+                        "products",
+                        10);
+        configFactory.setIncludePartitionedTables(true);
+        configFactory.decodingPluginName(pluginName);
+        Properties dbzProperties = new Properties();
+        dbzProperties.setProperty(PostgresConnectorConfig.PUBLICATION_NAME.name(), publicationName);
+        configFactory.debeziumProperties(dbzProperties);
+        return configFactory;
+    }
+
+    private void createEmptyPublication(String publicationName) throws Exception {
+        try (Connection connection =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER,
+                                inventoryPartitionedPublicationDatabase.getDatabaseName());
+                Statement statement = connection.createStatement()) {
+            statement.execute(String.format("CREATE PUBLICATION %s", publicationName));
+        }
+    }
+
+    private void createPublication(String publicationName, boolean publishViaPartitionRoot)
+            throws Exception {
+        try (Connection connection =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER,
+                                inventoryPartitionedPublicationDatabase.getDatabaseName());
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    String.format(
+                            "CREATE PUBLICATION %s FOR TABLE inventory_partitioned.products "
+                                    + "WITH (publish_via_partition_root=%s)",
+                            publicationName, publishViaPartitionRoot));
+        }
+    }
+
+    private List<String> publicationTables(String publicationName) throws Exception {
+        try (Connection connection =
+                        getJdbcConnection(
+                                POSTGRES_CONTAINER,
+                                inventoryPartitionedPublicationDatabase.getDatabaseName());
+                Statement statement = connection.createStatement();
+                ResultSet rs =
+                        statement.executeQuery(
+                                String.format(
+                                        "SELECT schemaname, tablename FROM pg_publication_tables "
+                                                + "WHERE pubname = '%s'",
+                                        publicationName))) {
+            List<String> publicationTables = new ArrayList<>();
+            while (rs.next()) {
+                publicationTables.add(rs.getString("schemaname") + "." + rs.getString("tablename"));
+            }
+            return publicationTables;
+        }
     }
 }

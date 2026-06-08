@@ -321,6 +321,7 @@ public class PostgresStreamingChangeEventSource
                                     if (message.getOperation() != Operation.NOOP) {
                                         tableId = PostgresSchema.parse(message.getTable());
                                         Objects.requireNonNull(tableId);
+                                        beforeDispatchDataChangeEvent(tableId);
                                     }
 
                                     offsetContext.updateWalPosition(
@@ -376,6 +377,10 @@ public class PostgresStreamingChangeEventSource
                 connection.commit();
             }
         }
+    }
+
+    protected void beforeDispatchDataChangeEvent(TableId tableId) throws SQLException {
+        // Extension point for Flink CDC partition routing.
     }
 
     private void searchWalPosition(

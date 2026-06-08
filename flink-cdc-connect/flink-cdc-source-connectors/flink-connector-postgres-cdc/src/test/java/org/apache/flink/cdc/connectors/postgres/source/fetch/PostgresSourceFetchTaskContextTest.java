@@ -17,6 +17,11 @@
 
 package org.apache.flink.cdc.connectors.postgres.source.fetch;
 
+import org.apache.flink.cdc.connectors.postgres.source.PostgresDialect;
+import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
+import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfigFactory;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionAwareTableFilter;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionRoutingState;
 import org.apache.flink.cdc.connectors.postgres.testutils.TestHelper;
 
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
@@ -24,17 +29,24 @@ import io.debezium.connector.postgresql.PostgresOffsetContext;
 import io.debezium.connector.postgresql.SourceInfo;
 import io.debezium.connector.postgresql.connection.Lsn;
 import io.debezium.pipeline.spi.OffsetContext;
+import io.debezium.relational.TableId;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
 import static io.debezium.connector.postgresql.Utils.lastKnownLsn;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** Unit test for {@link PostgresSourceFetchTaskContext}. */
 class PostgresSourceFetchTaskContextTest {
+
+    private static final TableId PARENT = new TableId(null, "public", "orders");
+    private static final TableId CHILD = new TableId(null, "public", "orders_2025");
+    private static final TableId RUNTIME_CHILD = new TableId(null, "public", "orders_2026");
 
     private PostgresConnectorConfig connectorConfig;
     private OffsetContext.Loader<PostgresOffsetContext> offsetLoader;
@@ -54,5 +66,100 @@ class PostgresSourceFetchTaskContextTest {
 
         final PostgresOffsetContext offsetContext = offsetLoader.load(offsetValues);
         Assertions.assertThat(lastKnownLsn(offsetContext)).isEqualTo(Lsn.valueOf(12345L));
+    }
+
+    @Test
+    void installsSharedPartitionAwareFilterBeforeRuntimeObjectsAreCreated() {
+        PostgresSourceConfig sourceConfig = sourceConfig();
+        PostgresDialect dialect = new PostgresDialect(sourceConfig);
+        dialect.compareAndSetRoutingState(
+                PartitionRoutingState.EMPTY,
+                PartitionRoutingState.of(
+                        Collections.singletonMap(PARENT, Collections.singletonList(CHILD))));
+
+        PostgresSourceFetchTaskContext context =
+                new PostgresSourceFetchTaskContext(sourceConfig, dialect);
+        PostgresConnectorConfig partitionAwareConfig =
+                context.installPartitionAwareConfig(sourceConfig.getDbzConnectorConfig());
+
+        assertThat(sourceConfig.getTableFilters().dataCollectionFilter().isIncluded(CHILD))
+                .isFalse();
+        assertThat(context.getTableFilter()).isInstanceOf(PartitionAwareTableFilter.class);
+        assertThat(partitionAwareConfig.getTableFilters().dataCollectionFilter())
+                .isSameAs(context.getTableFilter());
+        assertThat(context.getDbzConnectorConfig().getTableFilters().dataCollectionFilter())
+                .isSameAs(context.getTableFilter());
+        assertThat(context.getTableFilter().isIncluded(CHILD)).isTrue();
+        assertThat(context.getTableIdRouter().route(CHILD)).isEqualTo(PARENT);
+    }
+
+    @Test
+    void mergesPgoutputRuntimeChildBeforeRelationFilterUsesRoutingState() {
+        PostgresSourceConfig sourceConfig = sourceConfig();
+        PostgresDialect dialect = new PostgresDialect(sourceConfig);
+        dialect.compareAndSetRoutingState(
+                PartitionRoutingState.EMPTY,
+                PartitionRoutingState.of(
+                        Collections.singletonMap(PARENT, Collections.singletonList(CHILD))));
+        PostgresSourceFetchTaskContext context =
+                new PostgresSourceFetchTaskContext(sourceConfig, dialect);
+        context.installPartitionAwareConfig(sourceConfig.getDbzConnectorConfig());
+
+        assertThat(context.getTableFilter().isIncluded(RUNTIME_CHILD)).isFalse();
+
+        context.mergePgoutputRuntimeChild(RUNTIME_CHILD, PARENT);
+
+        assertThat(dialect.routingState().containsChild(RUNTIME_CHILD)).isTrue();
+        assertThat(dialect.routingState().routeToLogicalTable(RUNTIME_CHILD)).isEqualTo(PARENT);
+        assertThat(context.getTableFilter().isIncluded(RUNTIME_CHILD)).isTrue();
+        assertThat(context.getTableIdRouter().route(RUNTIME_CHILD)).isEqualTo(PARENT);
+    }
+
+    @Test
+    void ignoresRuntimeChildWhenParentIsNotCaptured() {
+        PostgresSourceConfig sourceConfig = sourceConfig();
+        PostgresDialect dialect = new PostgresDialect(sourceConfig);
+        dialect.compareAndSetRoutingState(
+                PartitionRoutingState.EMPTY,
+                PartitionRoutingState.of(
+                        Collections.singletonMap(PARENT, Collections.singletonList(CHILD))));
+        PostgresSourceFetchTaskContext context =
+                new PostgresSourceFetchTaskContext(sourceConfig, dialect);
+        context.installPartitionAwareConfig(sourceConfig.getDbzConnectorConfig());
+
+        context.mergePgoutputRuntimeChild(
+                new TableId(null, "public", "customers_2026"),
+                new TableId(null, "public", "customers"));
+
+        assertThat(dialect.routingState().allChildren()).containsExactly(CHILD);
+    }
+
+    @Test
+    void sourceConfigCarriesPublicationRefreshOption() {
+        PostgresSourceConfigFactory configFactory = new PostgresSourceConfigFactory();
+        configFactory.hostname("localhost");
+        configFactory.port(5432);
+        configFactory.username("postgres");
+        configFactory.password("postgres");
+        configFactory.database("postgres");
+        configFactory.schemaList(new String[] {"public"});
+        configFactory.tableList("public.orders");
+        configFactory.setPartitionPublicationRefreshEnabled(true);
+
+        assertThat(configFactory.create(0).partitionPublicationRefreshEnabled()).isTrue();
+    }
+
+    private static PostgresSourceConfig sourceConfig() {
+        PostgresSourceConfigFactory configFactory = new PostgresSourceConfigFactory();
+        configFactory.hostname("localhost");
+        configFactory.port(5432);
+        configFactory.username("postgres");
+        configFactory.password("postgres");
+        configFactory.database("postgres");
+        configFactory.schemaList(new String[] {"public"});
+        configFactory.tableList("public.orders");
+        configFactory.decodingPluginName("pgoutput");
+        configFactory.setIncludePartitionedTables(true);
+        return configFactory.create(0);
     }
 }

@@ -26,6 +26,8 @@ import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.schema.TopicSelector;
 
+import java.util.function.Consumer;
+
 /**
  * Extends PostgresSchema to dispatch Relation messages as schema change events via the event queue
  * and expose buildAndRegisterSchema as public.
@@ -33,6 +35,7 @@ import io.debezium.schema.TopicSelector;
 public class RelationAwarePostgresSchema extends PostgresSchema {
 
     private SchemaDispatcher dispatcher;
+    private Consumer<Table> relationListener;
 
     public RelationAwarePostgresSchema(
             PostgresConnectorConfig config,
@@ -47,8 +50,15 @@ public class RelationAwarePostgresSchema extends PostgresSchema {
         this.dispatcher = dispatcher;
     }
 
+    public void setRelationListener(Consumer<Table> relationListener) {
+        this.relationListener = relationListener;
+    }
+
     @Override
     public void applySchemaChangesForTable(int relationId, Table table) {
+        if (relationListener != null) {
+            relationListener.accept(table);
+        }
         super.applySchemaChangesForTable(relationId, table);
         if (dispatcher != null && !isFilteredOut(table.id())) {
             dispatcher.dispatch(table);

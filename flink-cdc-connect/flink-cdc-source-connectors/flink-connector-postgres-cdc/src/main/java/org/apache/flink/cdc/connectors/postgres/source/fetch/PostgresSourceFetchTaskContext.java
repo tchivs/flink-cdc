@@ -32,6 +32,11 @@ import org.apache.flink.cdc.connectors.postgres.source.offset.PostgresOffsetUtil
 import org.apache.flink.cdc.connectors.postgres.source.schema.PostgresSchemaRecord;
 import org.apache.flink.cdc.connectors.postgres.source.schema.RelationAwarePostgresSchema;
 import org.apache.flink.cdc.connectors.postgres.source.utils.ChunkUtils;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionAwarePostgresConnectorConfig;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionCatalog;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionPublicationRefresher;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionRoutingState;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresTableIdRouter;
 import org.apache.flink.table.types.logical.RowType;
 
 import io.debezium.DebeziumException;
@@ -70,6 +75,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.sql.SQLException;
+import java.util.Collections;
 
 import static io.debezium.connector.AbstractSourceInfo.SCHEMA_NAME_KEY;
 import static io.debezium.connector.AbstractSourceInfo.TABLE_NAME_KEY;
@@ -99,6 +105,8 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
     private EventMetadataProvider metadataProvider;
     private SnapshotChangeEventSourceMetrics<PostgresPartition> snapshotChangeEventSourceMetrics;
     private Snapshotter snapShotter;
+    private PostgresTableIdRouter tableIdRouter = PostgresTableIdRouter.empty();
+    private Tables.TableFilter tableFilter;
 
     public PostgresSourceFetchTaskContext(
             JdbcSourceConfig sourceConfig, PostgresDialect dataSourceDialect) {
@@ -168,6 +176,7 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
                                     .build());
         }
         setDbzConnectorConfig(dbzConfig);
+        dbzConfig = installPartitionAwareConfig(dbzConfig);
         PostgresConnectorConfig.SnapshotMode snapshotMode =
                 PostgresConnectorConfig.SnapshotMode.parse(
                         dbzConfig.getConfig().getString(SNAPSHOT_MODE));
@@ -193,6 +202,7 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
         } catch (SQLException e) {
             throw new RuntimeException("Failed to initialize PostgresSchema", e);
         }
+        schema.setRelationListener(this::discoverPgoutputRuntimeChild);
 
         this.offsetContext =
                 loadStartingOffsetState(
@@ -233,7 +243,7 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
                         topicSelector,
                         schema,
                         queue,
-                        finalDbzConfig.getTableFilters().dataCollectionFilter(),
+                        tableFilter,
                         DataChangeEvent::new,
                         metadataProvider,
                         new HeartbeatFactory<>(
@@ -267,7 +277,8 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
                                             break;
                                     }
                                 }),
-                        schemaNameAdjuster);
+                        schemaNameAdjuster,
+                        tableIdRouter);
         schema.setDispatcher(postgresDispatcher);
 
         ChangeEventSourceMetricsFactory<PostgresPartition> metricsFactory =
@@ -319,7 +330,9 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
 
     @Override
     public Tables.TableFilter getTableFilter() {
-        return getDbzConnectorConfig().getTableFilters().dataCollectionFilter();
+        return tableFilter == null
+                ? getDbzConnectorConfig().getTableFilters().dataCollectionFilter()
+                : tableFilter;
     }
 
     @Override
@@ -359,6 +372,84 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
 
     public ReplicationConnection getReplicationConnection() {
         return replicationConnection;
+    }
+
+    public PostgresTableIdRouter getTableIdRouter() {
+        return tableIdRouter;
+    }
+
+    PostgresConnectorConfig installPartitionAwareConfig(PostgresConnectorConfig dbzConfig) {
+        this.tableIdRouter =
+                PostgresTableIdRouter.of(
+                        () -> ((PostgresDialect) dataSourceDialect).routingState());
+        PostgresConnectorConfig partitionAwareConfig =
+                PartitionAwarePostgresConnectorConfig.wrap(
+                        dbzConfig, () -> ((PostgresDialect) dataSourceDialect).routingState());
+        setDbzConnectorConfig(partitionAwareConfig);
+        this.tableFilter = partitionAwareConfig.getTableFilters().dataCollectionFilter();
+        return partitionAwareConfig;
+    }
+
+    void discoverPgoutputRuntimeChild(Table table) {
+        if (!"pgoutput".equalsIgnoreCase(getPluginName())
+                || tableIdRouter.isKnownChild(table.id())) {
+            return;
+        }
+        PartitionRoutingState currentState = ((PostgresDialect) dataSourceDialect).routingState();
+        if (currentState == null || currentState.isEmpty()) {
+            return;
+        }
+        TableId parent;
+        try {
+            parent = PartitionCatalog.resolveParent(jdbcConnection, table.id());
+        } catch (SQLException e) {
+            throw new RuntimeException(
+                    "Unable to resolve PostgreSQL partition parent for " + table.id(), e);
+        }
+        mergePgoutputRuntimeChild(table.id(), parent);
+    }
+
+    void mergePgoutputRuntimeChild(TableId childTableId, TableId parent) {
+        PartitionRoutingState currentState = ((PostgresDialect) dataSourceDialect).routingState();
+        if (parent == null || currentState == null || !currentState.containsParent(parent)) {
+            return;
+        }
+        for (int attempts = 0; attempts < 3; attempts++) {
+            PartitionRoutingState previousState =
+                    ((PostgresDialect) dataSourceDialect).routingState();
+            PartitionRoutingState nextState =
+                    previousState.merge(
+                            Collections.singletonMap(
+                                    parent, Collections.singletonList(childTableId)));
+            if (nextState.equals(previousState)
+                    || ((PostgresDialect) dataSourceDialect)
+                            .compareAndSetRoutingState(previousState, nextState)) {
+                refreshRuntimeChildPublication(childTableId);
+                return;
+            }
+        }
+        throw new IllegalStateException(
+                "Unable to publish PostgreSQL partition routing state for runtime child "
+                        + childTableId);
+    }
+
+    private void refreshRuntimeChildPublication(TableId childTableId) {
+        PostgresSourceConfig postgresSourceConfig = (PostgresSourceConfig) sourceConfig;
+        if (!postgresSourceConfig.partitionPublicationRefreshEnabled()) {
+            return;
+        }
+        try {
+            PartitionPublicationRefresher.refreshPublication(
+                    jdbcConnection,
+                    postgresSourceConfig.getDbzConnectorConfig().publicationName(),
+                    Collections.singletonList(childTableId),
+                    true);
+        } catch (SQLException e) {
+            throw new RuntimeException(
+                    "Unable to refresh PostgreSQL publication membership for runtime child "
+                            + childTableId,
+                    e);
+        }
     }
 
     public SnapshotChangeEventSourceMetrics<PostgresPartition>
