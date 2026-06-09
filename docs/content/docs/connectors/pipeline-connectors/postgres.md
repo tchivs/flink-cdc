@@ -166,7 +166,7 @@ pipeline:
       <td>optional</td>
       <td style="word-wrap: break-word;">initial</td>
       <td>String</td>
-      <td> Optional startup mode for Postgres CDC consumer, valid enumerations are "initial"，"latest-offset"，"committed-offset"or"snapshot"。</td>
+      <td>Optional startup mode for Postgres CDC consumer, valid enumerations are "initial", "latest-offset", "committed-offset" and "snapshot".</td>
     </tr>
   <tr>
       <td>scan.incremental.close-idle-reader.enabled</td>
@@ -268,7 +268,7 @@ pipeline:
       <td style="word-wrap: break-word;">false</td>
       <td>Boolean</td>
       <td>
-        Whether to discover child partitions for captured partitioned tables and route emitted records to the partition root table.<br>
+        Whether to discover physical child partitions for captured partitioned tables, use the child partitions for snapshot splitting and log capture, and route emitted records to the partition root table.<br>
         If enabled, configure either partition parent tables or child partition tables in the table list, but not both.
       </td>
     </tr>
@@ -279,8 +279,9 @@ pipeline:
       <td>Boolean</td>
       <td>
         Whether to automatically add discovered child partition tables to the configured PostgreSQL publication.<br>
-        This option is only valid when <code>scan.include-partitioned-tables.enabled</code> is true, <code>decoding.plugin.name</code> is <code>pgoutput</code>, and the startup mode is not <code>snapshot</code>.<br>
-        The connector user must have privileges to alter the publication. If disabled, child partition tables must already be included in the publication unless <code>debezium.publication.autocreate.mode</code> manages the publication membership.
+        This option is valid only when <code>scan.include-partitioned-tables.enabled</code> is true, <code>decoding.plugin.name</code> is <code>pgoutput</code>, <code>scan.startup.mode</code> is not <code>snapshot</code>, and <code>debezium.publication.autocreate.mode</code> is not <code>all_tables</code>.<br>
+        When <code>debezium.publication.autocreate.mode</code> is <code>disabled</code>, the connector adds missing child partition tables to the existing publication and the connector user must have privileges to alter the publication. When this option is disabled in <code>disabled</code> mode, child partition tables must already be included in the publication.<br>
+        When <code>debezium.publication.autocreate.mode</code> is <code>filtered</code>, Debezium creates or updates the publication membership from the connector table filter and connector-side publication refresh is not required.
       </td>
     </tr>
     <tr>
@@ -302,7 +303,7 @@ pipeline:
 
 Note:
 1. The configuration option tables specifies the tables to be captured by Postgres CDC, in the format db.schema1.table1,db.schema2.table2. All db values must be the same, as the PostgreSQL connection URL requires a single database name. Currently, CDC only supports connecting to one database.
-2. When `scan.include-partitioned-tables.enabled` is enabled, captured partition parents are expanded to physical child partition tables for snapshot splitting, while emitted records and create-table events use the partition root table identity.
+2. When `scan.include-partitioned-tables.enabled` is enabled, captured partition parents are expanded to physical child partition tables for snapshot splitting and log capture, while emitted records and create-table events use the partition root table identity.
 
 ## Startup Reading Position
 

@@ -283,7 +283,7 @@ SELECT * FROM shipments;
       <td style="word-wrap: break-word;">false</td>
       <td>Boolean</td>
       <td>
-        Whether to discover child partitions for captured partitioned tables and route emitted records to the partition root table.<br>
+        Whether to discover physical child partitions for captured partitioned tables, use the child partitions for snapshot splitting and log capture, and route emitted records to the partition root table.<br>
         If enabled, configure either partition parent tables or child partition tables in the table list, but not both.
       </td>
     </tr>
@@ -294,8 +294,9 @@ SELECT * FROM shipments;
       <td>Boolean</td>
       <td>
         Whether to automatically add discovered child partition tables to the configured PostgreSQL publication.<br>
-        This option is only valid when <code>scan.include-partitioned-tables.enabled</code> is true, <code>decoding.plugin.name</code> is <code>pgoutput</code>, and the startup mode is not <code>snapshot</code>.<br>
-        The connector user must have privileges to alter the publication. If disabled, child partition tables must already be included in the publication unless <code>debezium.publication.autocreate.mode</code> manages the publication membership.
+        This option is valid only when <code>scan.include-partitioned-tables.enabled</code> is true, <code>decoding.plugin.name</code> is <code>pgoutput</code>, <code>scan.startup.mode</code> is not <code>snapshot</code>, and <code>debezium.publication.autocreate.mode</code> is not <code>all_tables</code>.<br>
+        When <code>debezium.publication.autocreate.mode</code> is <code>disabled</code>, the connector adds missing child partition tables to the existing publication and the connector user must have privileges to alter the publication. When this option is disabled in <code>disabled</code> mode, child partition tables must already be included in the publication.<br>
+        When <code>debezium.publication.autocreate.mode</code> is <code>filtered</code>, Debezium creates or updates the publication membership from the connector table filter and connector-side publication refresh is not required.
       </td>
     </tr>
     </tbody>
