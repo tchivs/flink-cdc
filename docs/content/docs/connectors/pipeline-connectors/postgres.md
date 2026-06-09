@@ -263,6 +263,27 @@ pipeline:
       </td>
     </tr>
     <tr>
+      <td>scan.include-partitioned-tables.enabled</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">false</td>
+      <td>Boolean</td>
+      <td>
+        Whether to discover child partitions for captured partitioned tables and route emitted records to the partition root table.<br>
+        If enabled, configure either partition parent tables or child partition tables in the table list, but not both.
+      </td>
+    </tr>
+    <tr>
+      <td>scan.partition.publication.refresh.enabled</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">false</td>
+      <td>Boolean</td>
+      <td>
+        Whether to automatically add discovered child partition tables to the configured PostgreSQL publication.<br>
+        This option is only valid when <code>scan.include-partitioned-tables.enabled</code> is true, <code>decoding.plugin.name</code> is <code>pgoutput</code>, and the startup mode is not <code>snapshot</code>.<br>
+        The connector user must have privileges to alter the publication. If disabled, child partition tables must already be included in the publication unless <code>debezium.publication.autocreate.mode</code> manages the publication membership.
+      </td>
+    </tr>
+    <tr>
       <td>table-id.include-database</td>
       <td>optional</td>
       <td style="word-wrap: break-word;">false</td>
@@ -281,6 +302,7 @@ pipeline:
 
 Note:
 1. The configuration option tables specifies the tables to be captured by Postgres CDC, in the format db.schema1.table1,db.schema2.table2. All db values must be the same, as the PostgreSQL connection URL requires a single database name. Currently, CDC only supports connecting to one database.
+2. When `scan.include-partitioned-tables.enabled` is enabled, captured partition parents are expanded to physical child partition tables for snapshot splitting, while emitted records and create-table events use the partition root table identity.
 
 ## Startup Reading Position
 

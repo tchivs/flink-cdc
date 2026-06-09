@@ -271,6 +271,27 @@ pipeline:
       </td>
     </tr>
     <tr>
+      <td>scan.include-partitioned-tables.enabled</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">false</td>
+      <td>Boolean</td>
+      <td>
+        是否发现被捕获分区表的子分区，并将输出记录路由到分区根表。<br>
+        开启后，表列表中只能配置分区父表或子分区表其中一种，不能同时配置父表和子分区表。
+      </td>
+    </tr>
+    <tr>
+      <td>scan.partition.publication.refresh.enabled</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">false</td>
+      <td>Boolean</td>
+      <td>
+        是否自动把发现的子分区表添加到配置的 PostgreSQL publication 中。<br>
+        该选项仅在 <code>scan.include-partitioned-tables.enabled</code> 为 true、<code>decoding.plugin.name</code> 为 <code>pgoutput</code>，且启动模式不是 <code>snapshot</code> 时有效。<br>
+        连接器用户必须具备修改 publication 的权限。未开启该选项时，除非 <code>debezium.publication.autocreate.mode</code> 管理 publication 成员，否则子分区表必须已包含在 publication 中。
+      </td>
+    </tr>
+    <tr>
       <td>table-id.include-database</td>
       <td>optional</td>
       <td style="word-wrap: break-word;">false</td>
@@ -288,6 +309,7 @@ pipeline:
 
 注意：
 1. 配置选项`tables`指定 Postgres CDC 需要采集的表，格式为`db.schema1.tabe1,db.schema2.table2`,其中所有的db需要为同一个db，这是因为postgres链接url中需要指定dbname，目前cdc只支持链接一个db。
+2. 开启 `scan.include-partitioned-tables.enabled` 后，被捕获的分区父表会展开成物理子分区表用于快照切分，但输出记录和建表事件会使用分区根表标识。
 
 ## 启动模式
 

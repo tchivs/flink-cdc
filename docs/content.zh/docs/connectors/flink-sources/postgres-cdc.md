@@ -286,10 +286,19 @@ Connector Options
       <td style="word-wrap: break-word;">false</td>
       <td>Boolean</td>
       <td>
-        Whether to enable reading partitioned tables via partition root.<br>
-        If enabled:
-          (1) PUBLICATION must be created beforehand with parameter publish_via_partition_root=true
-          (2) Table list (regex or predefined list) should only match the parent table name, if table list matches both parent and child tables, snapshot data will be read twice.
+        是否发现被捕获分区表的子分区，并将输出记录路由到分区根表。<br>
+        开启后，表列表中只能配置分区父表或子分区表其中一种，不能同时配置父表和子分区表。
+      </td>
+    </tr>
+    <tr>
+      <td>scan.partition.publication.refresh.enabled</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">false</td>
+      <td>Boolean</td>
+      <td>
+        是否自动把发现的子分区表添加到配置的 PostgreSQL publication 中。<br>
+        该选项仅在 <code>scan.include-partitioned-tables.enabled</code> 为 true、<code>decoding.plugin.name</code> 为 <code>pgoutput</code>，且启动模式不是 <code>snapshot</code> 时有效。<br>
+        连接器用户必须具备修改 publication 的权限。未开启该选项时，除非 <code>debezium.publication.autocreate.mode</code> 管理 publication 成员，否则子分区表必须已包含在 publication 中。
       </td>
     </tr>
     </tbody>

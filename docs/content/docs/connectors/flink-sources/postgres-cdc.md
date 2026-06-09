@@ -283,10 +283,19 @@ SELECT * FROM shipments;
       <td style="word-wrap: break-word;">false</td>
       <td>Boolean</td>
       <td>
-        Whether to enable reading partitioned tables via partition root.<br>
-        If enabled:
-          (1) PUBLICATION must be created beforehand with parameter publish_via_partition_root=true
-          (2) Table list (regex or predefined list) should only match the parent table name, if table list matches both parent and child tables, snapshot data will be read twice.
+        Whether to discover child partitions for captured partitioned tables and route emitted records to the partition root table.<br>
+        If enabled, configure either partition parent tables or child partition tables in the table list, but not both.
+      </td>
+    </tr>
+    <tr>
+      <td>scan.partition.publication.refresh.enabled</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">false</td>
+      <td>Boolean</td>
+      <td>
+        Whether to automatically add discovered child partition tables to the configured PostgreSQL publication.<br>
+        This option is only valid when <code>scan.include-partitioned-tables.enabled</code> is true, <code>decoding.plugin.name</code> is <code>pgoutput</code>, and the startup mode is not <code>snapshot</code>.<br>
+        The connector user must have privileges to alter the publication. If disabled, child partition tables must already be included in the publication unless <code>debezium.publication.autocreate.mode</code> manages the publication membership.
       </td>
     </tr>
     </tbody>
