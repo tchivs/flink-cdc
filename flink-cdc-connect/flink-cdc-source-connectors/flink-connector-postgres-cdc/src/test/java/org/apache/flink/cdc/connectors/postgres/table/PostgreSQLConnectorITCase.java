@@ -36,6 +36,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.containers.output.Slf4jLogConsumer;
@@ -49,7 +51,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
+import java.util.UUID;
 import java.util.concurrent.ExecutionException;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.testcontainers.containers.PostgreSQLContainer.POSTGRESQL_PORT;
@@ -86,6 +90,23 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
     @RegisterExtension
     public static StaticExternalResourceProxy<LegacyRowResource> usesLegacyRows =
             new StaticExternalResourceProxy<>(LegacyRowResource.INSTANCE);
+
+    private static final String[] PARTITIONED_PRODUCTS_SNAPSHOT_ROWS = {
+        "101,scooter,Small 2-wheel scooter,3.140,us",
+        "102,car battery,12V car battery,8.100,us",
+        "103,12-pack drill bits,12-pack of drill bits with sizes ranging from #40 to #3,0.800,us",
+        "104,hammer,12oz carpenter's hammer,0.750,us",
+        "105,hammer,14oz carpenter's hammer,0.875,us",
+        "106,hammer,16oz carpenter's hammer,1.000,uk",
+        "107,rocks,box of assorted rocks,5.300,uk",
+        "108,jacket,water resistent black wind breaker,0.100,uk",
+        "109,spare tire,24 inch spare tire,22.200,uk"
+    };
+
+    private static final String[] PARTITIONED_PRODUCTS_STREAM_ROWS = {
+        "110,jacket,water resistent white wind breaker,0.200,us",
+        "111,scooter,Big 2-wheel scooter ,5.180,uk"
+    };
 
     @BeforeAll
     static void startContainers() throws Exception {
@@ -272,9 +293,11 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
                                 + " 'schema-name' = '%s',"
                                 + " 'table-name' = '%s',"
                                 + " 'scan.incremental.snapshot.enabled' = '%s',"
+                                + " 'scan.incremental.snapshot.backfill.skip' = 'true',"
                                 + " 'scan.include-partitioned-tables.enabled' = 'true',"
                                 + " 'decoding.plugin.name' = 'pgoutput', "
                                 + " 'debezium.publication.name'  = '%s',"
+                                + " 'debezium.publication.autocreate.mode' = 'disabled',"
                                 + " 'slot.name' = '%s'"
                                 + ")",
                         POSTGRES_CONTAINER.getHost(),
@@ -351,6 +374,237 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
         Assertions.assertThat(actual).containsExactlyInAnyOrder(expected);
 
         result.getJobClient().get().cancel().get();
+    }
+
+    @Test
+    void testPartitionedTableWithoutPublishViaPartitionRoot()
+            throws SQLException, ExecutionException, InterruptedException {
+        setup(true);
+        initializePostgresTable(POSTGRES_CONTAINER, "inventory_partitioned");
+        String publicationName = "dbz_pub_no_root_" + new Random().nextInt(1000);
+        String slotName = getSlotName();
+
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    String.format(
+                            "CREATE PUBLICATION %s FOR TABLE "
+                                    + "inventory_partitioned.products_us, "
+                                    + "inventory_partitioned.products_uk",
+                            publicationName));
+            statement.execute(
+                    String.format(
+                            "select pg_create_logical_replication_slot('%s','pgoutput');",
+                            slotName));
+        }
+
+        String sourceDDL =
+                String.format(
+                        "CREATE TABLE debezium_source ("
+                                + " id INT NOT NULL,"
+                                + " name STRING,"
+                                + " description STRING,"
+                                + " weight DECIMAL(10,3),"
+                                + " country STRING"
+                                + ") WITH ("
+                                + " 'connector' = 'postgres-cdc',"
+                                + " 'hostname' = '%s',"
+                                + " 'port' = '%s',"
+                                + " 'username' = '%s',"
+                                + " 'password' = '%s',"
+                                + " 'database-name' = '%s',"
+                                + " 'schema-name' = '%s',"
+                                + " 'table-name' = '%s',"
+                                + " 'scan.incremental.snapshot.enabled' = 'true',"
+                                + " 'scan.incremental.snapshot.backfill.skip' = 'true',"
+                                + " 'scan.include-partitioned-tables.enabled' = 'true',"
+                                + " 'decoding.plugin.name' = 'pgoutput', "
+                                + " 'debezium.publication.name'  = '%s',"
+                                + " 'debezium.publication.autocreate.mode' = 'disabled',"
+                                + " 'slot.name' = '%s'"
+                                + ")",
+                        POSTGRES_CONTAINER.getHost(),
+                        POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT),
+                        POSTGRES_CONTAINER.getUsername(),
+                        POSTGRES_CONTAINER.getPassword(),
+                        POSTGRES_CONTAINER.getDatabaseName(),
+                        "inventory_partitioned",
+                        "products",
+                        publicationName,
+                        slotName);
+        String sinkDDL =
+                "CREATE TABLE sink ("
+                        + " id INT NOT NULL,"
+                        + " name STRING,"
+                        + " description STRING,"
+                        + " weight DECIMAL(10,3),"
+                        + " country STRING,"
+                        + " PRIMARY KEY (id, country) NOT ENFORCED"
+                        + ") WITH ("
+                        + " 'connector' = 'values',"
+                        + " 'sink-insert-only' = 'false',"
+                        + " 'sink-expected-messages-num' = '20'"
+                        + ")";
+        tEnv.executeSql(sourceDDL);
+        tEnv.executeSql(sinkDDL);
+
+        TableResult result =
+                tEnv.executeSql(
+                        "INSERT INTO sink SELECT id, name, description, weight, country FROM debezium_source");
+
+        waitForSnapshotStarted("sink");
+        Thread.sleep(5000);
+
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "INSERT INTO inventory_partitioned.products VALUES "
+                            + "(default,'vest','warm vest',1.5, 'us');");
+            statement.execute(
+                    "INSERT INTO inventory_partitioned.products VALUES "
+                            + "(default,'gloves','leather gloves',0.6, 'uk');");
+        }
+
+        String[] expected =
+                new String[] {
+                    "101,scooter,Small 2-wheel scooter,3.140,us",
+                    "102,car battery,12V car battery,8.100,us",
+                    "103,12-pack drill bits,12-pack of drill bits with sizes ranging from #40 to #3,0.800,us",
+                    "104,hammer,12oz carpenter's hammer,0.750,us",
+                    "105,hammer,14oz carpenter's hammer,0.875,us",
+                    "106,hammer,16oz carpenter's hammer,1.000,uk",
+                    "107,rocks,box of assorted rocks,5.300,uk",
+                    "108,jacket,water resistent black wind breaker,0.100,uk",
+                    "109,spare tire,24 inch spare tire,22.200,uk",
+                    "110,vest,warm vest,1.500,us",
+                    "111,gloves,leather gloves,0.600,uk"
+                };
+
+        waitForSinkResult("sink", Arrays.asList(expected));
+
+        List<String> actual = TestValuesTableFactory.getResultsAsStrings("sink");
+        Assertions.assertThat(actual).containsExactlyInAnyOrder(expected);
+
+        result.getJobClient().get().cancel().get();
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("partitionPublicationAndStartupModes")
+    void testPartitionedTablePublicationAutocreateModeAndStartupMode(
+            PartitionedTablePublicationScenario scenario)
+            throws SQLException, ExecutionException, InterruptedException {
+        setup(true);
+        initializePostgresTable(POSTGRES_CONTAINER, "inventory_partitioned");
+        String publicationName =
+                "dbz_pub_matrix_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+        String slotName =
+                "flink_matrix_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+
+        if (scenario.createEmptyPublication) {
+            try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                    Statement statement = connection.createStatement()) {
+                statement.execute(String.format("CREATE PUBLICATION %s", publicationName));
+            }
+        }
+
+        String sourceDDL =
+                String.format(
+                        "CREATE TABLE debezium_source ("
+                                + " id INT NOT NULL,"
+                                + " name STRING,"
+                                + " description STRING,"
+                                + " weight DECIMAL(10,3),"
+                                + " country STRING"
+                                + ") WITH ("
+                                + " 'connector' = 'postgres-cdc',"
+                                + " 'hostname' = '%s',"
+                                + " 'port' = '%s',"
+                                + " 'username' = '%s',"
+                                + " 'password' = '%s',"
+                                + " 'database-name' = '%s',"
+                                + " 'schema-name' = '%s',"
+                                + " 'table-name' = '%s',"
+                                + " 'scan.incremental.snapshot.enabled' = 'true',"
+                                + " 'scan.incremental.snapshot.backfill.skip' = 'true',"
+                                + " 'scan.include-partitioned-tables.enabled' = 'true',"
+                                + " 'scan.startup.mode' = '%s',"
+                                + " 'decoding.plugin.name' = 'pgoutput', "
+                                + " 'debezium.publication.name'  = '%s',"
+                                + " 'debezium.publication.autocreate.mode' = '%s',"
+                                + " 'scan.partition.publication.refresh.enabled' = '%s',"
+                                + " 'slot.name' = '%s'"
+                                + ")",
+                        POSTGRES_CONTAINER.getHost(),
+                        POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT),
+                        POSTGRES_CONTAINER.getUsername(),
+                        POSTGRES_CONTAINER.getPassword(),
+                        POSTGRES_CONTAINER.getDatabaseName(),
+                        "inventory_partitioned",
+                        "products",
+                        scenario.startupMode,
+                        publicationName,
+                        scenario.publicationAutocreateMode,
+                        scenario.partitionPublicationRefreshEnabled,
+                        slotName);
+        String sinkDDL =
+                "CREATE TABLE sink ("
+                        + " id INT NOT NULL,"
+                        + " name STRING,"
+                        + " description STRING,"
+                        + " weight DECIMAL(10,3),"
+                        + " country STRING,"
+                        + " PRIMARY KEY (id, country) NOT ENFORCED"
+                        + ") WITH ("
+                        + " 'connector' = 'values',"
+                        + " 'sink-insert-only' = 'false',"
+                        + " 'sink-expected-messages-num' = '20'"
+                        + ")";
+        tEnv.executeSql(sourceDDL);
+        tEnv.executeSql(sinkDDL);
+
+        TableResult result =
+                tEnv.executeSql(
+                        "INSERT INTO sink SELECT id, name, description, weight, country FROM debezium_source");
+
+        if ("initial".equals(scenario.startupMode)) {
+            waitForSnapshotStarted("sink");
+        } else {
+            Thread.sleep(10000L);
+        }
+
+        insertPartitionedProductsStreamRows();
+
+        List<String> expected = scenario.expectedRows();
+        waitForSinkResult("sink", expected);
+
+        List<String> actual = TestValuesTableFactory.getResultsAsStrings("sink");
+        Assertions.assertThat(actual).containsExactlyInAnyOrderElementsOf(expected);
+
+        result.getJobClient().get().cancel().get();
+    }
+
+    static Stream<Arguments> partitionPublicationAndStartupModes() {
+        return Stream.of(
+                Arguments.of(
+                        new PartitionedTablePublicationScenario(
+                                "filtered_initial", "filtered", "initial", false, false)),
+                Arguments.of(
+                        new PartitionedTablePublicationScenario(
+                                "filtered_latest_offset",
+                                "filtered",
+                                "latest-offset",
+                                false,
+                                false)),
+                Arguments.of(
+                        new PartitionedTablePublicationScenario(
+                                "disabled_refresh_initial", "disabled", "initial", true, true)),
+                Arguments.of(
+                        new PartitionedTablePublicationScenario(
+                                "disabled_refresh_latest_offset",
+                                "disabled",
+                                "latest-offset",
+                                true,
+                                true)));
     }
 
     @ParameterizedTest
@@ -1159,5 +1413,54 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
         assertEqualsInAnyOrder(expected, fetchRows(iterator, expected.size()));
         tableResult.getJobClient().get().cancel().get();
         RowUtils.USE_LEGACY_TO_STRING = true;
+    }
+
+    private void insertPartitionedProductsStreamRows() throws SQLException {
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "INSERT INTO inventory_partitioned.products VALUES "
+                            + "(default,'jacket','water resistent white wind breaker',0.2, 'us');");
+            statement.execute(
+                    "INSERT INTO inventory_partitioned.products VALUES "
+                            + "(default,'scooter','Big 2-wheel scooter ',5.18, 'uk');");
+        }
+    }
+
+    private static final class PartitionedTablePublicationScenario {
+        private final String name;
+        private final String publicationAutocreateMode;
+        private final String startupMode;
+        private final boolean partitionPublicationRefreshEnabled;
+        private final boolean createEmptyPublication;
+
+        private PartitionedTablePublicationScenario(
+                String name,
+                String publicationAutocreateMode,
+                String startupMode,
+                boolean partitionPublicationRefreshEnabled,
+                boolean createEmptyPublication) {
+            this.name = name;
+            this.publicationAutocreateMode = publicationAutocreateMode;
+            this.startupMode = startupMode;
+            this.partitionPublicationRefreshEnabled = partitionPublicationRefreshEnabled;
+            this.createEmptyPublication = createEmptyPublication;
+        }
+
+        private List<String> expectedRows() {
+            Stream<String> rows = Arrays.stream(PARTITIONED_PRODUCTS_STREAM_ROWS);
+            if ("initial".equals(startupMode)) {
+                rows =
+                        Stream.concat(
+                                Arrays.stream(PARTITIONED_PRODUCTS_SNAPSHOT_ROWS),
+                                Arrays.stream(PARTITIONED_PRODUCTS_STREAM_ROWS));
+            }
+            return rows.collect(Collectors.toList());
+        }
+
+        @Override
+        public String toString() {
+            return name;
+        }
     }
 }

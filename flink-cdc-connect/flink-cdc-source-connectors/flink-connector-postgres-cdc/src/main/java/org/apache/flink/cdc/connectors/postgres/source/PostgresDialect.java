@@ -56,6 +56,7 @@ import javax.annotation.Nullable;
 
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -326,8 +327,41 @@ public class PostgresDialect implements JdbcDataSourceDialect {
         if (filters == null) {
             this.filters = sourceConfig.getTableFilters().dataCollectionFilter();
         }
+        if (filters.isIncluded(tableId)) {
+            return true;
+        }
+        if (!((PostgresSourceConfig) sourceConfig).includePartitionedTables()) {
+            return false;
+        }
+        PartitionRoutingState currentRoutingState = routingState();
+        if (currentRoutingState.containsChild(tableId)) {
+            return true;
+        }
+        return resolveAndCacheIncludedPartitionChild(sourceConfig, tableId);
+    }
 
-        return filters.isIncluded(tableId);
+    private boolean resolveAndCacheIncludedPartitionChild(
+            JdbcSourceConfig sourceConfig, TableId childTableId) {
+        try (JdbcConnection jdbc = openJdbcConnection(sourceConfig)) {
+            TableId parentTableId = PartitionCatalog.resolveParent(jdbc, childTableId);
+            if (parentTableId == null || !filters.isIncluded(parentTableId)) {
+                return false;
+            }
+            routingState.updateAndGet(
+                    previous ->
+                            previous.merge(
+                                    Collections.singletonMap(
+                                            parentTableId,
+                                            Collections.singletonList(childTableId))));
+            return true;
+        } catch (SQLException e) {
+            throw new FlinkRuntimeException(
+                    "Error to resolve partition parent for table "
+                            + childTableId
+                            + ": "
+                            + e.getMessage(),
+                    e);
+        }
     }
 
     public String getSlotName() {

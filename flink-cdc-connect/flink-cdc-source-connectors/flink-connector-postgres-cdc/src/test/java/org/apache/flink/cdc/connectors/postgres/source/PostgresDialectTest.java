@@ -140,6 +140,27 @@ class PostgresDialectTest extends PostgresTestBase {
     }
 
     @Test
+    void testReaderSideFilterIncludesDiscoveredPartitionChild() {
+        inventoryPartitionedDatabase.createAndInitialize();
+
+        PostgresSourceConfigFactory configFactoryOfInventoryPartitionedDatabase =
+                getMockPostgresSourceConfigFactory(
+                        inventoryPartitionedDatabase, "inventory_partitioned", "products", 10);
+        configFactoryOfInventoryPartitionedDatabase.setIncludePartitionedTables(true);
+        PostgresDialect readerDialect =
+                new PostgresDialect(configFactoryOfInventoryPartitionedDatabase.create(0));
+        TableId childTableId = new TableId(null, "inventory_partitioned", "products_uk");
+
+        Assertions.assertThat(
+                        readerDialect.isIncludeDataCollection(
+                                configFactoryOfInventoryPartitionedDatabase.create(0),
+                                childTableId))
+                .isTrue();
+        Assertions.assertThat(readerDialect.routingState().routeToLogicalTable(childTableId))
+                .isEqualTo(new TableId(null, "inventory_partitioned", "products"));
+    }
+
+    @Test
     void testDiscoverDataCollectionsRejectsDecoderbufsWithPublishViaPartitionRoot()
             throws Exception {
         inventoryPartitionedPublicationDatabase.createAndInitialize();
