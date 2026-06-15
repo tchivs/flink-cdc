@@ -130,6 +130,7 @@ public class PostgresSourceEnumerator extends IncrementalSourceEnumerator {
             if (slotInfo != null) {
                 return;
             }
+            postgresDialect.ensurePartitionRoutingStateForReplicationSlot();
             PostgresReplicationConnection replicationConnection =
                     postgresDialect.openPostgresReplicationConnection(connection);
             replicationConnection.createReplicationSlot();

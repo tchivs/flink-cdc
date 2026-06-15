@@ -21,18 +21,27 @@ import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.connector.source.mocks.MockSplitEnumeratorContext;
 import org.apache.flink.cdc.connectors.base.config.JdbcSourceConfig;
 import org.apache.flink.cdc.connectors.base.options.StartupOptions;
+import org.apache.flink.cdc.connectors.base.source.assigner.AssignerStatus;
+import org.apache.flink.cdc.connectors.base.source.assigner.state.ChunkSplitterState;
+import org.apache.flink.cdc.connectors.base.source.assigner.state.HybridPendingSplitsState;
+import org.apache.flink.cdc.connectors.base.source.assigner.state.SnapshotPendingSplitsState;
 import org.apache.flink.cdc.connectors.base.source.assigner.state.StreamPendingSplitsState;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfigFactory;
 import org.apache.flink.cdc.connectors.postgres.source.offset.PostgresOffsetFactory;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionAwarePostgresConnectorConfig;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionRoutingState;
 import org.apache.flink.cdc.debezium.DebeziumDeserializationSchema;
 import org.apache.flink.util.Collector;
 
+import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.relational.TableId;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -40,6 +49,33 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link PostgresSourceBuilder}. */
 class PostgresSourceBuilderTest {
+
+    private static final TableId PARENT = new TableId(null, "public", "orders");
+    private static final TableId CHILD = new TableId(null, "public", "orders_2025");
+    private static final TableId CHILD_2026 = new TableId(null, "public", "orders_2026");
+
+    @Test
+    void wrapsReplicationConnectorConfigForPartitionAwarePublicationMembers() {
+        PostgresSourceConfigFactory configFactory = configFactory();
+        configFactory.setIncludePartitionedTables(true);
+        PostgresDialect dialect = new PostgresDialect(configFactory.create(0));
+        dialect.compareAndSetRoutingState(
+                PartitionRoutingState.EMPTY,
+                PartitionRoutingState.of(
+                        Collections.singletonMap(PARENT, Arrays.asList(CHILD, CHILD_2026))));
+
+        PostgresConnectorConfig replicationConfig = dialect.createReplicationConnectorConfig();
+
+        assertThat(replicationConfig.getTableFilters())
+                .isInstanceOf(
+                        PartitionAwarePostgresConnectorConfig.PublicationMemberResolver.class);
+        assertThat(
+                        ((PartitionAwarePostgresConnectorConfig.PublicationMemberResolver)
+                                        replicationConfig.getTableFilters())
+                                .resolvePublicationMembers(
+                                        Arrays.asList(PARENT, CHILD, CHILD_2026)))
+                .containsExactly(CHILD, CHILD_2026);
+    }
 
     @Test
     void restoresStreamOnlyEnumeratorWithPartitionRoutingSeeded() {
@@ -56,6 +92,25 @@ class PostgresSourceBuilderTest {
 
         source.restoreEnumerator(
                 new MockSplitEnumeratorContext<>(1), new StreamPendingSplitsState(true));
+
+        assertThat(dialect.discoveryCalls).isEqualTo(1);
+    }
+
+    @Test
+    void restoresHybridEnumeratorWithPartitionRoutingSeeded() {
+        PostgresSourceConfigFactory configFactory = configFactory();
+        configFactory.setIncludePartitionedTables(true);
+        CountingPostgresDialect dialect = new CountingPostgresDialect(configFactory.create(0));
+        PostgresSourceBuilder.PostgresIncrementalSource<SourceRecord> source =
+                new PostgresSourceBuilder.PostgresIncrementalSource<>(
+                        configFactory,
+                        new ForwardDeserializeSchema(),
+                        new PostgresOffsetFactory(),
+                        dialect);
+
+        source.restoreEnumerator(
+                new MockSplitEnumeratorContext<>(1),
+                new HybridPendingSplitsState(emptySnapshotPendingSplitsState(), true));
 
         assertThat(dialect.discoveryCalls).isEqualTo(1);
     }
@@ -114,6 +169,21 @@ class PostgresSourceBuilderTest {
         configFactory.password("password");
         configFactory.decodingPluginName("pgoutput");
         return configFactory;
+    }
+
+    private static SnapshotPendingSplitsState emptySnapshotPendingSplitsState() {
+        return new SnapshotPendingSplitsState(
+                Collections.emptyList(),
+                Collections.emptyList(),
+                new HashMap<>(),
+                new HashMap<>(),
+                new HashMap<>(),
+                AssignerStatus.INITIAL_ASSIGNING_FINISHED,
+                Collections.emptyList(),
+                true,
+                true,
+                new HashMap<>(),
+                ChunkSplitterState.NO_SPLITTING_TABLE_STATE);
     }
 
     private static class CountingPostgresDialect extends PostgresDialect {

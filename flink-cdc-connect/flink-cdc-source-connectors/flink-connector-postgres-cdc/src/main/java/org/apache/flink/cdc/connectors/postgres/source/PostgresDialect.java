@@ -32,6 +32,7 @@ import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresScanFetchTa
 import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresSourceFetchTaskContext;
 import org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresStreamFetchTask;
 import org.apache.flink.cdc.connectors.postgres.source.utils.CustomPostgresSchema;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionAwarePostgresConnectorConfig;
 import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionCatalog;
 import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionPublicationRefresher;
 import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionRoutingState;
@@ -114,7 +115,7 @@ public class PostgresDialect implements JdbcDataSourceDialect {
     public PostgresReplicationConnection openPostgresReplicationConnection(
             PostgresConnection jdbcConnection) {
         try {
-            PostgresConnectorConfig pgConnectorConfig = sourceConfig.getDbzConnectorConfig();
+            PostgresConnectorConfig pgConnectorConfig = createReplicationConnectorConfig();
             TopicSelector<TableId> topicSelector = PostgresTopicSelector.create(pgConnectorConfig);
             PostgresConnection.PostgresValueConverterBuilder valueConverterBuilder =
                     newPostgresValueConverterBuilder(pgConnectorConfig);
@@ -133,6 +134,21 @@ public class PostgresDialect implements JdbcDataSourceDialect {
         } catch (SQLException e) {
             throw new RuntimeException("Failed to initialize PostgresReplicationConnection", e);
         }
+    }
+
+    public void ensurePartitionRoutingStateForReplicationSlot() {
+        if (!sourceConfig.includePartitionedTables() || !routingState().isEmpty()) {
+            return;
+        }
+        discoverDataCollections(sourceConfig);
+    }
+
+    PostgresConnectorConfig createReplicationConnectorConfig() {
+        PostgresConnectorConfig dbzConnectorConfig = sourceConfig.getDbzConnectorConfig();
+        if (!sourceConfig.includePartitionedTables()) {
+            return dbzConnectorConfig;
+        }
+        return PartitionAwarePostgresConnectorConfig.wrap(dbzConnectorConfig, this::routingState);
     }
 
     @Override

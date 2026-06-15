@@ -385,7 +385,7 @@ public class PostgresSourceBuilder<T> {
                             "Failed to discover captured tables for enumerator", e);
                 }
             } else {
-                seedPartitionRoutingForStreamOnlyStartup(sourceConfig);
+                seedPartitionRoutingForEnumerator(sourceConfig, "stream-only partition routing");
                 splitAssigner =
                         new StreamSplitAssigner(
                                 sourceConfig, dataSourceDialect, offsetFactory, enumContext);
@@ -406,6 +406,8 @@ public class PostgresSourceBuilder<T> {
             final SplitAssigner splitAssigner;
             PostgresSourceConfig sourceConfig = (PostgresSourceConfig) configFactory.create(0);
             if (checkpoint instanceof HybridPendingSplitsState) {
+                seedPartitionRoutingForEnumerator(
+                        sourceConfig, "restored hybrid partition routing");
                 splitAssigner =
                         new HybridSplitAssigner<>(
                                 sourceConfig,
@@ -415,7 +417,7 @@ public class PostgresSourceBuilder<T> {
                                 offsetFactory,
                                 enumContext);
             } else if (checkpoint instanceof StreamPendingSplitsState) {
-                seedPartitionRoutingForStreamOnlyStartup(sourceConfig);
+                seedPartitionRoutingForEnumerator(sourceConfig, "stream-only partition routing");
                 splitAssigner =
                         new StreamSplitAssigner(
                                 sourceConfig,
@@ -436,7 +438,8 @@ public class PostgresSourceBuilder<T> {
                     getBoundedness());
         }
 
-        private void seedPartitionRoutingForStreamOnlyStartup(PostgresSourceConfig sourceConfig) {
+        private void seedPartitionRoutingForEnumerator(
+                PostgresSourceConfig sourceConfig, String failureContext) {
             if (!sourceConfig.includePartitionedTables()) {
                 return;
             }
@@ -447,7 +450,7 @@ public class PostgresSourceBuilder<T> {
                 dataSourceDialect.discoverDataCollections(sourceConfig);
             } catch (Exception e) {
                 throw new FlinkRuntimeException(
-                        "Failed to discover captured tables for stream-only partition routing", e);
+                        "Failed to discover captured tables for " + failureContext, e);
             }
         }
 
