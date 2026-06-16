@@ -42,8 +42,9 @@ source:
    port: 5432
    username: admin
    password: pass
-   # make sure all the tables share same database.
-   tables: adb.\.*.\.*
+   database: adb
+   schema: public
+   tables: orders,products
    decoding.plugin.name:  pgoutput
    slot.name: pgtest
 
@@ -105,12 +106,26 @@ pipeline:
       <td>Password to use when connecting to the Postgres database server.</td>
     </tr>
     <tr>
+      <td>database</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>String</td>
+      <td>Name of the Postgres database to capture. If this option is configured together with <code>schema</code>, entries in <code>tables</code> and <code>tables.exclude</code> can use short table names such as <code>orders,products</code>.</td>
+    </tr>
+    <tr>
+      <td>schema</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>String</td>
+      <td>Name of the Postgres schema used to qualify short table names in <code>tables</code> and <code>tables.exclude</code>.</td>
+    </tr>
+    <tr>
       <td>tables</td>
       <td>required</td>
       <td style="word-wrap: break-word;">(none)</td>
       <td>String</td>
       <td>Table name of the Postgres database to monitor. The table-name also supports regular expressions to monitor multiple tables that satisfy the regular expressions. <br>
-          All the tables are required to share same database.  <br>
+          All the tables are required to share same database. When <code>database</code> and <code>schema</code> are configured, table names can be written without database and schema, for example <code>orders,products</code>. Fully qualified names such as <code>adb.public.orders</code> remain supported.  <br>
           It is important to note that the dot (.) is treated as a delimiter for database, schema and table names.
           If there is a need to use a dot (.) in a regular expression to match any character, it is necessary to escape the dot with a backslash.<br>
           for example:  bdb.user_schema_[0-9].user_table_[0-9]+, bdb.schema_\.*.order_\.*</td>
@@ -279,9 +294,9 @@ pipeline:
       <td>Boolean</td>
       <td>
         Whether to automatically add discovered child partition tables to the configured PostgreSQL publication.<br>
-        This option is valid only when <code>scan.include-partitioned-tables.enabled</code> is true, <code>decoding.plugin.name</code> is <code>pgoutput</code>, <code>scan.startup.mode</code> is not <code>snapshot</code>, and <code>debezium.publication.autocreate.mode</code> is not <code>all_tables</code>.<br>
+        Connector-side <code>ALTER PUBLICATION ADD TABLE</code> refresh runs only when <code>scan.include-partitioned-tables.enabled</code> is true, <code>decoding.plugin.name</code> is <code>pgoutput</code>, <code>scan.startup.mode</code> is not <code>snapshot</code>, and <code>debezium.publication.autocreate.mode</code> is <code>disabled</code> or <code>filtered</code>.<br>
         When <code>debezium.publication.autocreate.mode</code> is <code>disabled</code>, the connector adds missing child partition tables to the existing publication and the connector user must have privileges to alter the publication. When this option is disabled in <code>disabled</code> mode, child partition tables must already be included in the publication.<br>
-        When <code>debezium.publication.autocreate.mode</code> is <code>filtered</code>, Debezium creates or updates the publication membership from the connector table filter and connector-side publication refresh is not required.
+        When <code>debezium.publication.autocreate.mode</code> is <code>filtered</code>, Debezium creates or updates the initial publication membership from the connector table filter using partition-aware child table members. If this option is enabled, the connector can also add child partitions that are created while the job is running.
       </td>
     </tr>
     <tr>

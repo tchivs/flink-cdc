@@ -97,6 +97,24 @@ class PostgresSourceBuilderTest {
     }
 
     @Test
+    void createsStreamOnlyEnumeratorWithPartitionRoutingSeededBeforeStart() {
+        PostgresSourceConfigFactory configFactory = configFactory();
+        configFactory.startupOptions(StartupOptions.latest());
+        configFactory.setIncludePartitionedTables(true);
+        CountingPostgresDialect dialect = new CountingPostgresDialect(configFactory.create(0));
+        PostgresSourceBuilder.PostgresIncrementalSource<SourceRecord> source =
+                new PostgresSourceBuilder.PostgresIncrementalSource<>(
+                        configFactory,
+                        new ForwardDeserializeSchema(),
+                        new PostgresOffsetFactory(),
+                        dialect);
+
+        source.createEnumerator(new MockSplitEnumeratorContext<>(1));
+
+        assertThat(dialect.discoveryCalls).isEqualTo(1);
+    }
+
+    @Test
     void restoresHybridEnumeratorWithPartitionRoutingSeeded() {
         PostgresSourceConfigFactory configFactory = configFactory();
         configFactory.setIncludePartitionedTables(true);
@@ -197,6 +215,10 @@ class PostgresSourceBuilderTest {
         @Override
         public List<TableId> discoverDataCollections(JdbcSourceConfig sourceConfig) {
             discoveryCalls++;
+            compareAndSetRoutingState(
+                    routingState(),
+                    PartitionRoutingState.of(
+                            Collections.singletonMap(PARENT, Collections.singletonList(CHILD))));
             return Collections.singletonList(new TableId(null, "public", "orders_2025"));
         }
     }

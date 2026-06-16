@@ -169,6 +169,32 @@ class PartitionPublicationRefresherTest {
     }
 
     @Test
+    void acceptsPgoutputFilteredModeWithExplicitRefresh() {
+        PartitionPublicationRefresher.validatePartitionRoutingSupport(
+                sourceConfig("pgoutput", "filtered", true), routingState(), false);
+    }
+
+    @Test
+    void refreshPublicationForExplicitDisabledOrFilteredMode() {
+        assertThat(
+                        PartitionPublicationRefresher.shouldRefreshPublication(
+                                sourceConfig("pgoutput", "disabled", true)))
+                .isTrue();
+        assertThat(
+                        PartitionPublicationRefresher.shouldRefreshPublication(
+                                sourceConfig("pgoutput", "filtered", true)))
+                .isTrue();
+        assertThat(
+                        PartitionPublicationRefresher.shouldRefreshPublication(
+                                sourceConfig("pgoutput", "disabled", false)))
+                .isFalse();
+        assertThat(
+                        PartitionPublicationRefresher.shouldRefreshPublication(
+                                sourceConfig("pgoutput", null, true)))
+                .isFalse();
+    }
+
+    @Test
     void buildsIdempotentAddTablesStatement() {
         assertThat(
                         PartitionPublicationRefresher.buildAddTablesStatement(

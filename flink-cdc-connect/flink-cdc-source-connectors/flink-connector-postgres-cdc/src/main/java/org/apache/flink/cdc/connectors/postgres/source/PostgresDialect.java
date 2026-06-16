@@ -136,11 +136,14 @@ public class PostgresDialect implements JdbcDataSourceDialect {
         }
     }
 
-    public void ensurePartitionRoutingStateForReplicationSlot() {
-        if (!sourceConfig.includePartitionedTables() || !routingState().isEmpty()) {
-            return;
+    public boolean ensurePartitionRoutingStateForReplicationSlot() {
+        if (!sourceConfig.includePartitionedTables()) {
+            return false;
         }
-        discoverDataCollections(sourceConfig);
+        if (routingState().isEmpty()) {
+            discoverDataCollections(sourceConfig);
+        }
+        return !routingState().isEmpty();
     }
 
     PostgresConnectorConfig createReplicationConnectorConfig() {

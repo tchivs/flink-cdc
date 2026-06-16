@@ -294,9 +294,9 @@ SELECT * FROM shipments;
       <td>Boolean</td>
       <td>
         Whether to automatically add discovered child partition tables to the configured PostgreSQL publication.<br>
-        This option is valid only when <code>scan.include-partitioned-tables.enabled</code> is true, <code>decoding.plugin.name</code> is <code>pgoutput</code>, <code>scan.startup.mode</code> is not <code>snapshot</code>, and <code>debezium.publication.autocreate.mode</code> is not <code>all_tables</code>.<br>
+        Connector-side <code>ALTER PUBLICATION ADD TABLE</code> refresh runs only when <code>scan.include-partitioned-tables.enabled</code> is true, <code>decoding.plugin.name</code> is <code>pgoutput</code>, <code>scan.startup.mode</code> is not <code>snapshot</code>, and <code>debezium.publication.autocreate.mode</code> is <code>disabled</code> or <code>filtered</code>.<br>
         When <code>debezium.publication.autocreate.mode</code> is <code>disabled</code>, the connector adds missing child partition tables to the existing publication and the connector user must have privileges to alter the publication. When this option is disabled in <code>disabled</code> mode, child partition tables must already be included in the publication.<br>
-        When <code>debezium.publication.autocreate.mode</code> is <code>filtered</code>, Debezium creates or updates the publication membership from the connector table filter and connector-side publication refresh is not required.
+        When <code>debezium.publication.autocreate.mode</code> is <code>filtered</code>, Debezium creates or updates the initial publication membership from the connector table filter using partition-aware child table members. If this option is enabled, the connector can also add child partitions that are created while the job is running.
       </td>
     </tr>
     </tbody>

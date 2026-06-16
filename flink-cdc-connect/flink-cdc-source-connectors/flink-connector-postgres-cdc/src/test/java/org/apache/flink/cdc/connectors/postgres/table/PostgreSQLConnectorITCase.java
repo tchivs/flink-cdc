@@ -45,8 +45,10 @@ import org.testcontainers.lifecycle.Startables;
 import org.testcontainers.utility.DockerImageName;
 
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -597,6 +599,9 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
                                 false)),
                 Arguments.of(
                         new PartitionedTablePublicationScenario(
+                                "filtered_refresh_initial", "filtered", "initial", true, true)),
+                Arguments.of(
+                        new PartitionedTablePublicationScenario(
                                 "disabled_refresh_initial", "disabled", "initial", true, true)),
                 Arguments.of(
                         new PartitionedTablePublicationScenario(
@@ -605,6 +610,116 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
                                 "latest-offset",
                                 true,
                                 true)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"disabled", "filtered"})
+    void testPartitionPublicationRefreshCapturesRuntimeChildPartition(
+            String publicationAutocreateMode)
+            throws SQLException, ExecutionException, InterruptedException {
+        setup(true);
+        initializePostgresTable(POSTGRES_CONTAINER, "inventory_partitioned");
+        String publicationName =
+                "dbz_pub_runtime_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+        String slotName =
+                "flink_runtime_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(String.format("CREATE PUBLICATION %s", publicationName));
+        }
+
+        String sourceDDL =
+                String.format(
+                        "CREATE TABLE debezium_source ("
+                                + " id INT NOT NULL,"
+                                + " name STRING,"
+                                + " description STRING,"
+                                + " weight DECIMAL(10,3),"
+                                + " country STRING"
+                                + ") WITH ("
+                                + " 'connector' = 'postgres-cdc',"
+                                + " 'hostname' = '%s',"
+                                + " 'port' = '%s',"
+                                + " 'username' = '%s',"
+                                + " 'password' = '%s',"
+                                + " 'database-name' = '%s',"
+                                + " 'schema-name' = '%s',"
+                                + " 'table-name' = '%s',"
+                                + " 'scan.incremental.snapshot.enabled' = 'true',"
+                                + " 'scan.incremental.snapshot.backfill.skip' = 'true',"
+                                + " 'scan.include-partitioned-tables.enabled' = 'true',"
+                                + " 'scan.startup.mode' = 'initial',"
+                                + " 'decoding.plugin.name' = 'pgoutput', "
+                                + " 'debezium.publication.name'  = '%s',"
+                                + " 'debezium.publication.autocreate.mode' = '%s',"
+                                + " 'scan.partition.publication.refresh.enabled' = 'true',"
+                                + " 'heartbeat.interval.ms' = '1000',"
+                                + " 'slot.name' = '%s'"
+                                + ")",
+                        POSTGRES_CONTAINER.getHost(),
+                        POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT),
+                        POSTGRES_CONTAINER.getUsername(),
+                        POSTGRES_CONTAINER.getPassword(),
+                        POSTGRES_CONTAINER.getDatabaseName(),
+                        "inventory_partitioned",
+                        "products",
+                        publicationName,
+                        publicationAutocreateMode,
+                        slotName);
+        String sinkDDL =
+                "CREATE TABLE sink ("
+                        + " id INT NOT NULL,"
+                        + " name STRING,"
+                        + " description STRING,"
+                        + " weight DECIMAL(10,3),"
+                        + " country STRING,"
+                        + " PRIMARY KEY (id, country) NOT ENFORCED"
+                        + ") WITH ("
+                        + " 'connector' = 'values',"
+                        + " 'sink-insert-only' = 'false',"
+                        + " 'sink-expected-messages-num' = '20'"
+                        + ")";
+        tEnv.executeSql(sourceDDL);
+        tEnv.executeSql(sinkDDL);
+
+        TableResult result =
+                tEnv.executeSql(
+                        "INSERT INTO sink SELECT id, name, description, weight, country FROM debezium_source");
+
+        waitForSnapshotStarted("sink");
+        waitForPublicationTable(
+                publicationName, "inventory_partitioned", "products_us", Duration.ofMinutes(1));
+        waitForPublicationTable(
+                publicationName, "inventory_partitioned", "products_uk", Duration.ofMinutes(1));
+
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "CREATE TABLE inventory_partitioned.products_china PARTITION OF inventory_partitioned.products FOR VALUES IN ('china');");
+        }
+
+        waitForPublicationTable(
+                publicationName, "inventory_partitioned", "products_china", Duration.ofMinutes(1));
+
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "INSERT INTO inventory_partitioned.products VALUES "
+                            + "(default,'bike','Big 2-wheel bycicle ',6.18, 'china');");
+        }
+
+        List<String> expected =
+                Stream.concat(
+                                Arrays.stream(PARTITIONED_PRODUCTS_SNAPSHOT_ROWS),
+                                Stream.of("110,bike,Big 2-wheel bycicle ,6.180,china"))
+                        .collect(Collectors.toList());
+        waitForSinkResult("sink", expected);
+
+        List<String> actual = TestValuesTableFactory.getResultsAsStrings("sink");
+        Assertions.assertThat(actual).containsExactlyInAnyOrderElementsOf(expected);
+
+        result.getJobClient().get().cancel().get();
     }
 
     @ParameterizedTest
@@ -1424,6 +1539,37 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
             statement.execute(
                     "INSERT INTO inventory_partitioned.products VALUES "
                             + "(default,'scooter','Big 2-wheel scooter ',5.18, 'uk');");
+        }
+    }
+
+    private void waitForPublicationTable(
+            String publicationName, String schemaName, String tableName, Duration timeout)
+            throws SQLException, InterruptedException {
+        long start = System.currentTimeMillis();
+        while (!publicationContainsTable(publicationName, schemaName, tableName)) {
+            if (System.currentTimeMillis() - start > timeout.toMillis()) {
+                throw new AssertionError(
+                        String.format(
+                                "Timeout waiting for publication %s to contain %s.%s",
+                                publicationName, schemaName, tableName));
+            }
+            Thread.sleep(500L);
+        }
+    }
+
+    private boolean publicationContainsTable(
+            String publicationName, String schemaName, String tableName) throws SQLException {
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
+                Statement statement = connection.createStatement();
+                ResultSet resultSet =
+                        statement.executeQuery(
+                                String.format(
+                                        "SELECT 1 FROM pg_publication_tables "
+                                                + "WHERE pubname = '%s' "
+                                                + "AND schemaname = '%s' "
+                                                + "AND tablename = '%s'",
+                                        publicationName, schemaName, tableName))) {
+            return resultSet.next();
         }
     }
 

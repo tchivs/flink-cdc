@@ -21,6 +21,7 @@ import org.apache.flink.api.connector.source.Boundedness;
 import org.apache.flink.api.connector.source.SourceEvent;
 import org.apache.flink.api.connector.source.SplitEnumeratorContext;
 import org.apache.flink.cdc.common.annotation.Internal;
+import org.apache.flink.cdc.common.annotation.VisibleForTesting;
 import org.apache.flink.cdc.connectors.base.source.assigner.AssignerStatus;
 import org.apache.flink.cdc.connectors.base.source.assigner.SplitAssigner;
 import org.apache.flink.cdc.connectors.base.source.enumerator.IncrementalSourceEnumerator;
@@ -122,19 +123,38 @@ public class PostgresSourceEnumerator extends IncrementalSourceEnumerator {
      * reading the globalStreamSplit to catch all data changes.
      */
     private void createSlotForGlobalStreamSplit() {
+        createSlotForGlobalStreamSplit(postgresDialect);
+    }
+
+    @VisibleForTesting
+    static void createSlotForGlobalStreamSplit(PostgresDialect postgresDialect) {
         try (PostgresConnection connection = postgresDialect.openJdbcConnection()) {
+            boolean hasPartitionRouting =
+                    postgresDialect.ensurePartitionRoutingStateForReplicationSlot();
             SlotState slotInfo =
                     connection.getReplicationSlotState(
                             postgresDialect.getSlotName(), postgresDialect.getPluginName());
             // skip creating the replication slot when the slot exists.
             if (slotInfo != null) {
+                if (hasPartitionRouting
+                        && "pgoutput".equalsIgnoreCase(postgresDialect.getPluginName())) {
+                    PostgresReplicationConnection replicationConnection =
+                            postgresDialect.openPostgresReplicationConnection(connection);
+                    try {
+                        replicationConnection.initConnection();
+                    } finally {
+                        replicationConnection.close(false);
+                    }
+                }
                 return;
             }
-            postgresDialect.ensurePartitionRoutingStateForReplicationSlot();
             PostgresReplicationConnection replicationConnection =
                     postgresDialect.openPostgresReplicationConnection(connection);
-            replicationConnection.createReplicationSlot();
-            replicationConnection.close(false);
+            try {
+                replicationConnection.createReplicationSlot();
+            } finally {
+                replicationConnection.close(false);
+            }
 
         } catch (Throwable t) {
             throw new FlinkRuntimeException(

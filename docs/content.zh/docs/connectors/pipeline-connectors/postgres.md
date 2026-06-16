@@ -35,14 +35,15 @@ Postgres CDC Pipeline 连接器允许从 Postgres 数据库读取快照数据和
 
 ```yaml
 source:
-   type: posgtres
+   type: postgres
    name: Postgres Source
    hostname: 127.0.0.1
    port: 5432
    username: admin
    password: pass
-   # 需要确保所有的表来自同一个database
-   tables: adb.\.*.\.*
+   database: adb
+   schema: public
+   tables: orders,products
    decoding.plugin.name:  pgoutput
    slot.name: pgtest
 
@@ -104,12 +105,26 @@ pipeline:
       <td>连接 Postgres 数据库服务器时使用的密码。</td>
     </tr>
     <tr>
+      <td>database</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>String</td>
+      <td>需要捕获的 Postgres 数据库名称。如果同时配置了 <code>schema</code>，<code>tables</code> 和 <code>tables.exclude</code> 可以使用 <code>orders,products</code> 这样的短表名。</td>
+    </tr>
+    <tr>
+      <td>schema</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>String</td>
+      <td>用于补全 <code>tables</code> 和 <code>tables.exclude</code> 中短表名的 Postgres schema 名称。</td>
+    </tr>
+    <tr>
       <td>tables</td>
       <td>required</td>
       <td style="word-wrap: break-word;">(none)</td>
       <td>String</td>
       <td>需要监视的 Postgres 数据库的表名。表名支持正则表达式，以监视满足正则表达式的多个表。<br>
-          需要确保所有的表来自同一个数据库。<br>
+          需要确保所有的表来自同一个数据库。当配置了 <code>database</code> 和 <code>schema</code> 时，可以使用 <code>orders,products</code> 这样的短表名；原来的 <code>adb.public.orders</code> 完整表名仍然支持。<br>
           需要注意的是，点号（.）被视为数据库、模式和表名的分隔符。 如果需要在正则表达式中使用点（.）来匹配任何字符，必须使用反斜杠对点进行转义。<br>
           例如，bdb.user_schema_[0-9].user_table_[0-9]+, bdb.schema_\.*.order_\.*</td>
     </tr>
@@ -286,9 +301,9 @@ pipeline:
       <td>Boolean</td>
       <td>
         是否自动把发现的子分区表添加到配置的 PostgreSQL publication 中。<br>
-        该选项仅在 <code>scan.include-partitioned-tables.enabled</code> 为 true、<code>decoding.plugin.name</code> 为 <code>pgoutput</code>、<code>scan.startup.mode</code> 不是 <code>snapshot</code>，且 <code>debezium.publication.autocreate.mode</code> 不是 <code>all_tables</code> 时有效。<br>
+        连接器侧的 <code>ALTER PUBLICATION ADD TABLE</code> 刷新仅在 <code>scan.include-partitioned-tables.enabled</code> 为 true、<code>decoding.plugin.name</code> 为 <code>pgoutput</code>、<code>scan.startup.mode</code> 不是 <code>snapshot</code>，且 <code>debezium.publication.autocreate.mode</code> 为 <code>disabled</code> 或 <code>filtered</code> 时执行。<br>
         当 <code>debezium.publication.autocreate.mode</code> 为 <code>disabled</code> 时，连接器会把缺失的子分区表添加到已有 publication 中，且连接器用户必须具备修改 publication 的权限。若在 <code>disabled</code> 模式下未开启该选项，子分区表必须已包含在 publication 中。<br>
-        当 <code>debezium.publication.autocreate.mode</code> 为 <code>filtered</code> 时，Debezium 会根据连接器表过滤条件创建或更新 publication 成员，此时不需要连接器侧刷新 publication。
+        当 <code>debezium.publication.autocreate.mode</code> 为 <code>filtered</code> 时，Debezium 会根据连接器表过滤条件创建或更新初始 publication 成员，并使用分区感知后的子表成员。若开启本选项，连接器也可以自动添加作业运行期间新建的子分区。
       </td>
     </tr>
     <tr>

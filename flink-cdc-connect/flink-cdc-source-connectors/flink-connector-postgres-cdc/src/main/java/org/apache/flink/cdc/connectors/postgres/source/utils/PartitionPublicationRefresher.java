@@ -123,12 +123,12 @@ public final class PartitionPublicationRefresher {
                                     + "decoding.plugin.name=%s, scan.startup.mode=%s, "
                                     + "debezium.publication.autocreate.mode=%s, publication=%s, "
                                     + "partition parents=[%s]. Reason: connector-side refresh mutates "
-                                    + "PostgreSQL publication metadata and is only meaningful for "
-                                    + "pgoutput streaming modes with filtered or disabled publication "
+                                    + "PostgreSQL publication metadata and is only supported for "
+                                    + "pgoutput streaming modes with disabled or filtered publication "
                                     + "membership. Support level: unsupported/fail-fast. "
                                     + "Remediation: disable scan.partition.publication.refresh.enabled, "
                                     + "or use pgoutput with initial/latest-offset/committed-offset and "
-                                    + "debezium.publication.autocreate.mode=filtered or disabled.",
+                                    + "debezium.publication.autocreate.mode=disabled or filtered.",
                             ERR_PR_007,
                             decoderName,
                             sourceConfig.getStartupOptions().startupMode,
@@ -269,6 +269,15 @@ public final class PartitionPublicationRefresher {
         } finally {
             connection.setAutoCommit(previousAutoCommit);
         }
+    }
+
+    public static boolean shouldRefreshPublication(PostgresSourceConfig sourceConfig) {
+        String publicationAutocreateMode =
+                sourceConfig == null ? null : publicationAutocreateMode(sourceConfig);
+        return sourceConfig != null
+                && sourceConfig.partitionPublicationRefreshEnabled()
+                && (AUTOCREATE_DISABLED.equals(publicationAutocreateMode)
+                        || AUTOCREATE_FILTERED.equals(publicationAutocreateMode));
     }
 
     public static List<TableId> missingPublicationMembers(

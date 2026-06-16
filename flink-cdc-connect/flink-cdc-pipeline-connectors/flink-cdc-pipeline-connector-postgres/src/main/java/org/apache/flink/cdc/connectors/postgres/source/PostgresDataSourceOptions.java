@@ -53,12 +53,27 @@ public class PostgresDataSourceOptions {
                     .withDescription(
                             "Password to use when connecting to the PostgreSQL database server.");
 
+    public static final ConfigOption<String> DATABASE =
+            ConfigOptions.key("database")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Name of the PostgreSQL database to capture. If configured together with schema, tables can use unqualified table names.");
+
+    public static final ConfigOption<String> SCHEMA =
+            ConfigOptions.key("schema")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Name of the PostgreSQL schema used to qualify unqualified table names in tables and tables.exclude.");
+
     public static final ConfigOption<String> TABLES =
             ConfigOptions.key("tables")
                     .stringType()
                     .noDefaultValue()
                     .withDescription(
                             "Table names of the PostgreSQL tables to monitor. Regular expressions are supported. "
+                                    + "If database and schema are configured, unqualified table names are supported. "
                                     + "It is important to note that the dot (.) is treated as a delimiter for database and table names. "
                                     + "If there is a need to use a dot (.) in a regular expression to match any character, "
                                     + "it is necessary to escape the dot with a backslash."
@@ -232,6 +247,7 @@ public class PostgresDataSourceOptions {
                     .noDefaultValue()
                     .withDescription(
                             "Table names of the PostgreSQL tables to Exclude. Regular expressions are supported. "
+                                    + "If database and schema are configured, unqualified table names are supported. "
                                     + "It is important to note that the dot (.) is treated as a delimiter for database and table names. "
                                     + "If there is a need to use a dot (.) in a regular expression to match any character, "
                                     + "it is necessary to escape the dot with a backslash."

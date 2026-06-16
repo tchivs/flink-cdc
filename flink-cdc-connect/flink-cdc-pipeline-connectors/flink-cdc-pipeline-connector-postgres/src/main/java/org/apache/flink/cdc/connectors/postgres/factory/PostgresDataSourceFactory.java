@@ -60,6 +60,7 @@ import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSource
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CONNECTION_POOL_SIZE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CONNECT_MAX_RETRIES;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CONNECT_TIMEOUT;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.DATABASE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.DECODING_PLUGIN_NAME;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.HEARTBEAT_INTERVAL;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.HOSTNAME;
@@ -76,6 +77,7 @@ import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSource
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_PARTITION_PUBLICATION_REFRESH_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_SNAPSHOT_FETCH_SIZE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_STARTUP_MODE;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCHEMA;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCHEMA_CHANGE_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SERVER_TIME_ZONE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SLOT_NAME;
@@ -148,19 +150,25 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         validateDistributionFactorLower(distributionFactorLower);
 
         Map<String, String> configMap = config.toMap();
-        Optional<String> databaseName = getValidateDatabaseName(tables);
-        String normalizedTables = normalizeTablePatterns(tables, TABLES.key(), databaseName.get());
+        Optional<String> configuredDatabaseName = config.getOptional(DATABASE);
+        Optional<String> configuredSchemaName = config.getOptional(SCHEMA);
+        String databaseName = getValidateDatabaseName(tables, configuredDatabaseName);
+        String normalizedTables =
+                normalizeTablePatterns(tables, TABLES.key(), databaseName, configuredSchemaName);
         String normalizedTablesExclude =
                 tablesExclude == null
                         ? null
                         : normalizeTablePatterns(
-                                tablesExclude, TABLES_EXCLUDE.key(), databaseName.get());
+                                tablesExclude,
+                                TABLES_EXCLUDE.key(),
+                                databaseName,
+                                configuredSchemaName);
 
         PostgresSourceConfigFactory configFactory =
                 PostgresSourceBuilder.PostgresIncrementalSource.<RowData>builder()
                         .hostname(hostname)
                         .port(port)
-                        .database(databaseName.get())
+                        .database(databaseName)
                         .schemaList(".*")
                         .tableList(".*")
                         .username(username)
@@ -260,6 +268,8 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
     public Set<ConfigOption<?>> optionalOptions() {
         Set<ConfigOption<?>> options = new HashSet<>();
         options.add(PG_PORT);
+        options.add(DATABASE);
+        options.add(SCHEMA);
         options.add(TABLES_EXCLUDE);
         options.add(DECODING_PLUGIN_NAME);
         options.add(SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE);
@@ -299,30 +309,69 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
     }
 
     static String normalizeTablePatterns(String patterns, String optionName, String databaseName) {
+        return normalizeTablePatterns(patterns, optionName, databaseName, Optional.empty());
+    }
+
+    static String normalizeTablePatterns(
+            String patterns,
+            String optionName,
+            String databaseName,
+            Optional<String> defaultSchemaName) {
         if (patterns == null || patterns.trim().isEmpty()) {
             throw new IllegalArgumentException(
                     String.format("Parameter %s cannot be null or empty", optionName));
         }
         return Arrays.stream(patterns.split(","))
                 .map(String::trim)
-                .map(pattern -> normalizeTablePattern(pattern, optionName, databaseName))
+                .map(
+                        pattern ->
+                                normalizeTablePattern(
+                                        pattern, optionName, databaseName, defaultSchemaName))
                 .collect(Collectors.joining(","));
     }
 
     private static String normalizeTablePattern(
-            String pattern, String optionName, String databaseName) {
+            String pattern,
+            String optionName,
+            String databaseName,
+            Optional<String> defaultSchemaName) {
         String[] parts = pattern.split("(?<!\\\\)\\.", -1);
-        checkState(
-                parts.length == 3,
+        if (parts.length == 1) {
+            checkState(
+                    defaultSchemaName.isPresent(),
+                    String.format(
+                            "The value of option '%s' must use database.schema.table format, "
+                                    + "or set both 'database' and 'schema' to qualify short table names, but was: %s",
+                            optionName, pattern));
+            return defaultSchemaName.get() + "." + parts[0];
+        }
+        if (parts.length == 2) {
+            checkState(
+                    defaultSchemaName.isPresent(),
+                    String.format(
+                            "The value of option '%s' must use database.schema.table format, "
+                                    + "or set both 'database' and 'schema' to qualify short table names, but was: %s",
+                            optionName, pattern));
+            checkState(
+                    defaultSchemaName.get().equals(parts[0]),
+                    String.format(
+                            "The value of option '%s' must use schema '%s' for short table names, but found: %s",
+                            optionName, defaultSchemaName.get(), pattern));
+            return parts[0] + "." + parts[1];
+        }
+        if (parts.length == 3) {
+            checkState(
+                    databaseName.equals(parts[0]),
+                    String.format(
+                            "The value of option '%s' must use database '%s', but found: %s",
+                            optionName, databaseName, pattern));
+            return parts[1] + "." + parts[2];
+        }
+        throw new IllegalStateException(
                 String.format(
-                        "The value of option '%s' must use database.schema.table format, but was: %s",
+                        "The value of option '%s' must use database.schema.table format, "
+                                + "or short table names with database and schema configured, but was: %s",
                         optionName, pattern));
-        checkState(
-                databaseName.equals(parts[0]),
-                String.format(
-                        "The value of option '%s' must use database '%s', but found: %s",
-                        optionName, databaseName, pattern));
-        return parts[1] + "." + parts[2];
     }
 
     /** Checks the value of given integer option is valid. */
@@ -394,17 +443,23 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
     /**
      * Get the database name.
      *
-     * @param tables Table name list, format is "db.schema.table,db.schema.table,..." Each table
-     *     name consists of three parts separated by ".", which are database name, schema name, and
-     *     table name.
+     * @param tables Table name list. If database is not configured, each table name must use
+     *     "db.schema.table" format.
      * @return Database name if found, otherwise returns Optional.empty()
      * @throws IllegalArgumentException If the input parameter is null or does not match the
      *     expected format, or if database names are inconsistent.
      */
-    private Optional<String> getValidateDatabaseName(String tables) {
+    private String getValidateDatabaseName(String tables, Optional<String> configuredDatabaseName) {
         // Input validation
         if (tables == null || tables.trim().isEmpty()) {
             throw new IllegalArgumentException("Parameter tables cannot be null or empty");
+        }
+        if (configuredDatabaseName.isPresent()) {
+            String databaseName = configuredDatabaseName.get();
+            checkState(
+                    isValidPostgresDbName(databaseName),
+                    String.format("%s is not a valid PostgreSQL database name", databaseName));
+            return databaseName;
         }
 
         // Split table name list
@@ -439,8 +494,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
             }
         }
 
-        // If no valid table name is found, return Optional.empty()
-        return Optional.ofNullable(dbName);
+        return dbName;
     }
 
     /** Validate if the database name conforms to PostgreSQL naming conventions. */

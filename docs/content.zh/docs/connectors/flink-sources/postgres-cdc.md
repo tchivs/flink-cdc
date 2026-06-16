@@ -293,9 +293,9 @@ SELECT * FROM shipments;
       <td>Boolean</td>
       <td>
         是否自动把发现的子分区表添加到配置的 PostgreSQL publication 中。<br>
-        该选项仅在 <code>scan.include-partitioned-tables.enabled</code> 为 true、<code>decoding.plugin.name</code> 为 <code>pgoutput</code>、<code>scan.startup.mode</code> 不是 <code>snapshot</code>，且 <code>debezium.publication.autocreate.mode</code> 不是 <code>all_tables</code> 时有效。<br>
+        连接器侧的 <code>ALTER PUBLICATION ADD TABLE</code> 刷新仅在 <code>scan.include-partitioned-tables.enabled</code> 为 true、<code>decoding.plugin.name</code> 为 <code>pgoutput</code>、<code>scan.startup.mode</code> 不是 <code>snapshot</code>，且 <code>debezium.publication.autocreate.mode</code> 为 <code>disabled</code> 或 <code>filtered</code> 时执行。<br>
         当 <code>debezium.publication.autocreate.mode</code> 为 <code>disabled</code> 时，连接器会把缺失的子分区表添加到已有 publication 中，且连接器用户必须具备修改 publication 的权限。若在 <code>disabled</code> 模式下未开启该选项，子分区表必须已包含在 publication 中。<br>
-        当 <code>debezium.publication.autocreate.mode</code> 为 <code>filtered</code> 时，Debezium 会根据连接器表过滤条件创建或更新 publication 成员，此时不需要连接器侧刷新 publication。
+        当 <code>debezium.publication.autocreate.mode</code> 为 <code>filtered</code> 时，Debezium 会根据连接器表过滤条件创建或更新初始 publication 成员，并使用分区感知后的子表成员。若开启本选项，连接器也可以自动添加作业运行期间新建的子分区。
       </td>
     </tr>
     </tbody>

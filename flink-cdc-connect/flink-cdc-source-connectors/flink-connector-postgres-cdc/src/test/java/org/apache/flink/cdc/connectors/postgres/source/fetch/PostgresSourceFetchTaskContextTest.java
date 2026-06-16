@@ -37,6 +37,7 @@ import org.junit.jupiter.api.Test;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Properties;
 
 import static io.debezium.connector.postgresql.Utils.lastKnownLsn;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -116,6 +117,24 @@ class PostgresSourceFetchTaskContextTest {
     }
 
     @Test
+    void doesNotRefreshPublicationForFilteredModeUnlessRefreshIsExplicitlyEnabled() {
+        PostgresSourceConfig sourceConfig = sourceConfig("filtered", false);
+        PostgresDialect dialect = new PostgresDialect(sourceConfig);
+        dialect.compareAndSetRoutingState(
+                PartitionRoutingState.EMPTY,
+                PartitionRoutingState.of(
+                        Collections.singletonMap(PARENT, Collections.singletonList(CHILD))));
+        PostgresSourceFetchTaskContext context =
+                new PostgresSourceFetchTaskContext(sourceConfig, dialect);
+        context.installPartitionAwareConfig(sourceConfig.getDbzConnectorConfig());
+
+        context.mergePgoutputRuntimeChild(RUNTIME_CHILD, PARENT);
+
+        assertThat(dialect.routingState().containsChild(RUNTIME_CHILD)).isTrue();
+        assertThat(context.getTableFilter().isIncluded(RUNTIME_CHILD)).isTrue();
+    }
+
+    @Test
     void ignoresRuntimeChildWhenParentIsNotCaptured() {
         PostgresSourceConfig sourceConfig = sourceConfig();
         PostgresDialect dialect = new PostgresDialect(sourceConfig);
@@ -150,6 +169,11 @@ class PostgresSourceFetchTaskContextTest {
     }
 
     private static PostgresSourceConfig sourceConfig() {
+        return sourceConfig(null, false);
+    }
+
+    private static PostgresSourceConfig sourceConfig(
+            String publicationMode, boolean publicationRefreshEnabled) {
         PostgresSourceConfigFactory configFactory = new PostgresSourceConfigFactory();
         configFactory.hostname("localhost");
         configFactory.port(5432);
@@ -160,6 +184,14 @@ class PostgresSourceFetchTaskContextTest {
         configFactory.tableList("public.orders");
         configFactory.decodingPluginName("pgoutput");
         configFactory.setIncludePartitionedTables(true);
+        configFactory.setPartitionPublicationRefreshEnabled(publicationRefreshEnabled);
+        if (publicationMode != null) {
+            Properties dbzProperties = new Properties();
+            dbzProperties.setProperty(PostgresConnectorConfig.PUBLICATION_NAME.name(), "cdc_pub");
+            dbzProperties.setProperty(
+                    PostgresConnectorConfig.PUBLICATION_AUTOCREATE_MODE.name(), publicationMode);
+            configFactory.debeziumProperties(dbzProperties);
+        }
         return configFactory.create(0);
     }
 }

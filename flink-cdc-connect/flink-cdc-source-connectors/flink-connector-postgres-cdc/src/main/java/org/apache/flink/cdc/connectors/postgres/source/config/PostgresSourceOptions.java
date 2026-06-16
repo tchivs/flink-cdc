@@ -104,7 +104,7 @@ public class PostgresSourceOptions extends JdbcSourceOptions {
                     .defaultValue(Boolean.FALSE)
                     .withDescription(
                             "Whether to automatically add newly discovered partition child tables to the configured PostgreSQL publication. "
-                                    + "This option is only valid for pgoutput partition routing, requires privileges to alter the publication, and is disabled by default.");
+                                    + "This option is only valid for pgoutput partition routing with debezium.publication.autocreate.mode=disabled or filtered, requires privileges to alter the publication, and is disabled by default.");
 
     public static final ConfigOption<Boolean> TABLE_ID_INCLUDE_DATABASE =
             ConfigOptions.key("table-id.include-database")

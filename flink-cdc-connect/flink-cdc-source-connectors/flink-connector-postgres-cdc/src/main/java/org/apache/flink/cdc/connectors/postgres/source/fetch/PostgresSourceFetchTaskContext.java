@@ -17,6 +17,7 @@
 
 package org.apache.flink.cdc.connectors.postgres.source.fetch;
 
+import org.apache.flink.cdc.common.annotation.VisibleForTesting;
 import org.apache.flink.cdc.connectors.base.WatermarkDispatcher;
 import org.apache.flink.cdc.connectors.base.config.JdbcSourceConfig;
 import org.apache.flink.cdc.connectors.base.source.meta.offset.Offset;
@@ -75,7 +76,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
 
 import static io.debezium.connector.AbstractSourceInfo.SCHEMA_NAME_KEY;
 import static io.debezium.connector.AbstractSourceInfo.TABLE_NAME_KEY;
@@ -107,6 +110,8 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
     private Snapshotter snapShotter;
     private PostgresTableIdRouter tableIdRouter = PostgresTableIdRouter.empty();
     private Tables.TableFilter tableFilter;
+    private volatile boolean partitionPublicationReconcilerStopped;
+    private Thread partitionPublicationReconciler;
 
     public PostgresSourceFetchTaskContext(
             JdbcSourceConfig sourceConfig, PostgresDialect dataSourceDialect) {
@@ -285,6 +290,7 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
                 new DefaultChangeEventSourceMetricsFactory<>();
         this.snapshotChangeEventSourceMetrics =
                 metricsFactory.getSnapshotMetrics(taskContext, queue, metadataProvider);
+        startPartitionPublicationReconcilerIfNeeded(sourceSplitBase);
     }
 
     @Override
@@ -354,6 +360,7 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
 
     @Override
     public void close() throws Exception {
+        stopPartitionPublicationReconciler();
         if (jdbcConnection != null) {
             jdbcConnection.close();
         }
@@ -435,7 +442,7 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
 
     private void refreshRuntimeChildPublication(TableId childTableId) {
         PostgresSourceConfig postgresSourceConfig = (PostgresSourceConfig) sourceConfig;
-        if (!postgresSourceConfig.partitionPublicationRefreshEnabled()) {
+        if (!PartitionPublicationRefresher.shouldRefreshPublication(postgresSourceConfig)) {
             return;
         }
         try {
@@ -450,6 +457,150 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
                             + childTableId,
                     e);
         }
+    }
+
+    private void startPartitionPublicationReconcilerIfNeeded(SourceSplitBase sourceSplitBase) {
+        PostgresSourceConfig postgresSourceConfig = (PostgresSourceConfig) sourceConfig;
+        if (partitionPublicationReconciler != null
+                || !sourceSplitBase.isStreamSplit()
+                || isBackFillSplit(sourceSplitBase)
+                || !postgresSourceConfig.includePartitionedTables()
+                || !PartitionPublicationRefresher.shouldRefreshPublication(postgresSourceConfig)
+                || !"pgoutput".equalsIgnoreCase(getPluginName())) {
+            return;
+        }
+        PartitionRoutingState currentState = ((PostgresDialect) dataSourceDialect).routingState();
+        if (currentState == null || currentState.isEmpty()) {
+            return;
+        }
+
+        long pollIntervalMillis = partitionPublicationPollIntervalMillis(postgresSourceConfig);
+        partitionPublicationReconcilerStopped = false;
+        partitionPublicationReconciler =
+                new Thread(
+                        () -> {
+                            while (!partitionPublicationReconcilerStopped) {
+                                try {
+                                    Thread.sleep(pollIntervalMillis);
+                                    refreshNewPartitionPublicationChildren();
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                    return;
+                                } catch (Throwable t) {
+                                    errorHandler.setProducerThrowable(
+                                            new RuntimeException(
+                                                    "Unable to reconcile PostgreSQL partition publication membership",
+                                                    t));
+                                    return;
+                                }
+                            }
+                        },
+                        "postgres-partition-publication-reconciler-" + getSlotName());
+        partitionPublicationReconciler.setDaemon(true);
+        partitionPublicationReconciler.start();
+    }
+
+    private void stopPartitionPublicationReconciler() {
+        partitionPublicationReconcilerStopped = true;
+        Thread reconciler = partitionPublicationReconciler;
+        if (reconciler != null) {
+            reconciler.interrupt();
+            try {
+                reconciler.join(5000L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            partitionPublicationReconciler = null;
+        }
+    }
+
+    private static long partitionPublicationPollIntervalMillis(
+            PostgresSourceConfig postgresSourceConfig) {
+        // Reuse Debezium heartbeat cadence to keep catalog polling conservative by default.
+        String heartbeatInterval =
+                postgresSourceConfig
+                        .getDbzProperties()
+                        .getProperty(Heartbeat.HEARTBEAT_INTERVAL.name());
+        if (heartbeatInterval == null) {
+            return 30_000L;
+        }
+        try {
+            return Math.max(1_000L, Long.parseLong(heartbeatInterval));
+        } catch (NumberFormatException ignored) {
+            return 30_000L;
+        }
+    }
+
+    @VisibleForTesting
+    public List<TableId> refreshNewPartitionPublicationChildren() throws SQLException {
+        PostgresSourceConfig postgresSourceConfig = (PostgresSourceConfig) sourceConfig;
+        if (!postgresSourceConfig.includePartitionedTables()
+                || !PartitionPublicationRefresher.shouldRefreshPublication(postgresSourceConfig)
+                || !"pgoutput".equalsIgnoreCase(getPluginName())) {
+            return Collections.emptyList();
+        }
+
+        PostgresDialect postgresDialect = (PostgresDialect) dataSourceDialect;
+        PartitionRoutingState previousState = postgresDialect.routingState();
+        if (previousState == null || previousState.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        try (PostgresConnection jdbc = postgresDialect.openJdbcConnection()) {
+            String publicationName = postgresSourceConfig.getDbzConnectorConfig().publicationName();
+            if (PartitionPublicationRefresher.isPublishViaPartitionRootEnabled(
+                    jdbc, publicationName)) {
+                return Collections.emptyList();
+            }
+
+            PartitionRoutingState latestState =
+                    PartitionRoutingState.of(
+                            PartitionCatalog.discoverChildren(jdbc, previousState.allParents()));
+            List<TableId> newChildren = findNewChildren(previousState, latestState);
+            if (newChildren.isEmpty()) {
+                return Collections.emptyList();
+            }
+
+            // Publish routing state before exposing the child through pgoutput publication
+            // membership, otherwise Relation messages can arrive before the runtime filter accepts
+            // the child table.
+            mergePartitionRoutingState(latestState);
+            PartitionPublicationRefresher.refreshPublication(
+                    jdbc, publicationName, newChildren, true);
+            return newChildren;
+        }
+    }
+
+    private static List<TableId> findNewChildren(
+            PartitionRoutingState previousState, PartitionRoutingState latestState) {
+        if (latestState == null || latestState.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<TableId> newChildren = new ArrayList<>();
+        for (TableId child : latestState.allChildren()) {
+            if (!previousState.containsChild(child)) {
+                newChildren.add(child);
+            }
+        }
+        return newChildren;
+    }
+
+    private void mergePartitionRoutingState(PartitionRoutingState latestState) {
+        if (latestState == null || latestState.isEmpty()) {
+            return;
+        }
+        for (int attempts = 0; attempts < 3; attempts++) {
+            PartitionRoutingState previousState =
+                    ((PostgresDialect) dataSourceDialect).routingState();
+            PartitionRoutingState nextState = previousState.merge(latestState.parentToChildren());
+            if (nextState.equals(previousState)
+                    || ((PostgresDialect) dataSourceDialect)
+                            .compareAndSetRoutingState(previousState, nextState)) {
+                return;
+            }
+        }
+        throw new IllegalStateException(
+                "Unable to publish PostgreSQL partition routing state before publication refresh");
     }
 
     public SnapshotChangeEventSourceMetrics<PostgresPartition>
