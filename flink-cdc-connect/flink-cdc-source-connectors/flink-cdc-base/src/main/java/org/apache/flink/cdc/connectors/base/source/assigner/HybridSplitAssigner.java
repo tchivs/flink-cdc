@@ -111,7 +111,7 @@ public class HybridSplitAssigner<C extends SourceConfig> implements SplitAssigne
                 enumeratorContext);
     }
 
-    private HybridSplitAssigner(
+    HybridSplitAssigner(
             C sourceConfig,
             SnapshotSplitAssigner<C> snapshotSplitAssigner,
             boolean isStreamSplitAssigned,
@@ -136,9 +136,9 @@ public class HybridSplitAssigner<C extends SourceConfig> implements SplitAssigne
             enumeratorMetrics.exitStreamReading();
         }
 
-        snapshotSplitAssigner.open();
         // init enumerator metrics
         snapshotSplitAssigner.initEnumeratorMetrics(enumeratorMetrics);
+        snapshotSplitAssigner.open();
     }
 
     @Override
