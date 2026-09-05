@@ -207,6 +207,7 @@ public class PostgresSourceReaderTest extends PostgresTestBase {
     private PostgresSourceReader createSnapshotOnlyReader() throws Exception {
         final PostgresOffsetFactory offsetFactory = new PostgresOffsetFactory();
         final PostgresSourceConfigFactory configFactory = createConfigFactory();
+        configFactory.slotName(slotName);
         configFactory.startupOptions(StartupOptions.snapshot());
         PostgresDialect dialect = new PostgresDialect(configFactory.create(0));
         final PostgresSourceBuilder.PostgresIncrementalSource<?> source =
