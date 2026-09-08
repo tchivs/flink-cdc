@@ -22,7 +22,7 @@ limitations under the License.
     <parent>
         <artifactId>flink-cdc-pipeline-connectors</artifactId>
         <groupId>org.apache.flink</groupId>
-        <version>3.6.0-2.2-hytera-slot-meta-num-e00e28c1d-20260908-r3</version>
+        <version>3.6.0-2.2-hytera-slot-meta-num-594f81a21-20260908-r4</version>
     </parent>
     <modelVersion>4.0.0</modelVersion>
 

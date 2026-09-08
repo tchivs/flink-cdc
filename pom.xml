@@ -29,7 +29,7 @@ limitations under the License.
 
     <groupId>org.apache.flink</groupId>
     <artifactId>flink-cdc-parent</artifactId>
-    <version>3.6.0-2.2-hytera-slot-meta-num-e00e28c1d-20260908-r3</version>
+    <version>3.6.0-2.2-hytera-slot-meta-num-594f81a21-20260908-r4</version>
     <packaging>pom</packaging>
 
     <modules>
@@ -61,7 +61,7 @@ limitations under the License.
     </scm>
 
     <properties>
-        <revision>3.6.0-2.2-hytera-slot-meta-num-e00e28c1d-20260908-r3</revision>
+        <revision>3.6.0-2.2-hytera-slot-meta-num-594f81a21-20260908-r4</revision>
         <scala.binary.version>2.12</scala.binary.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <!-- Enforce single fork execution due to heavy mini cluster use in the tests -->
