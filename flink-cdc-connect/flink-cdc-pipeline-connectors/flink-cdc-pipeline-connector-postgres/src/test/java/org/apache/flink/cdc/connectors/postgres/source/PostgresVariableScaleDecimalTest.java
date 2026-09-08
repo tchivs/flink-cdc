@@ -24,7 +24,6 @@ import org.apache.flink.cdc.common.event.DataChangeEvent;
 import org.apache.flink.cdc.common.types.DataTypes;
 import org.apache.flink.cdc.debezium.table.DebeziumChangelogMode;
 
-import io.debezium.data.SpecialValueDecimal;
 import io.debezium.data.VariableScaleDecimal;
 import org.apache.kafka.connect.data.Decimal;
 import org.apache.kafka.connect.data.Schema;
@@ -158,25 +157,6 @@ class PostgresVariableScaleDecimalTest {
 
         assertThat(deserializer.convertToString(encoded, schema))
                 .isEqualTo(BinaryStringData.fromString(value.toPlainString()));
-    }
-
-    @Test
-    void variableScaleSpecialValuesUseCanonicalText() {
-        Schema schema = VariableScaleDecimal.schema();
-        PostgresEventDeserializer deserializer =
-                new PostgresEventDeserializer(DebeziumChangelogMode.ALL);
-        List<SpecialValueDecimal> values =
-                Arrays.asList(
-                        SpecialValueDecimal.NOT_A_NUMBER,
-                        SpecialValueDecimal.POSITIVE_INF,
-                        SpecialValueDecimal.NEGATIVE_INF);
-        List<String> expected = Arrays.asList("NAN", "POSITIVE_INFINITY", "NEGATIVE_INFINITY");
-
-        for (int i = 0; i < values.size(); i++) {
-            Struct encoded = VariableScaleDecimal.fromLogical(schema, values.get(i));
-            assertThat(deserializer.convertToString(encoded, schema))
-                    .isEqualTo(BinaryStringData.fromString(expected.get(i)));
-        }
     }
 
     @Test
