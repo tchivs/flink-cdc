@@ -21,7 +21,7 @@ limitations under the License.
     <parent>
         <artifactId>flink-cdc-source-connectors</artifactId>
         <groupId>org.apache.flink</groupId>
-        <version>3.6.0-2.2-hytera-slot-finish-47ff606d5-20260905</version>
+        <version>3.6.0-2.2-hytera-slot-metadata-64c300722-20260908</version>
     </parent>
     <properties>
         <oblogclient.version>1.1.2</oblogclient.version>
