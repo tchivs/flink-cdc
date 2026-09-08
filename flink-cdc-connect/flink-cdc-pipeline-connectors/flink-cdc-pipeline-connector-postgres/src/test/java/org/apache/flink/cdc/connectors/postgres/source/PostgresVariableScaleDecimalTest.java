@@ -170,8 +170,7 @@ class PostgresVariableScaleDecimalTest {
                         SpecialValueDecimal.NOT_A_NUMBER,
                         SpecialValueDecimal.POSITIVE_INF,
                         SpecialValueDecimal.NEGATIVE_INF);
-        List<String> expected =
-                Arrays.asList("NAN", "POSITIVE_INFINITY", "NEGATIVE_INFINITY");
+        List<String> expected = Arrays.asList("NAN", "POSITIVE_INFINITY", "NEGATIVE_INFINITY");
 
         for (int i = 0; i < values.size(); i++) {
             Struct encoded = VariableScaleDecimal.fromLogical(schema, values.get(i));
@@ -221,8 +220,7 @@ class PostgresVariableScaleDecimalTest {
         List<BigDecimal> values =
                 Arrays.asList(
                         new BigDecimal("1E-40"),
-                        new BigDecimal(
-                                "1234567890.1234567890123456789012345678901234567890"));
+                        new BigDecimal("1234567890.1234567890123456789012345678901234567890"));
 
         assertThat(new PostgresSchemaDataTypeInference().infer(null, arraySchema))
                 .isEqualTo(DataTypes.ARRAY(DataTypes.STRING()));

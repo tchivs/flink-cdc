@@ -44,8 +44,7 @@ public class PostgresSchemaDataTypeInference extends DebeziumSchemaDataTypeInfer
     protected DataType inferBytes(Object value, Schema schema) {
         if (Decimal.LOGICAL_NAME.equals(schema.name())) {
             Map<String, String> parameters = schema.parameters();
-            String scaleParameter =
-                    parameters == null ? null : parameters.get(Decimal.SCALE_FIELD);
+            String scaleParameter = parameters == null ? null : parameters.get(Decimal.SCALE_FIELD);
             int scale =
                     scaleParameter == null
                             ? DecimalType.DEFAULT_SCALE
