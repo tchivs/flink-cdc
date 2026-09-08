@@ -24,6 +24,7 @@ import org.apache.flink.cdc.common.event.TableId;
 import org.apache.flink.cdc.connectors.postgres.table.PostgreSQLReadableMetadata;
 import org.apache.flink.cdc.debezium.event.DebeziumEventDeserializationSchema;
 import org.apache.flink.cdc.debezium.table.DebeziumChangelogMode;
+import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.data.TimestampData;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -116,18 +117,21 @@ public class PostgresEventDeserializer extends DebeziumEventDeserializationSchem
     @Override
     protected Map<String, String> getMetadata(SourceRecord record) {
         Map<String, String> metadataMap = new HashMap<>();
-        readableMetadataList.forEach(
-                (postgresReadableMetadata -> {
-                    Object metadata = postgresReadableMetadata.getConverter().read(record);
-                    if (postgresReadableMetadata.equals(PostgreSQLReadableMetadata.OP_TS)) {
-                        metadataMap.put(
-                                postgresReadableMetadata.getKey(),
-                                String.valueOf(((TimestampData) metadata).getMillisecond()));
-                    } else {
-                        metadataMap.put(
-                                postgresReadableMetadata.getKey(), String.valueOf(metadata));
-                    }
-                }));
+        for (PostgreSQLReadableMetadata readableMetadata : readableMetadataList) {
+            Object metadata = readableMetadata.getConverter().read(record);
+            if (metadata == null) {
+                continue;
+            }
+            String value;
+            if (readableMetadata == PostgreSQLReadableMetadata.OP_TS) {
+                value = String.valueOf(((TimestampData) metadata).getMillisecond());
+            } else if (metadata instanceof StringData) {
+                value = metadata.toString();
+            } else {
+                value = String.valueOf(metadata);
+            }
+            metadataMap.put(readableMetadata.getKey(), value);
+        }
         return metadataMap;
     }
 

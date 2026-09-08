@@ -248,7 +248,7 @@ pipeline:
       <td style="word-wrap: break-word;">(none)</td>
       <td>String</td>
       <td>
-        List of readable metadata from SourceRecord to be passed to downstream and could be used in transform module, split by `,`. Available readable metadata are: op_ts, table_name, database_name, schema_name. See <a href="#supported-metadata-columns">Supported Metadata Columns</a> for more details.
+        Comma-separated list of SourceRecord metadata keys to pass downstream. No metadata is emitted by default. In addition to op_ts, table_name, database_name, and schema_name, the connector supports the neutral <code>source.*</code> keys described in <a href="#supported-metadata-columns">Supported Metadata Columns</a>.
       </td>
     </tr>
     <tr>
@@ -316,8 +316,9 @@ Notice:
 PostgreSQL CDC connector supports reading metadata columns from source records. These metadata columns can be used in transform operations or passed to downstream sinks.
 
 **Note:** Some metadata information is also available through Transform expressions (e.g., `__namespace_name__`, `__schema_name__`, `__table_name__`). The key differences are:
-- **`op_ts`**: Only available via `metadata.list` - provides the actual operation timestamp from the database.
-- **`table_name`, `database_name`, `schema_name`**: Can be obtained via either `metadata.list` or Transform expressions. Using `metadata.list` allows you to pass these values directly to downstream sinks without writing transform rules, which is simpler for basic use cases.
+- **`op_ts`**: Only available via `metadata.list` - provides the operation timestamp from the database.
+- **`table_name`, `database_name`, `schema_name`**: Can be obtained via either `metadata.list` or Transform expressions.
+- **`source.*`**: Preserves the original PostgreSQL envelope identity and position even if a route changes the event's target table ID. Missing optional values are omitted rather than emitted as the string `null`.
 
 To enable metadata columns, configure the `metadata.list` option with a comma-separated list of metadata column names:
 
@@ -325,7 +326,7 @@ To enable metadata columns, configure the `metadata.list` option with a comma-se
 source:
   type: postgres
   # ... other configurations
-  metadata.list: op_ts,table_name,database_name,schema_name
+  metadata.list: source.op,source.database,source.schema,source.table,source.lsn,source.tx-id,source.sequence,source.snapshot,source.ts-ms,source.ts-us,source.partition,source.offset
 ```
 
 The following metadata columns are supported:
@@ -359,6 +360,59 @@ The following metadata columns are supported:
       <td>schema_name</td>
       <td>STRING NOT NULL</td>
       <td>The name of the schema that contains the changed row. This is specific to PostgreSQL. Alternative: use <code>__schema_name__</code> in Transform expressions.</td>
+    </tr>
+    <tr>
+      <td>source.op</td>
+      <td>STRING NOT NULL</td>
+      <td>The original Debezium operation code: <code>r</code>, <code>c</code>, <code>u</code>, or <code>d</code>. A READ (<code>r</code>) is authoritative for snapshot rows even when <code>source.snapshot</code> is <code>false</code>.</td>
+    </tr>
+    <tr>
+      <td>source.database / source.schema / source.table</td>
+      <td>STRING NOT NULL</td>
+      <td>The original names from the PostgreSQL source envelope. Downstream routing does not rewrite them.</td>
+    </tr>
+    <tr>
+      <td>source.lsn</td>
+      <td>STRING</td>
+      <td>The PostgreSQL LSN as an unsigned decimal string. The value <code>0</code> on a READ record is a snapshot sentinel and must not be used as a streaming identity.</td>
+    </tr>
+    <tr>
+      <td>source.tx-id</td>
+      <td>STRING</td>
+      <td>The PostgreSQL transaction identifier when present.</td>
+    </tr>
+    <tr>
+      <td>source.sequence</td>
+      <td>STRING</td>
+      <td>The ordered source sequence JSON string supplied by Debezium.</td>
+    </tr>
+    <tr>
+      <td>source.snapshot</td>
+      <td>STRING</td>
+      <td>Debezium's source marker: <code>true</code>, <code>last</code>, <code>false</code>, or <code>incremental</code>. Use it together with <code>source.op</code>.</td>
+    </tr>
+    <tr>
+      <td>source.ts-ms</td>
+      <td>STRING</td>
+      <td>The source envelope timestamp in milliseconds since the epoch. Snapshot rows may contain <code>0</code>.</td>
+    </tr>
+    <tr>
+      <td>source.ts-us</td>
+      <td>STRING</td>
+      <td>The source offset timestamp in microseconds since the epoch. For snapshot rows it is scanner observation time, not a stable replay identity.</td>
+    </tr>
+    <tr>
+      <td>source.partition</td>
+      <td>STRING</td>
+      <td>Deterministic, key-sorted JSON containing only the PostgreSQL source server identity.</td>
+    </tr>
+    <tr>
+      <td>source.offset</td>
+      <td>STRING</td>
+      <td>Deterministic, key-sorted JSON containing only safe PostgreSQL position fields (LSNs, transaction identifiers, snapshot markers, and microsecond timestamp). LSN numbers are unsigned. Unknown fields and credentials are excluded. This diagnostic/recovery value is not a stable snapshot identity.</td>
+    </tr>
+    <tr>
+      <td colspan="3">All <code>source.*</code> strings are limited to 4096 characters; an oversized selected value fails extraction rather than being truncated.</td>
     </tr>
     </tbody>
 </table>

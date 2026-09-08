@@ -256,7 +256,7 @@ pipeline:
       <td style="word-wrap: break-word;">(none)</td>
       <td>String</td>
       <td>
-        源记录中可读取的元数据列表，将传递给下游并在转换模块中使用，各字段以逗号分隔。可用的可读元数据包括：op_ts、table_name、database_name、schema_name。详见<a href="#支持的元数据列">支持的元数据列</a>。
+        以逗号分隔、传递给下游的 SourceRecord 元数据键列表。默认不输出任何元数据。除 op_ts、table_name、database_name、schema_name 外，还支持<a href="#支持的元数据列">支持的元数据列</a>中说明的中立 <code>source.*</code> 键。
       </td>
     </tr>
     <tr>
@@ -321,8 +321,9 @@ pipeline:
 PostgreSQL CDC 连接器支持从源记录中读取元数据列。这些元数据列可以在转换操作中使用或传递给下游 Sink。
 
 **注意：** 部分元数据信息也可以通过 Transform 表达式获取（例如 `__namespace_name__`、`__schema_name__`、`__table_name__`）。主要区别如下：
-- **`op_ts`**：仅可通过 `metadata.list` 获取 - 提供数据库中实际的操作时间戳。
-- **`table_name`、`database_name`、`schema_name`**：可通过 `metadata.list` 或 Transform 表达式获取。使用 `metadata.list` 可以直接将这些值传递给下游 Sink，无需编写转换规则，对于基本用例更加简单。
+- **`op_ts`**：仅可通过 `metadata.list` 获取，表示数据库操作时间。
+- **`table_name`、`database_name`、`schema_name`**：可通过 `metadata.list` 或 Transform 表达式获取。
+- **`source.*`**：保留 PostgreSQL 原始信封中的源身份和位置；即使路由修改事件目标表 ID，这些值也不变。缺失的可选值会省略，而不是输出字符串 `null`。
 
 要启用元数据列，请使用逗号分隔的元数据列名称列表配置 `metadata.list` 选项：
 
@@ -330,7 +331,7 @@ PostgreSQL CDC 连接器支持从源记录中读取元数据列。这些元数�
 source:
   type: postgres
   # ... 其他配置
-  metadata.list: op_ts,table_name,database_name,schema_name
+  metadata.list: source.op,source.database,source.schema,source.table,source.lsn,source.tx-id,source.sequence,source.snapshot,source.ts-ms,source.ts-us,source.partition,source.offset
 ```
 
 支持以下元数据列：
@@ -364,6 +365,59 @@ source:
       <td>schema_name</td>
       <td>STRING NOT NULL</td>
       <td>包含变更行的 Schema 名称。这是 PostgreSQL 特有的。替代方案：在 Transform 表达式中使用 <code>__schema_name__</code>。</td>
+    </tr>
+    <tr>
+      <td>source.op</td>
+      <td>STRING NOT NULL</td>
+      <td>Debezium 原始操作码：<code>r</code>、<code>c</code>、<code>u</code> 或 <code>d</code>。READ（<code>r</code>）是快照行的权威判断，即使 <code>source.snapshot</code> 为 <code>false</code>。</td>
+    </tr>
+    <tr>
+      <td>source.database / source.schema / source.table</td>
+      <td>STRING NOT NULL</td>
+      <td>PostgreSQL 源信封中的原始名称；下游路由不会改写这些值。</td>
+    </tr>
+    <tr>
+      <td>source.lsn</td>
+      <td>STRING</td>
+      <td>无符号十进制 PostgreSQL LSN。READ 记录中的 <code>0</code> 是快照哨兵值，不得作为增量流身份。</td>
+    </tr>
+    <tr>
+      <td>source.tx-id</td>
+      <td>STRING</td>
+      <td>源记录提供时的 PostgreSQL 事务标识。</td>
+    </tr>
+    <tr>
+      <td>source.sequence</td>
+      <td>STRING</td>
+      <td>Debezium 提供的有序源 sequence JSON 字符串。</td>
+    </tr>
+    <tr>
+      <td>source.snapshot</td>
+      <td>STRING</td>
+      <td>Debezium 源标记：<code>true</code>、<code>last</code>、<code>false</code> 或 <code>incremental</code>；应与 <code>source.op</code> 一起使用。</td>
+    </tr>
+    <tr>
+      <td>source.ts-ms</td>
+      <td>STRING</td>
+      <td>自 epoch 起的源信封毫秒时间戳；快照行可能为 <code>0</code>。</td>
+    </tr>
+    <tr>
+      <td>source.ts-us</td>
+      <td>STRING</td>
+      <td>自 epoch 起的源 offset 微秒时间戳。对于快照行，它是扫描观察时间，不是稳定重放身份。</td>
+    </tr>
+    <tr>
+      <td>source.partition</td>
+      <td>STRING</td>
+      <td>仅包含 PostgreSQL 源 server 身份的确定性、键排序 JSON。</td>
+    </tr>
+    <tr>
+      <td>source.offset</td>
+      <td>STRING</td>
+      <td>仅包含安全 PostgreSQL 位置字段（LSN、事务标识、快照标记和微秒时间戳）的确定性、键排序 JSON。LSN 使用无符号数；未知字段和凭据不会输出。该诊断/恢复值不是稳定快照身份。</td>
+    </tr>
+    <tr>
+      <td colspan="3">所有 <code>source.*</code> 字符串最长 4096 个字符；选中值超限时提取失败，不会截断。</td>
     </tr>
     </tbody>
 </table>
