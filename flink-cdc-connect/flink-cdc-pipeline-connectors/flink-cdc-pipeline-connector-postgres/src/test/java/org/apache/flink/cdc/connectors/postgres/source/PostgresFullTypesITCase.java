@@ -459,8 +459,8 @@ public class PostgresFullTypesITCase extends PostgresTestBase {
                     1,
                     DecimalData.fromBigDecimal(new BigDecimal("123.45"), 10, 2),
                     DecimalData.fromBigDecimal(new BigDecimal("67.8912"), 8, 4),
-                    DecimalData.fromBigDecimal(new BigDecimal("987.65"), 5, 2),
-                    DecimalData.fromBigDecimal(new BigDecimal("12.3"), 3, 1),
+                    BinaryStringData.fromString("987.65"),
+                    BinaryStringData.fromString("12.3"),
                     DecimalData.fromBigDecimal(new BigDecimal("100.50"), 38, 2),
                 };
 
@@ -1176,8 +1176,8 @@ public class PostgresFullTypesITCase extends PostgresTestBase {
                     DataTypes.INT(),
                     DataTypes.DECIMAL(10, 2),
                     DataTypes.DECIMAL(8, 4),
-                    DataTypes.DECIMAL(5, 2),
-                    DataTypes.DECIMAL(3, 1),
+                    DataTypes.STRING(),
+                    DataTypes.STRING(),
                     DataTypes.DECIMAL(38, 2));
 
     private static final RowType TYPES_WITH_DOUBLE =

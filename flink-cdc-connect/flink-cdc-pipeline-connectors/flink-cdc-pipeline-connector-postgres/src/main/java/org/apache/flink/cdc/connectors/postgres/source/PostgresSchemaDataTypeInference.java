@@ -22,6 +22,7 @@ import org.apache.flink.cdc.common.types.DataType;
 import org.apache.flink.cdc.common.types.DataTypes;
 import org.apache.flink.cdc.debezium.event.DebeziumSchemaDataTypeInference;
 
+import io.debezium.data.VariableScaleDecimal;
 import io.debezium.data.geometry.Geography;
 import io.debezium.data.geometry.Geometry;
 import io.debezium.data.geometry.Point;
@@ -34,11 +35,15 @@ public class PostgresSchemaDataTypeInference extends DebeziumSchemaDataTypeInfer
     private static final long serialVersionUID = 1L;
 
     protected DataType inferStruct(Object value, Schema schema) {
-        // the Geometry datatype in PostgresSQL will be converted to
-        // a String with Json format
-        if (Point.LOGICAL_NAME.equals(schema.name())
+        if (VariableScaleDecimal.LOGICAL_NAME.equals(schema.name())) {
+            // PostgreSQL NUMERIC without a typmod may change precision and scale per value. Keep
+            // one schema for the table lifetime and preserve every digit.
+            return DataTypes.STRING();
+        } else if (Point.LOGICAL_NAME.equals(schema.name())
                 || Geography.LOGICAL_NAME.equals(schema.name())
                 || Geometry.LOGICAL_NAME.equals(schema.name())) {
+            // the Geometry datatype in PostgresSQL will be converted to
+            // a String with Json format
             return DataTypes.STRING();
         } else {
             return super.inferStruct(value, schema);

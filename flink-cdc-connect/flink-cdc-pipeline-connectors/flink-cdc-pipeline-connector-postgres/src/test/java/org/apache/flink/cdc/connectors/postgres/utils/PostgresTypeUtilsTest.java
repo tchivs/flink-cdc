@@ -47,22 +47,20 @@ class PostgresTypeUtilsTest {
 
     @Test
     void testHandleNumericPreciseWithZeroPrecision() {
-        // precision=0 (no explicit precision), should fall back to (MAX_PRECISION, DEFAULT_SCALE)
+        // Unknown precision cannot be represented losslessly by one DECIMAL type.
         DataType result =
                 PostgresTypeUtils.handleNumericWithDecimalMode(
                         0, 0, JdbcValueConverters.DecimalMode.PRECISE);
-        assertThat(result)
-                .isEqualTo(DataTypes.DECIMAL(DecimalType.MAX_PRECISION, DecimalType.DEFAULT_SCALE));
+        assertThat(result).isEqualTo(DataTypes.STRING());
     }
 
     @Test
     void testHandleNumericPreciseBoundaryAtDefaultScale() {
-        // precision == DEFAULT_SCALE is NOT > DEFAULT_SCALE, so falls back to max
+        // Invalid precision cannot be represented losslessly by one DECIMAL type.
         DataType result =
                 PostgresTypeUtils.handleNumericWithDecimalMode(
                         DecimalType.DEFAULT_SCALE, 2, JdbcValueConverters.DecimalMode.PRECISE);
-        assertThat(result)
-                .isEqualTo(DataTypes.DECIMAL(DecimalType.MAX_PRECISION, DecimalType.DEFAULT_SCALE));
+        assertThat(result).isEqualTo(DataTypes.STRING());
     }
 
     @Test
@@ -79,12 +77,11 @@ class PostgresTypeUtilsTest {
 
     @Test
     void testHandleNumericPreciseExceedsMaxPrecision() {
-        // precision > MAX_PRECISION, should still fall back to max
+        // Bare PostgreSQL NUMERIC uses a sentinel precision above Flink's maximum.
         DataType result =
                 PostgresTypeUtils.handleNumericWithDecimalMode(
                         DecimalType.MAX_PRECISION + 1, 2, JdbcValueConverters.DecimalMode.PRECISE);
-        assertThat(result)
-                .isEqualTo(DataTypes.DECIMAL(DecimalType.MAX_PRECISION, DecimalType.DEFAULT_SCALE));
+        assertThat(result).isEqualTo(DataTypes.STRING());
     }
 
     @Test
