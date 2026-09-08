@@ -81,9 +81,7 @@ class PostgresTypeUtilsTest {
                         DecimalType.MAX_PRECISION,
                         JdbcValueConverters.DecimalMode.PRECISE);
         assertThat(result)
-                .isEqualTo(
-                        DataTypes.DECIMAL(
-                                DecimalType.MAX_PRECISION, DecimalType.MAX_PRECISION));
+                .isEqualTo(DataTypes.DECIMAL(DecimalType.MAX_PRECISION, DecimalType.MAX_PRECISION));
     }
 
     @Test
