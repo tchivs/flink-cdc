@@ -29,15 +29,18 @@ import org.apache.flink.table.data.TimestampData;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.debezium.data.Envelope;
+import io.debezium.data.VariableScaleDecimal;
 import io.debezium.data.geometry.Geography;
 import io.debezium.data.geometry.Geometry;
 import io.debezium.data.geometry.Point;
+import org.apache.kafka.connect.data.Decimal;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.locationtech.jts.geom.Coordinate;
 import org.locationtech.jts.io.WKBReader;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -137,11 +140,26 @@ public class PostgresEventDeserializer extends DebeziumEventDeserializationSchem
 
     @Override
     protected Object convertToString(Object dbzObj, Schema schema) {
-        // the Geometry datatype in PostgreSQL will be converted to
-        // a String with Json format
-        if (Point.LOGICAL_NAME.equals(schema.name())
+        if (VariableScaleDecimal.LOGICAL_NAME.equals(schema.name())) {
+            return BinaryStringData.fromString(
+                    VariableScaleDecimal.toLogical((Struct) dbzObj)
+                            .getDecimalValue()
+                            .orElseThrow(
+                                    () ->
+                                            new IllegalArgumentException(
+                                                    "Variable-scale decimal has no finite value"))
+                            .toPlainString());
+        } else if (Decimal.LOGICAL_NAME.equals(schema.name())) {
+            BigDecimal decimal =
+                    dbzObj instanceof byte[]
+                            ? Decimal.toLogical(schema, (byte[]) dbzObj)
+                            : (BigDecimal) dbzObj;
+            return BinaryStringData.fromString(decimal.toPlainString());
+        } else if (Point.LOGICAL_NAME.equals(schema.name())
                 || Geometry.LOGICAL_NAME.equals(schema.name())
                 || Geography.LOGICAL_NAME.equals(schema.name())) {
+            // the Geometry datatype in PostgreSQL will be converted to
+            // a String with Json format
             try {
                 Struct geometryStruct = (Struct) dbzObj;
                 byte[] wkb = geometryStruct.getBytes("wkb");

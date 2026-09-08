@@ -213,7 +213,11 @@ public class PostgresTypeUtils {
                         && precision <= DecimalType.MAX_PRECISION) {
                     return DataTypes.DECIMAL(precision, scale);
                 }
-                return DataTypes.DECIMAL(DecimalType.MAX_PRECISION, DecimalType.DEFAULT_SCALE);
+                // PostgreSQL NUMERIC without a typmod has no fixed precision or scale. Mapping it
+                // to DECIMAL(38, 0) loses fractional digits and disagrees with Debezium's
+                // value-dependent VariableScaleDecimal representation. Use a stable, lossless
+                // textual representation instead.
+                return DataTypes.STRING();
             case DOUBLE:
                 return DataTypes.DOUBLE();
             case STRING:
