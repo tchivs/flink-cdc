@@ -253,8 +253,11 @@ public class PostgresDataSourceOptions {
                     .stringType()
                     .noDefaultValue()
                     .withDescription(
-                            "List of readable metadata from SourceRecord to be passed to downstream, split by `,`. "
-                                    + "Available readable metadata are: op_ts.");
+                            "Comma-separated list of SourceRecord metadata keys to pass downstream. "
+                                    + "Supported keys are op_ts, table_name, database_name, schema_name, "
+                                    + "source.op, source.database, source.schema, source.table, source.lsn, "
+                                    + "source.tx-id, source.sequence, source.snapshot, source.ts-ms, source.ts-us, "
+                                    + "source.partition, and source.offset. No metadata is emitted by default.");
 
     @Experimental
     public static final ConfigOption<Boolean>

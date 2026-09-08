@@ -207,7 +207,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         return new PostgresDataSource(configFactory, readableMetadataList);
     }
 
-    private List<PostgreSQLReadableMetadata> listReadableMetadata(String metadataList) {
+    List<PostgreSQLReadableMetadata> listReadableMetadata(String metadataList) {
         if (StringUtils.isNullOrWhitespaceOnly(metadataList)) {
             return new ArrayList<>();
         }
@@ -217,6 +217,9 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
                         .collect(Collectors.toSet());
         List<PostgreSQLReadableMetadata> foundMetadata = new ArrayList<>();
         for (PostgreSQLReadableMetadata metadata : PostgreSQLReadableMetadata.values()) {
+            if (metadata == PostgreSQLReadableMetadata.ROW_KIND) {
+                continue;
+            }
             if (readableMetadataList.contains(metadata.getKey())) {
                 foundMetadata.add(metadata);
                 readableMetadataList.remove(metadata.getKey());

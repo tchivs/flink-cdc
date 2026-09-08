@@ -28,6 +28,7 @@ import org.apache.flink.cdc.connectors.postgres.source.OpTsMetadataColumn;
 import org.apache.flink.cdc.connectors.postgres.source.PostgresDataSource;
 import org.apache.flink.cdc.connectors.postgres.source.SchemaNameMetadataColumn;
 import org.apache.flink.cdc.connectors.postgres.source.TableNameMetadataColumn;
+import org.apache.flink.cdc.connectors.postgres.table.PostgreSQLReadableMetadata;
 import org.apache.flink.table.api.ValidationException;
 
 import org.junit.jupiter.api.AfterEach;
@@ -335,6 +336,34 @@ public class PostgresDataSourceFactoryTest extends PostgresTestBase {
         assertThat(metadataColumns[2].getName()).isEqualTo("database_name");
         assertThat(metadataColumns[3]).isInstanceOf(SchemaNameMetadataColumn.class);
         assertThat(metadataColumns[3].getName()).isEqualTo("schema_name");
+    }
+
+    @Test
+    public void testPipelineMetadataListContract() {
+        PostgresDataSourceFactory factory = new PostgresDataSourceFactory();
+
+        assertThat(factory.listReadableMetadata(null)).isEmpty();
+        assertThat(
+                        factory.listReadableMetadata(
+                                "source.op,source.database,source.schema,source.table,source.lsn,"
+                                        + "source.tx-id,source.sequence,source.snapshot,source.ts-ms,"
+                                        + "source.ts-us,source.partition,source.offset"))
+                .containsExactly(
+                        PostgreSQLReadableMetadata.SOURCE_OPERATION,
+                        PostgreSQLReadableMetadata.SOURCE_DATABASE,
+                        PostgreSQLReadableMetadata.SOURCE_SCHEMA,
+                        PostgreSQLReadableMetadata.SOURCE_TABLE,
+                        PostgreSQLReadableMetadata.SOURCE_LSN,
+                        PostgreSQLReadableMetadata.SOURCE_TRANSACTION_ID,
+                        PostgreSQLReadableMetadata.SOURCE_SEQUENCE,
+                        PostgreSQLReadableMetadata.SOURCE_SNAPSHOT,
+                        PostgreSQLReadableMetadata.SOURCE_TIMESTAMP_MS,
+                        PostgreSQLReadableMetadata.SOURCE_TIMESTAMP_US,
+                        PostgreSQLReadableMetadata.SOURCE_PARTITION,
+                        PostgreSQLReadableMetadata.SOURCE_OFFSET);
+        assertThatThrownBy(() -> factory.listReadableMetadata("row_kind"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("row_kind");
     }
 
     class MockContext implements Factory.Context {
