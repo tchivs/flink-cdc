@@ -489,8 +489,8 @@ transform:
       <td>FLOAT</td>
     </tr>
    <tr>
-      <td>NUMERIC</td>
-      <td>DECIMAL(38, 0)</td>
+      <td>NUMERIC without precision and scale</td>
+      <td>STRING</td>
     </tr>
     <tr>
       <td>DOUBLE PRECISION<br>
@@ -659,7 +659,7 @@ When the <code>debezium.time.precision.mode</code> property is set to the defaul
 ### Decimal types Mapping
 The setting of the PostgreSQL connector configuration property <code>debezium.decimal.handling.mode</code> determines how the connector maps decimal types.
 
-When the <code>debezium.decimal.handling.mode</code> property is set to precise, the connector uses the Kafka Connect org.apache.kafka.connect.data.Decimal logical type for all DECIMAL, NUMERIC and MONEY columns. This is the default mode.
+When <code>debezium.decimal.handling.mode</code> is set to <code>precise</code>, fixed decimal types within the CDC <code>DECIMAL</code> bounds retain decimal semantics. A <code>NUMERIC</code>/<code>DECIMAL</code> without an explicit precision and scale can change shape per value, and a fixed type can exceed those bounds; the connector maps both cases to <code>STRING</code> and uses plain decimal notation so no digit is lost. This is the default mode.
 <div class="wy-table-responsive">
 <table class="colwidths-auto docutils">
     <thead>
@@ -671,23 +671,33 @@ When the <code>debezium.decimal.handling.mode</code> property is set to precise,
     <tbody>
        <tr>
         <td>
-          NUMERIC[(M[,D])]
-        <td>DECIMAL[(M[,D])]</td>
+          NUMERIC(M,D), where 1 &le; M &le; 38 and 0 &le; D &le; M
+        <td>DECIMAL(M,D)</td>
       </tr>
       <tr>
         <td>
-          NUMERIC
-        <td>DECIMAL(38,0)</td>
+          NUMERIC(M,D), outside the CDC DECIMAL bounds
+        <td>STRING</td>
       </tr>
       <tr>
         <td>
-          DECIMAL[(M[,D])]
-        <td>DECIMAL[(M[,D])]</td>
+          NUMERIC without precision and scale
+        <td>STRING</td>
       </tr>
       <tr>
         <td>
-          DECIMAL
-        <td>DECIMAL(38,0)</td>
+          DECIMAL(M,D), where 1 &le; M &le; 38 and 0 &le; D &le; M
+        <td>DECIMAL(M,D)</td>
+      </tr>
+      <tr>
+        <td>
+          DECIMAL(M,D), outside the CDC DECIMAL bounds
+        <td>STRING</td>
+      </tr>
+      <tr>
+        <td>
+          DECIMAL without precision and scale
+        <td>STRING</td>
       </tr>
       <tr>
         <td>

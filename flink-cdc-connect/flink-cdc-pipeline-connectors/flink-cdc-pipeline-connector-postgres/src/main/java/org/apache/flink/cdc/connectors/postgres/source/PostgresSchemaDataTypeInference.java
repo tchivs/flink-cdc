@@ -20,13 +20,19 @@ package org.apache.flink.cdc.connectors.postgres.source;
 import org.apache.flink.cdc.common.annotation.Internal;
 import org.apache.flink.cdc.common.types.DataType;
 import org.apache.flink.cdc.common.types.DataTypes;
+import org.apache.flink.cdc.common.types.DecimalType;
+import org.apache.flink.cdc.connectors.postgres.utils.PostgresTypeUtils;
 import org.apache.flink.cdc.debezium.event.DebeziumSchemaDataTypeInference;
 
 import io.debezium.data.VariableScaleDecimal;
 import io.debezium.data.geometry.Geography;
 import io.debezium.data.geometry.Geometry;
 import io.debezium.data.geometry.Point;
+import io.debezium.jdbc.JdbcValueConverters;
+import org.apache.kafka.connect.data.Decimal;
 import org.apache.kafka.connect.data.Schema;
+
+import java.util.Map;
 
 /** {@link DataType} inference for PostgresSQL debezium {@link Schema}. */
 @Internal
@@ -34,6 +40,29 @@ public class PostgresSchemaDataTypeInference extends DebeziumSchemaDataTypeInfer
 
     private static final long serialVersionUID = 1L;
 
+    @Override
+    protected DataType inferBytes(Object value, Schema schema) {
+        if (Decimal.LOGICAL_NAME.equals(schema.name())) {
+            Map<String, String> parameters = schema.parameters();
+            String scaleParameter =
+                    parameters == null ? null : parameters.get(Decimal.SCALE_FIELD);
+            int scale =
+                    scaleParameter == null
+                            ? DecimalType.DEFAULT_SCALE
+                            : Integer.parseInt(scaleParameter);
+            String precisionParameter =
+                    parameters == null ? null : parameters.get(PRECISION_PARAMETER_KEY);
+            int precision =
+                    precisionParameter == null
+                            ? DEFAULT_DECIMAL_PRECISION
+                            : Integer.parseInt(precisionParameter);
+            return PostgresTypeUtils.handleNumericWithDecimalMode(
+                    precision, scale, JdbcValueConverters.DecimalMode.PRECISE);
+        }
+        return super.inferBytes(value, schema);
+    }
+
+    @Override
     protected DataType inferStruct(Object value, Schema schema) {
         if (VariableScaleDecimal.LOGICAL_NAME.equals(schema.name())) {
             // PostgreSQL NUMERIC without a typmod may change precision and scale per value. Keep

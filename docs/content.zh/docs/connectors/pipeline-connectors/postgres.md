@@ -494,8 +494,8 @@ transform:
       <td>FLOAT</td>
     </tr>
    <tr>
-      <td>NUMERIC</td>
-      <td>DECIMAL(38, 0)</td>
+      <td>未指定精度和小数位数的 NUMERIC</td>
+      <td>STRING</td>
     </tr>
     <tr>
       <td>DOUBLE PRECISION<br>
@@ -664,7 +664,7 @@ transform:
 ### Decimal types Mapping
 PostgreSQL 连接器配置属性 <code>debezium.decimal.handling.mode</code> 的设置决定了连接器如何映射十进制类型。
 
-当 <code>debezium.decimal.handling.mode</code> 属性设置为 precise（精确）时，连接器会对所有 DECIMAL、NUMERIC 和 MONEY 列使用 Kafka Connect 的 org.apache.kafka.connect.data.Decimal 逻辑类型。这是默认模式。
+当 <code>debezium.decimal.handling.mode</code> 设置为 <code>precise</code> 时，CDC <code>DECIMAL</code> 范围内的定长十进制类型保持十进制语义。未显式指定精度和小数位数的 <code>NUMERIC</code>/<code>DECIMAL</code> 可随每个值改变形态，定长类型也可能超出 CDC 范围；连接器将这两类值映射为 <code>STRING</code>，并使用普通十进制文本以避免丢失任何数字。这是默认模式。
 <div class="wy-table-responsive">
 <table class="colwidths-auto docutils">
     <thead>
@@ -676,23 +676,33 @@ PostgreSQL 连接器配置属性 <code>debezium.decimal.handling.mode</code> 的
     <tbody>
        <tr>
         <td>
-          NUMERIC[(M[,D])]
-        <td>DECIMAL[(M[,D])]</td>
+          NUMERIC(M,D)，其中 1 &le; M &le; 38 且 0 &le; D &le; M
+        <td>DECIMAL(M,D)</td>
       </tr>
       <tr>
         <td>
-          NUMERIC
-        <td>DECIMAL(38,0)</td>
+          超出 CDC DECIMAL 范围的 NUMERIC(M,D)
+        <td>STRING</td>
       </tr>
       <tr>
         <td>
-          DECIMAL[(M[,D])]
-        <td>DECIMAL[(M[,D])]</td>
+          未指定精度和小数位数的 NUMERIC
+        <td>STRING</td>
       </tr>
       <tr>
         <td>
-          DECIMAL
-        <td>DECIMAL(38,0)</td>
+          DECIMAL(M,D)，其中 1 &le; M &le; 38 且 0 &le; D &le; M
+        <td>DECIMAL(M,D)</td>
+      </tr>
+      <tr>
+        <td>
+          超出 CDC DECIMAL 范围的 DECIMAL(M,D)
+        <td>STRING</td>
+      </tr>
+      <tr>
+        <td>
+          未指定精度和小数位数的 DECIMAL
+        <td>STRING</td>
       </tr>
       <tr>
         <td>

@@ -142,13 +142,7 @@ public class PostgresEventDeserializer extends DebeziumEventDeserializationSchem
     protected Object convertToString(Object dbzObj, Schema schema) {
         if (VariableScaleDecimal.LOGICAL_NAME.equals(schema.name())) {
             return BinaryStringData.fromString(
-                    VariableScaleDecimal.toLogical((Struct) dbzObj)
-                            .getDecimalValue()
-                            .orElseThrow(
-                                    () ->
-                                            new IllegalArgumentException(
-                                                    "Variable-scale decimal has no finite value"))
-                            .toPlainString());
+                    VariableScaleDecimal.toLogical((Struct) dbzObj).toString());
         } else if (Decimal.LOGICAL_NAME.equals(schema.name())) {
             BigDecimal decimal =
                     dbzObj instanceof byte[]

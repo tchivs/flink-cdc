@@ -38,7 +38,7 @@ class PostgresTypeUtilsTest {
 
     @Test
     void testHandleNumericPreciseWithinRange() {
-        // precision=20 > DEFAULT_SCALE and <= MAX_PRECISION, should produce DECIMAL(20, 5)
+        // Supported precision and scale retain DECIMAL semantics.
         DataType result =
                 PostgresTypeUtils.handleNumericWithDecimalMode(
                         20, 5, JdbcValueConverters.DecimalMode.PRECISE);
@@ -64,15 +64,34 @@ class PostgresTypeUtilsTest {
     }
 
     @Test
-    void testHandleNumericPreciseJustAboveDefaultScale() {
-        // precision = DEFAULT_SCALE + 1 is the smallest value where the condition
-        // (precision > DEFAULT_SCALE) becomes true, should use exact precision and scale
-        int precision = DecimalType.DEFAULT_SCALE + 1;
-        int scale = 0;
+    void testHandleNumericPreciseMinimumPrecision() {
+        int precision = DecimalType.MIN_PRECISION;
+        int scale = DecimalType.MIN_SCALE;
         DataType result =
                 PostgresTypeUtils.handleNumericWithDecimalMode(
                         precision, scale, JdbcValueConverters.DecimalMode.PRECISE);
         assertThat(result).isEqualTo(DataTypes.DECIMAL(precision, scale));
+    }
+
+    @Test
+    void testHandleNumericPreciseMaximumScale() {
+        DataType result =
+                PostgresTypeUtils.handleNumericWithDecimalMode(
+                        DecimalType.MAX_PRECISION,
+                        DecimalType.MAX_PRECISION,
+                        JdbcValueConverters.DecimalMode.PRECISE);
+        assertThat(result)
+                .isEqualTo(
+                        DataTypes.DECIMAL(
+                                DecimalType.MAX_PRECISION, DecimalType.MAX_PRECISION));
+    }
+
+    @Test
+    void testHandleNumericPreciseInvalidScaleUsesString() {
+        DataType result =
+                PostgresTypeUtils.handleNumericWithDecimalMode(
+                        10, 11, JdbcValueConverters.DecimalMode.PRECISE);
+        assertThat(result).isEqualTo(DataTypes.STRING());
     }
 
     @Test

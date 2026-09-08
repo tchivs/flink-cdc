@@ -209,14 +209,15 @@ public class PostgresTypeUtils {
             int precision, int scale, JdbcValueConverters.DecimalMode mode) {
         switch (mode) {
             case PRECISE:
-                if (precision > DecimalType.DEFAULT_SCALE
-                        && precision <= DecimalType.MAX_PRECISION) {
+                if (precision >= DecimalType.MIN_PRECISION
+                        && precision <= DecimalType.MAX_PRECISION
+                        && scale >= DecimalType.MIN_SCALE
+                        && scale <= precision) {
                     return DataTypes.DECIMAL(precision, scale);
                 }
-                // PostgreSQL NUMERIC without a typmod has no fixed precision or scale. Mapping it
-                // to DECIMAL(38, 0) loses fractional digits and disagrees with Debezium's
-                // value-dependent VariableScaleDecimal representation. Use a stable, lossless
-                // textual representation instead.
+                // PostgreSQL NUMERIC without a typmod and fixed values outside Flink's DECIMAL
+                // bounds cannot share a safe DECIMAL type. Use a stable, lossless textual
+                // representation instead.
                 return DataTypes.STRING();
             case DOUBLE:
                 return DataTypes.DOUBLE();
