@@ -23,6 +23,7 @@ import org.apache.flink.cdc.common.data.LocalZonedTimestampData;
 import org.apache.flink.cdc.common.data.MapData;
 import org.apache.flink.cdc.common.data.RecordData;
 import org.apache.flink.cdc.common.data.StringData;
+import org.apache.flink.cdc.common.data.TimeData;
 import org.apache.flink.cdc.common.data.TimestampData;
 import org.apache.flink.cdc.common.data.ZonedTimestampData;
 import org.apache.flink.cdc.common.types.DataType;
@@ -32,6 +33,7 @@ import org.apache.flink.core.memory.MemorySegmentFactory;
 
 import java.lang.reflect.Array;
 
+import static org.apache.flink.cdc.common.types.DataTypeChecks.getPrecision;
 import static org.apache.flink.core.memory.MemoryUtils.UNSAFE;
 
 /**
@@ -146,8 +148,9 @@ public final class BinaryArrayData extends BinarySection implements ArrayData {
             case INTEGER:
             case FLOAT:
             case DATE:
-            case TIME_WITHOUT_TIME_ZONE:
                 return 4;
+            case TIME_WITHOUT_TIME_ZONE:
+                return getPrecision(type) <= 3 ? 4 : 8;
             default:
                 throw new IllegalArgumentException();
         }
@@ -224,6 +227,31 @@ public final class BinaryArrayData extends BinarySection implements ArrayData {
     public int getInt(int pos) {
         assertIndexIsValid(pos);
         return BinarySegmentUtils.getInt(segments, getElementOffset(pos, 4));
+    }
+
+    @Override
+    public TimeData getTime(int pos, int precision) {
+        assertIndexIsValid(pos);
+        if (precision <= 3 || usesLegacyTimeLayout()) {
+            return TimeData.fromMillisOfDay(
+                    BinarySegmentUtils.getInt(segments, getElementOffset(pos, 4)));
+        }
+        long encoded = BinarySegmentUtils.getLong(segments, getElementOffset(pos, 8));
+        if (encoded < 0) {
+            return TimeData.fromNanoOfDay(encoded & Long.MAX_VALUE);
+        }
+        if (size == 1) {
+            // Four- and eight-byte layouts have the same padded size for a single element.
+            return TimeData.fromMillisOfDay(
+                    BinarySegmentUtils.getInt(segments, getElementOffset(pos, 4)));
+        }
+        throw new IllegalStateException("High-precision TIME array is missing its format marker");
+    }
+
+    private boolean usesLegacyTimeLayout() {
+        long nanosLayoutSize =
+                ((long) calculateHeaderInBytes(size) + (long) size * Long.BYTES + 7L) & ~7L;
+        return sizeInBytes < nanosLayoutSize;
     }
 
     public void setInt(int pos, int value) {
