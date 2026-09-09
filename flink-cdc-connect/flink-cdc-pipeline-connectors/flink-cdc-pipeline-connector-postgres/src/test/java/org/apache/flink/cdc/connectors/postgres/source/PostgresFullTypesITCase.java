@@ -53,6 +53,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -76,6 +78,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.TimeZone;
 import java.util.stream.Stream;
 
 import static org.testcontainers.containers.PostgreSQLContainer.POSTGRESQL_PORT;
@@ -252,60 +255,103 @@ public class PostgresFullTypesITCase extends PostgresTestBase {
                 .isEqualTo(expectedSnapshot);
     }
 
-    @Test
-    public void testTimeTypesWithTemporalModeAdaptive() throws Exception {
-        initializePostgresTable(POSTGIS_CONTAINER, "column_type_test");
+    @ParameterizedTest
+    @ValueSource(strings = {"UTC", "Asia/Shanghai"})
+    public void testTimeSixPrecisionThroughSnapshotAndWal(String jvmTimeZone) throws Exception {
+        TimeZone originalTimeZone = TimeZone.getDefault();
+        TimeZone.setDefault(TimeZone.getTimeZone(jvmTimeZone));
+        try {
+            initializePostgresTable(POSTGIS_CONTAINER, "column_type_test");
+            try (Connection connection =
+                            PostgresTestBase.getJdbcConnection(POSTGIS_CONTAINER, "postgres");
+                    Statement statement = connection.createStatement()) {
+                statement.execute(
+                        "UPDATE inventory.time_types SET "
+                                + "time_c = '04:05:06', "
+                                + "time_3_c = '04:05:06.123', "
+                                + "time_6_c = '04:05:06.123456' WHERE id = 2");
+            }
 
-        Properties debeziumProps = new Properties();
-        debeziumProps.setProperty("time.precision.mode", "adaptive");
+            Properties debeziumProps = new Properties();
+            debeziumProps.setProperty("time.precision.mode", "adaptive");
 
-        PostgresSourceConfigFactory configFactory =
-                (PostgresSourceConfigFactory)
-                        new PostgresSourceConfigFactory()
-                                .hostname(POSTGIS_CONTAINER.getHost())
-                                .port(POSTGIS_CONTAINER.getMappedPort(POSTGRESQL_PORT))
-                                .username(TEST_USER)
-                                .password(TEST_PASSWORD)
-                                .databaseList(POSTGRES_CONTAINER.getDatabaseName())
-                                .tableList("inventory.time_types")
-                                .startupOptions(StartupOptions.initial())
-                                .debeziumProperties(debeziumProps)
-                                .serverTimeZone("UTC");
-        configFactory.database(POSTGRES_CONTAINER.getDatabaseName());
-        configFactory.slotName(slotName);
-        configFactory.decodingPluginName("pgoutput");
+            PostgresSourceConfigFactory configFactory =
+                    (PostgresSourceConfigFactory)
+                            new PostgresSourceConfigFactory()
+                                    .hostname(POSTGIS_CONTAINER.getHost())
+                                    .port(POSTGIS_CONTAINER.getMappedPort(POSTGRESQL_PORT))
+                                    .username(TEST_USER)
+                                    .password(TEST_PASSWORD)
+                                    .databaseList(POSTGRES_CONTAINER.getDatabaseName())
+                                    .tableList("inventory.time_types")
+                                    .startupOptions(StartupOptions.initial())
+                                    .debeziumProperties(debeziumProps)
+                                    .serverTimeZone("UTC");
+            configFactory.database(POSTGRES_CONTAINER.getDatabaseName());
+            configFactory.slotName(slotName);
+            configFactory.decodingPluginName("pgoutput");
 
-        FlinkSourceProvider sourceProvider =
-                (FlinkSourceProvider)
-                        new PostgresDataSource(configFactory).getEventSourceProvider();
+            FlinkSourceProvider sourceProvider =
+                    (FlinkSourceProvider)
+                            new PostgresDataSource(configFactory).getEventSourceProvider();
 
-        CloseableIterator<Event> events =
-                env.fromSource(
-                                sourceProvider.getSource(),
-                                WatermarkStrategy.noWatermarks(),
-                                PostgresDataSourceFactory.IDENTIFIER,
-                                new EventTypeInfo())
-                        .executeAndCollect();
+            try (CloseableIterator<Event> events =
+                    env.fromSource(
+                                    sourceProvider.getSource(),
+                                    WatermarkStrategy.noWatermarks(),
+                                    PostgresDataSourceFactory.IDENTIFIER,
+                                    new EventTypeInfo())
+                            .executeAndCollect()) {
+                List<Event> snapshotResults = fetchResultsAndCreateTableEvent(events, 1).f0;
+                RecordData snapshotRecord = ((DataChangeEvent) snapshotResults.get(0)).after();
 
-        Object[] expectedSnapshot =
-                new Object[] {
-                    2,
-                    DateData.fromEpochDay(18460),
-                    TimeData.fromLocalTime(LocalTime.parse("18:00:22")),
-                    TimeData.fromLocalTime(LocalTime.parse("18:00:22.123")),
-                    TimeData.fromLocalTime(LocalTime.parse("18:00:22.123456")),
-                    TimestampData.fromLocalDateTime(LocalDateTime.parse("2020-07-17T18:00:22")),
-                    TimestampData.fromLocalDateTime(LocalDateTime.parse("2020-07-17T18:00:22.123")),
-                    TimestampData.fromLocalDateTime(
-                            LocalDateTime.parse("2020-07-17T18:00:22.123456")),
-                    TimestampData.fromLocalDateTime(LocalDateTime.parse("2020-07-17T18:00:22")),
-                    LocalZonedTimestampData.fromInstant(toInstant("2020-07-17 18:00:22")),
-                };
+                Assertions.assertThat(recordFields(snapshotRecord, TIME_TYPES_WITH_ADAPTIVE))
+                        .isEqualTo(
+                                new Object[] {
+                                    2,
+                                    DateData.fromEpochDay(18460),
+                                    TimeData.fromLocalTime(LocalTime.parse("04:05:06")),
+                                    TimeData.fromLocalTime(LocalTime.parse("04:05:06.123")),
+                                    TimeData.fromLocalTime(LocalTime.parse("04:05:06.123456")),
+                                    TimestampData.fromLocalDateTime(
+                                            LocalDateTime.parse("2020-07-17T18:00:22")),
+                                    TimestampData.fromLocalDateTime(
+                                            LocalDateTime.parse("2020-07-17T18:00:22.123")),
+                                    TimestampData.fromLocalDateTime(
+                                            LocalDateTime.parse("2020-07-17T18:00:22.123456")),
+                                    TimestampData.fromLocalDateTime(
+                                            LocalDateTime.parse("2020-07-17T18:00:22")),
+                                    LocalZonedTimestampData.fromInstant(
+                                            toInstant("2020-07-17 18:00:22")),
+                                });
+                Assertions.assertThat(microsOfDay(snapshotRecord, 2)).isEqualTo(14_706_000_000L);
+                Assertions.assertThat(microsOfDay(snapshotRecord, 3)).isEqualTo(14_706_123_000L);
+                Assertions.assertThat(microsOfDay(snapshotRecord, 4)).isEqualTo(14_706_123_456L);
 
-        List<Event> snapshotResults = fetchResultsAndCreateTableEvent(events, 1).f0;
-        RecordData snapshotRecord = ((DataChangeEvent) snapshotResults.get(0)).after();
-        Assertions.assertThat(recordFields(snapshotRecord, TIME_TYPES_WITH_ADAPTIVE))
-                .isEqualTo(expectedSnapshot);
+                try (Connection connection =
+                                PostgresTestBase.getJdbcConnection(POSTGIS_CONTAINER, "postgres");
+                        Statement statement = connection.createStatement()) {
+                    statement.execute(
+                            "UPDATE inventory.time_types SET "
+                                    + "time_c = '23:59:59', "
+                                    + "time_3_c = '23:59:59.999', "
+                                    + "time_6_c = '23:59:59.999999' WHERE id = 2");
+                }
+
+                List<Event> incrementalResults = fetchResultsAndCreateTableEvent(events, 1).f0;
+                DataChangeEvent updateEvent = (DataChangeEvent) incrementalResults.get(0);
+                Assertions.assertThat(microsOfDay(updateEvent.before(), 4))
+                        .isEqualTo(14_706_123_456L);
+                Assertions.assertThat(microsOfDay(updateEvent.after(), 2))
+                        .isEqualTo(86_399_000_000L);
+                Assertions.assertThat(microsOfDay(updateEvent.after(), 3))
+                        .isEqualTo(86_399_999_000L);
+                Assertions.assertThat(microsOfDay(updateEvent.after(), 4))
+                        .isEqualTo(86_399_999_999L);
+            }
+        } finally {
+            TimeZone.setDefault(originalTimeZone);
+        }
     }
 
     @Test
@@ -1103,6 +1149,10 @@ public class PostgresFullTypesITCase extends PostgresTestBase {
             }
         }
         return Tuple2.of(result, createTableEvents);
+    }
+
+    private static long microsOfDay(RecordData record, int position) {
+        return record.getTime(position).toLocalTime().toNanoOfDay() / 1_000;
     }
 
     private Object[] recordFields(RecordData record, RowType rowType) {

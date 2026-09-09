@@ -32,6 +32,7 @@ import org.apache.flink.cdc.common.types.TimestampType;
 import org.apache.flink.cdc.common.types.ZonedTimestampType;
 import org.apache.flink.cdc.common.types.variant.BinaryVariantBuilder;
 import org.apache.flink.cdc.common.types.variant.Variant;
+import org.apache.flink.cdc.runtime.serializer.data.writer.BinaryRecordDataWriter;
 
 import org.junit.jupiter.api.Test;
 
@@ -43,6 +44,31 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** Unit tests for {@link BinaryRecordDataGenerator}. */
 class BinaryRecordDataGeneratorTest {
+
+    @Test
+    void preservesHighPrecisionTimeAndReadsLegacyMilliseconds() {
+        BinaryRecordData precise =
+                new BinaryRecordDataGenerator(
+                                RowType.of(DataTypes.TIME(0), DataTypes.TIME(3), DataTypes.TIME(6)))
+                        .generate(
+                                new Object[] {
+                                    TimeData.fromMicroOfDay(14_706_000_000L),
+                                    TimeData.fromMicroOfDay(14_706_123_000L),
+                                    TimeData.fromMicroOfDay(14_706_123_456L)
+                                });
+
+        assertThat(precise.getTime(0, 0).toMicroOfDay()).isEqualTo(14_706_000_000L);
+        assertThat(precise.getTime(1, 3).toMicroOfDay()).isEqualTo(14_706_123_000L);
+        assertThat(precise.getTime(2, 6).toMicroOfDay()).isEqualTo(14_706_123_456L);
+        assertThat(precise.getTime(2, 0).toMicroOfDay()).isEqualTo(14_706_123_456L);
+        assertThat(precise.getTime(2).toMicroOfDay()).isEqualTo(14_706_123_456L);
+
+        BinaryRecordData legacy = new BinaryRecordData(1);
+        BinaryRecordDataWriter writer = new BinaryRecordDataWriter(legacy);
+        writer.writeInt(0, 14_706_123);
+        writer.complete();
+        assertThat(legacy.getTime(0, 6).toMicroOfDay()).isEqualTo(14_706_123_000L);
+    }
 
     @Test
     void testOf() {

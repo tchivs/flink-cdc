@@ -21,6 +21,7 @@ import org.apache.flink.api.common.typeutils.CompositeTypeSerializerSnapshot;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.TypeSerializerSchemaCompatibility;
 import org.apache.flink.api.common.typeutils.TypeSerializerSnapshot;
+import org.apache.flink.api.common.typeutils.TypeSerializerSnapshotAdapter;
 import org.apache.flink.api.common.typeutils.TypeSerializerUtils;
 import org.apache.flink.core.memory.DataInputView;
 import org.apache.flink.core.memory.DataOutputView;
@@ -183,6 +184,37 @@ public class NestedSerializersSnapshotDelegate {
     // ------------------------------------------------------------------------
     //  Utilities
     // ------------------------------------------------------------------------
+
+    /**
+     * Resolves compatibility from a serializer instance embedded in an older composite snapshot.
+     *
+     * <p>Older array, map, and nullable snapshots serialized their nested serializers directly.
+     * Re-snapshotting that restored instance lets format-aware serializers request migration
+     * instead of being rejected solely because their configuration objects are no longer equal.
+     */
+    public static TypeSerializerSchemaCompatibility<?> resolveSerializerCompatibility(
+            TypeSerializer<?> previousSerializer, TypeSerializer<?> newSerializer) {
+        if (previousSerializer.equals(newSerializer)) {
+            return TypeSerializerSchemaCompatibility.compatibleAsIs();
+        }
+
+        TypeSerializerSnapshot<?> previousSnapshot = previousSerializer.snapshotConfiguration();
+        if (!(previousSnapshot instanceof TypeSerializerSnapshotAdapter)) {
+            return TypeSerializerSchemaCompatibility.incompatible();
+        }
+        return resolveCompatibility(
+                newSerializer, (TypeSerializerSnapshotAdapter<?>) previousSnapshot);
+    }
+
+    /** Utility method to conjure up a new scope for adapter generic parameters. */
+    @SuppressWarnings("unchecked")
+    private static <E> TypeSerializerSchemaCompatibility<E> resolveCompatibility(
+            TypeSerializer<?> serializer, TypeSerializerSnapshotAdapter<?> snapshot) {
+        TypeSerializer<E> typedSerializer = (TypeSerializer<E>) serializer;
+        TypeSerializerSnapshotAdapter<E> typedSnapshot =
+                (TypeSerializerSnapshotAdapter<E>) snapshot;
+        return typedSnapshot.resolveSchemaCompatibility(typedSerializer);
+    }
 
     /** Utility method to conjure up a new scope for the generic parameters. */
     @SuppressWarnings("unchecked")
