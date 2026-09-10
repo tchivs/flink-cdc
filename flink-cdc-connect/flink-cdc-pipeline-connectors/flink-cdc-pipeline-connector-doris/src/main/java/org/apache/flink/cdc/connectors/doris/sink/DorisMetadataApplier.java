@@ -187,6 +187,9 @@ public class DorisMetadataApplier implements MetadataApplier {
                         DorisTypeMapper.toDorisType(
                                 DataTypeUtils.toFlinkDataType(column.getType()));
             }
+            if (!column.getType().isNullable()) {
+                typeString += " NOT NULL";
+            }
             fieldSchemaMap.put(
                     column.getName(),
                     new FieldSchema(
