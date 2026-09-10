@@ -163,11 +163,8 @@ public enum PostgreSQLReadableMetadata {
             DataTypes.STRING(),
             sourceFieldConverter(AbstractSourceInfo.SEQUENCE_KEY, false)),
 
-    /** Debezium snapshot marker: true, last, false, or incremental. */
-    SOURCE_SNAPSHOT(
-            "source.snapshot",
-            DataTypes.STRING(),
-            sourceFieldConverter(AbstractSourceInfo.SNAPSHOT_KEY, false)),
+    /** Canonical snapshot marker derived from Debezium's authoritative READ operation. */
+    SOURCE_SNAPSHOT("source.snapshot", DataTypes.STRING(), snapshotConverter()),
 
     /** Source timestamp in milliseconds since the epoch. */
     SOURCE_TIMESTAMP_MS(
@@ -222,6 +219,21 @@ public enum PostgreSQLReadableMetadata {
             public Object read(SourceRecord record) {
                 Struct envelope = (Struct) record.value();
                 return boundedString("source.op", envelope.getString(Envelope.FieldName.OPERATION));
+            }
+        };
+    }
+
+    private static MetadataConverter snapshotConverter() {
+        return new MetadataConverter() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public Object read(SourceRecord record) {
+                Struct envelope = (Struct) record.value();
+                return StringData.fromString(
+                        "r".equals(envelope.getString(Envelope.FieldName.OPERATION))
+                                ? "true"
+                                : "false");
             }
         };
     }

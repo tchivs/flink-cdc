@@ -140,7 +140,7 @@ class PostgresEventDeserializerTest {
         assertThat(metadata)
                 .containsEntry("source.op", "r")
                 .containsEntry("source.lsn", "0")
-                .containsEntry("source.snapshot", "false")
+                .containsEntry("source.snapshot", "true")
                 .containsEntry("source.sequence", "[null,\"0\"]")
                 .doesNotContainKey("source.tx-id");
         assertThat(metadata.get("source.offset"))
@@ -156,8 +156,8 @@ class PostgresEventDeserializerTest {
         Map<String, String> metadata = deserializer(pipelineMetadata()).metadata(record);
 
         assertThat(metadata)
-                .doesNotContainKeys(
-                        "source.lsn", "source.tx-id", "source.sequence", "source.snapshot")
+                .doesNotContainKeys("source.lsn", "source.tx-id", "source.sequence")
+                .containsEntry("source.snapshot", "false")
                 .containsEntry("source.ts-us", "1700000000123456")
                 .containsEntry("source.offset", "{\"ts_usec\":1700000000123456}");
     }
