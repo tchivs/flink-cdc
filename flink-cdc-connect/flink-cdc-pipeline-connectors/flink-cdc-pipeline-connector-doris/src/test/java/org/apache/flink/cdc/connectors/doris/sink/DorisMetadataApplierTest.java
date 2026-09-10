@@ -72,6 +72,9 @@ class DorisMetadataApplierTest {
 
         Assertions.assertThat(tableSchema.getTableBuckets()).isNull();
         Assertions.assertThat(DorisSchemaFactory.generateCreateTableDDL(tableSchema))
+                .contains("`id` BIGINT NOT NULL")
+                .contains("`payload` STRING")
+                .doesNotContain("`payload` STRING NOT NULL")
                 .contains("BUCKETS AUTO");
     }
 
