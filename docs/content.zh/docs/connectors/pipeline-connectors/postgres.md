@@ -369,7 +369,7 @@ source:
     <tr>
       <td>source.op</td>
       <td>STRING NOT NULL</td>
-      <td>Debezium 原始操作码：<code>r</code>、<code>c</code>、<code>u</code> 或 <code>d</code>。READ（<code>r</code>）是快照行的权威判断，即使 <code>source.snapshot</code> 为 <code>false</code>。</td>
+      <td>Debezium 原始操作码：<code>r</code>、<code>c</code>、<code>u</code> 或 <code>d</code>。</td>
     </tr>
     <tr>
       <td>source.database / source.schema / source.table</td>
@@ -394,7 +394,7 @@ source:
     <tr>
       <td>source.snapshot</td>
       <td>STRING</td>
-      <td>Debezium 源标记：<code>true</code>、<code>last</code>、<code>false</code> 或 <code>incremental</code>；应与 <code>source.op</code> 一起使用。</td>
+      <td>由操作码推导的规范快照标记：READ（<code>r</code>）记录为 <code>true</code>，增量 DML 为 <code>false</code>。</td>
     </tr>
     <tr>
       <td>source.ts-ms</td>

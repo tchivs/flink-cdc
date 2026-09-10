@@ -364,7 +364,7 @@ The following metadata columns are supported:
     <tr>
       <td>source.op</td>
       <td>STRING NOT NULL</td>
-      <td>The original Debezium operation code: <code>r</code>, <code>c</code>, <code>u</code>, or <code>d</code>. A READ (<code>r</code>) is authoritative for snapshot rows even when <code>source.snapshot</code> is <code>false</code>.</td>
+      <td>The original Debezium operation code: <code>r</code>, <code>c</code>, <code>u</code>, or <code>d</code>.</td>
     </tr>
     <tr>
       <td>source.database / source.schema / source.table</td>
@@ -389,7 +389,7 @@ The following metadata columns are supported:
     <tr>
       <td>source.snapshot</td>
       <td>STRING</td>
-      <td>Debezium's source marker: <code>true</code>, <code>last</code>, <code>false</code>, or <code>incremental</code>. Use it together with <code>source.op</code>.</td>
+      <td>Canonical snapshot marker derived from the operation code: <code>true</code> for READ (<code>r</code>) records and <code>false</code> for streaming DML.</td>
     </tr>
     <tr>
       <td>source.ts-ms</td>
