@@ -26,6 +26,8 @@ import org.apache.flink.cdc.common.pipeline.PipelineOptions;
 import org.apache.flink.cdc.common.sink.DataSink;
 import org.apache.flink.cdc.connectors.doris.sink.DorisDataSink;
 import org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions;
+import org.apache.flink.cdc.connectors.doris.utils.DorisSchemaUtils;
+import org.apache.flink.table.api.ValidationException;
 
 import org.apache.doris.flink.cfg.DorisExecutionOptions;
 import org.apache.doris.flink.cfg.DorisOptions;
@@ -43,12 +45,14 @@ import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.CH
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.FENODES;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.JDBC_URL;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.PASSWORD;
+import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SCHEMA_CHANGE_ALLOWED_TYPES;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SINK_BUFFER_COUNT;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SINK_BUFFER_FLUSH_INTERVAL;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SINK_BUFFER_FLUSH_MAX_BYTES;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SINK_BUFFER_FLUSH_MAX_ROWS;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SINK_BUFFER_SIZE;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SINK_CHECK_INTERVAL;
+import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SINK_DELETE_MODE;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SINK_ENABLE_2PC;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SINK_ENABLE_BATCH_MODE;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SINK_ENABLE_DELETE;
@@ -56,9 +60,12 @@ import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SI
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SINK_IGNORE_UPDATE_BEFORE;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SINK_LABEL_PREFIX;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SINK_MAX_RETRIES;
+import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SINK_METADATA_COLUMNS_PREFIX;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SINK_USE_CACHE;
+import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.SINK_VISIBLE_DELETE_COLUMN;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.STREAM_LOAD_PROP_PREFIX;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.TABLE_CREATE_AUTO_PARTITION_PROPERTIES_PREFIX;
+import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.TABLE_CREATE_BUCKETS;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.TABLE_CREATE_PROPERTIES_PREFIX;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.USERNAME;
 
@@ -71,9 +78,11 @@ public class DorisDataSinkFactory implements DataSinkFactory {
                 .validateExcept(
                         TABLE_CREATE_PROPERTIES_PREFIX,
                         STREAM_LOAD_PROP_PREFIX,
-                        TABLE_CREATE_AUTO_PARTITION_PROPERTIES_PREFIX);
+                        TABLE_CREATE_AUTO_PARTITION_PROPERTIES_PREFIX,
+                        SINK_METADATA_COLUMNS_PREFIX);
 
         Configuration config = context.getFactoryConfiguration();
+        validateConnectorOptions(config);
         DorisOptions.Builder optionsBuilder = DorisOptions.builder();
         DorisExecutionOptions.Builder executionBuilder = DorisExecutionOptions.builder();
         config.getOptional(FENODES).ifPresent(optionsBuilder::setFenodes);
@@ -133,6 +142,25 @@ public class DorisDataSinkFactory implements DataSinkFactory {
         return "doris";
     }
 
+    private static void validateConnectorOptions(Configuration config) {
+        config.getOptional(TABLE_CREATE_BUCKETS)
+                .ifPresent(
+                        buckets -> {
+                            if (buckets < 1 || buckets > 256) {
+                                throw new ValidationException(
+                                        String.format(
+                                                "Option '%s' must be between 1 and 256, but was %d.",
+                                                TABLE_CREATE_BUCKETS.key(), buckets));
+                            }
+                        });
+        try {
+            DorisSchemaUtils.getAllowedSchemaEvolutionTypes(config);
+            DorisDataSinkOptions.validateVisibleColumnOptions(config);
+        } catch (IllegalArgumentException e) {
+            throw new ValidationException(e.getMessage(), e);
+        }
+    }
+
     @Override
     public Set<ConfigOption<?>> requiredOptions() {
         Set<ConfigOption<?>> options = new HashSet<>();
@@ -154,6 +182,8 @@ public class DorisDataSinkFactory implements DataSinkFactory {
         options.add(SINK_ENABLE_2PC);
         options.add(SINK_MAX_RETRIES);
         options.add(SINK_ENABLE_DELETE);
+        options.add(SINK_DELETE_MODE);
+        options.add(SINK_VISIBLE_DELETE_COLUMN);
         options.add(SINK_LABEL_PREFIX);
         options.add(SINK_BUFFER_SIZE);
         options.add(SINK_BUFFER_COUNT);
@@ -165,6 +195,8 @@ public class DorisDataSinkFactory implements DataSinkFactory {
         options.add(SINK_BUFFER_FLUSH_INTERVAL);
         options.add(SINK_IGNORE_UPDATE_BEFORE);
         options.add(SINK_USE_CACHE);
+        options.add(TABLE_CREATE_BUCKETS);
+        options.add(SCHEMA_CHANGE_ALLOWED_TYPES);
 
         return options;
     }

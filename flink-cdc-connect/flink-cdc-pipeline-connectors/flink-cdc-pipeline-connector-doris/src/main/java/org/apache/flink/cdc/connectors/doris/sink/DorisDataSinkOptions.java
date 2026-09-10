@@ -67,6 +67,38 @@ public class DorisDataSinkOptions {
                     .defaultValue("UTF-8")
                     .withDescription("Charset encoding for doris http client, default UTF-8.");
 
+    public static final ConfigOption<Integer> TABLE_CREATE_BUCKETS =
+            ConfigOptions.key("table.create.buckets")
+                    .intType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Explicit bucket count for automatically created Doris tables. "
+                                    + "If absent, Doris chooses the bucket count automatically.");
+
+    public static final ConfigOption<String> SCHEMA_CHANGE_ALLOWED_TYPES =
+            ConfigOptions.key("schema-change.allowed-types")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Comma-separated allowlist of Doris schema evolution event types. "
+                                    + "If absent, all supported types are allowed.");
+
+    public static final ConfigOption<String> SINK_DELETE_MODE =
+            ConfigOptions.key("sink.delete-mode")
+                    .stringType()
+                    .defaultValue("PHYSICAL")
+                    .withDescription(
+                            "Delete handling mode. PHYSICAL uses Doris delete signs; VISIBLE writes tombstone upserts.");
+
+    public static final ConfigOption<String> SINK_VISIBLE_DELETE_COLUMN =
+            ConfigOptions.key("sink.visible-delete-column")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Target BOOLEAN column used as the tombstone marker in VISIBLE delete mode.");
+
+    public static final String SINK_METADATA_COLUMNS_PREFIX = "sink.metadata-columns.";
+
     // Streaming Sink options
     public static final ConfigOption<Boolean> SINK_ENABLE_2PC =
             ConfigOptions.key("sink.enable-2pc")
@@ -181,6 +213,10 @@ public class DorisDataSinkOptions {
             TABLE_CREATE_AUTO_PARTITION_PROPERTIES_PREFIX + TABLE_CREATE_PARTITION_INCLUDE;
     public static final String TABLE_CREATE_AUTO_PARTITION_PROPERTIES_EXCLUDE =
             TABLE_CREATE_AUTO_PARTITION_PROPERTIES_PREFIX + TABLE_CREATE_PARTITION_EXCLUDE;
+
+    public static void validateVisibleColumnOptions(Configuration configuration) {
+        DorisSinkConfig.from(configuration);
+    }
 
     public static Map<String, String> getPropertiesByPrefix(
             Configuration tableOptions, String prefix) {
