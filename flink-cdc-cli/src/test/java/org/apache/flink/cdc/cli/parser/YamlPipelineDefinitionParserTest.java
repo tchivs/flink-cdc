@@ -41,6 +41,7 @@ import java.time.ZoneId;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Set;
 
 import static org.apache.flink.cdc.common.event.SchemaChangeEventType.ADD_COLUMN;
@@ -442,6 +443,37 @@ class YamlPipelineDefinitionParserTest {
                                     .put("schema.change.behavior", "evolve")
                                     .put("schema-operator.rpc-timeout", "1 h")
                                     .build()));
+
+    @Test
+    void testParsingStructuredSinkOptionsAsJsonScalars() throws Exception {
+        YamlPipelineDefinitionParser parser = new YamlPipelineDefinitionParser();
+        PipelineDef pipelineDef =
+                parser.parse(
+                        "source:\n"
+                                + "  type: values\n"
+                                + "sink:\n"
+                                + "  type: composite-sink\n"
+                                + "  sinks:\n"
+                                + "    doris:\n"
+                                + "      type: doris\n"
+                                + "      sink.enable-2pc: true\n"
+                                + "  routes:\n"
+                                + "    - sink: doris\n"
+                                + "      tables: [ods.*]\n"
+                                + "pipeline:\n"
+                                + "  parallelism: 1\n",
+                        new Configuration());
+
+        Map<String, String> sinkConfig = pipelineDef.getSink().getConfig().toMap();
+        org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper json =
+                new org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper();
+        assertThat(json.readTree(sinkConfig.get("sinks")).at("/doris/type").asText())
+                .isEqualTo("doris");
+        assertThat(json.readTree(sinkConfig.get("sinks")).at("/doris/sink.enable-2pc").asBoolean())
+                .isTrue();
+        assertThat(json.readTree(sinkConfig.get("routes")).at("/0/tables/0").asText())
+                .isEqualTo("ods.*");
+    }
 
     @Test
     void testParsingFullDefinitionFromString() throws Exception {
