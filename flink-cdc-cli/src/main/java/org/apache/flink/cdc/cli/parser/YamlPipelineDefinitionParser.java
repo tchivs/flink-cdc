@@ -37,6 +37,7 @@ import org.apache.flink.core.fs.FSDataInputStream;
 import org.apache.flink.core.fs.FileSystem;
 import org.apache.flink.core.fs.Path;
 
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.core.JsonProcessingException;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.core.type.TypeReference;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
@@ -123,6 +124,7 @@ public class YamlPipelineDefinitionParser implements PipelineDefinitionParser {
     public static final String TRANSFORM_TABLE_OPTION_DELIMITER_KEY = "table-options.delimiter";
 
     private static final ObjectMapper mapper = new ObjectMapper(new YAMLFactory());
+    private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
 
     /** Parse the specified pipeline definition file. */
     @Override
@@ -279,8 +281,7 @@ public class YamlPipelineDefinitionParser implements PipelineDefinitionParser {
             ((ObjectNode) sinkNode).remove(EXISTING_TABLE_SCHEMA_EXPANSION_MODE);
         }
 
-        Map<String, String> sinkMap =
-                mapper.convertValue(sinkNode, new TypeReference<Map<String, String>>() {});
+        Map<String, String> sinkMap = sinkConfiguration(sinkNode);
 
         // "type" field is required
         String type =
@@ -320,6 +321,37 @@ public class YamlPipelineDefinitionParser implements PipelineDefinitionParser {
                 String.format(
                         "Option \"%s\" must be one of DISABLED, CHECK, TRY_EXPAND, EXPAND, but was \"%s\".",
                         EXISTING_TABLE_SCHEMA_EXPANSION_MODE, value));
+    }
+
+    private Map<String, String> sinkConfiguration(JsonNode sinkNode) {
+        if (!(sinkNode instanceof ObjectNode)) {
+            throw new IllegalArgumentException("Sink configuration must be a YAML object");
+        }
+        Map<String, String> result = new LinkedHashMap<>();
+        sinkNode.fields()
+                .forEachRemaining(
+                        entry -> {
+                            JsonNode value = entry.getValue();
+                            if (value == null || value.isNull()) {
+                                throw new IllegalArgumentException(
+                                        "Sink option '" + entry.getKey() + "' must not be null");
+                            }
+                            result.put(
+                                    entry.getKey(),
+                                    value.isContainerNode()
+                                            ? structuredSinkOption(entry.getKey(), value)
+                                            : value.asText());
+                        });
+        return result;
+    }
+
+    private String structuredSinkOption(String name, JsonNode value) {
+        try {
+            return JSON_MAPPER.writeValueAsString(value);
+        } catch (JsonProcessingException error) {
+            throw new IllegalArgumentException(
+                    "Sink option '" + name + "' is not valid structured configuration", error);
+        }
     }
 
     private RouteDef toRouteDef(JsonNode routeNode) {
