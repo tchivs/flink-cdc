@@ -21,7 +21,7 @@ limitations under the License.
     <parent>
         <artifactId>flink-cdc-e2e-tests</artifactId>
         <groupId>org.apache.flink</groupId>
-        <version>3.6.0-2.2-hytera-slot-meta-num-time6-doris-ods-20260911-r12</version>
+        <version>3.6.0-2.2-hytera-slot-meta-num-time6-doris-ods-20260911-r13</version>
     </parent>
     <modelVersion>4.0.0</modelVersion>
 
