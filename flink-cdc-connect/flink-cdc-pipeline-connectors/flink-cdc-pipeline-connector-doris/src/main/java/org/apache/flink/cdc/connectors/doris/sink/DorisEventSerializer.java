@@ -37,7 +37,6 @@ import org.apache.flink.cdc.common.utils.Preconditions;
 import org.apache.flink.cdc.common.utils.SchemaUtils;
 import org.apache.flink.cdc.connectors.doris.utils.DorisSchemaUtils;
 
-import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.core.JsonProcessingException;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
 
 import org.apache.doris.flink.sink.writer.serializer.DorisRecord;
@@ -56,8 +55,9 @@ import static org.apache.doris.flink.sink.util.DeleteOperation.addDeleteSign;
 
 /** A serializer for Event to DorisRecord. */
 public class DorisEventSerializer implements DorisRecordSerializer<Event> {
-    private ObjectMapper objectMapper = new ObjectMapper();
-    private Map<TableId, Schema> schemaMaps = new HashMap<>();
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private final Map<TableId, Schema> schemaMaps = new HashMap<>();
+    private final DorisSinkConfig sinkConfig;
 
     /** Format DATE type data. */
     public static final DateTimeFormatter DATE_FORMATTER =
@@ -75,13 +75,14 @@ public class DorisEventSerializer implements DorisRecordSerializer<Event> {
             DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
 
     /** ZoneId from pipeline config to support timestamp with local time zone. */
-    public final ZoneId pipelineZoneId;
+    private final ZoneId pipelineZoneId;
 
-    public final Configuration dorisConfig;
+    private final Configuration dorisConfig;
 
     public DorisEventSerializer(ZoneId zoneId, Configuration config) {
         pipelineZoneId = zoneId;
-        dorisConfig = config;
+        dorisConfig = config.clone();
+        sinkConfig = DorisSinkConfig.from(dorisConfig);
     }
 
     @Override
@@ -92,21 +93,24 @@ public class DorisEventSerializer implements DorisRecordSerializer<Event> {
             SchemaChangeEvent schemaChangeEvent = (SchemaChangeEvent) event;
             TableId tableId = schemaChangeEvent.tableId();
             if (event instanceof CreateTableEvent) {
-                schemaMaps.put(tableId, ((CreateTableEvent) event).getSchema());
+                Schema schema = ((CreateTableEvent) event).getSchema();
+                sinkConfig.validateSchema(schema);
+                schemaMaps.put(tableId, schema);
             } else {
                 if (!schemaMaps.containsKey(tableId)) {
                     throw new RuntimeException("schema of " + tableId + " is not existed.");
                 }
-                schemaMaps.put(
-                        tableId,
+                Schema updatedSchema =
                         SchemaUtils.applySchemaChangeEvent(
-                                schemaMaps.get(tableId), schemaChangeEvent));
+                                schemaMaps.get(tableId), schemaChangeEvent);
+                sinkConfig.validateSchema(updatedSchema);
+                schemaMaps.put(tableId, updatedSchema);
             }
         }
         return null;
     }
 
-    private DorisRecord applyDataChangeEvent(DataChangeEvent event) throws JsonProcessingException {
+    private DorisRecord applyDataChangeEvent(DataChangeEvent event) throws IOException {
         TableId tableId = event.tableId();
         Schema schema = schemaMaps.get(tableId);
         Preconditions.checkNotNull(schema, event.tableId() + " is not existed");
@@ -117,11 +121,15 @@ public class DorisEventSerializer implements DorisRecordSerializer<Event> {
             case UPDATE:
             case REPLACE:
                 valueMap = serializerRecord(event.after(), schema);
+                appendVisibleColumns(valueMap, event, false);
                 addDeleteSign(valueMap, false);
                 break;
             case DELETE:
                 valueMap = serializerRecord(event.before(), schema);
-                addDeleteSign(valueMap, true);
+                appendVisibleColumns(valueMap, event, true);
+                if (!sinkConfig.usesVisibleDeletes()) {
+                    addDeleteSign(valueMap, true);
+                }
                 break;
             default:
                 throw new UnsupportedOperationException("Unsupport Operation " + op);
@@ -154,7 +162,26 @@ public class DorisEventSerializer implements DorisRecordSerializer<Event> {
         return DorisRecord.of(
                 tableId.getSchemaName(),
                 tableId.getTableName(),
-                objectMapper.writeValueAsString(valueMap).getBytes(StandardCharsets.UTF_8));
+                OBJECT_MAPPER.writeValueAsString(valueMap).getBytes(StandardCharsets.UTF_8));
+    }
+
+    private void appendVisibleColumns(
+            Map<String, Object> valueMap, DataChangeEvent event, boolean deleted)
+            throws IOException {
+        try {
+            for (DorisSinkConfig.MetadataColumn metadataColumn : sinkConfig.getMetadataColumns()) {
+                valueMap.put(metadataColumn.getTargetColumn(), metadataColumn.read(event.meta()));
+            }
+        } catch (IllegalArgumentException e) {
+            throw new IOException(
+                    String.format(
+                            "Failed to map event metadata for Doris table '%s': %s",
+                            event.tableId(), e.getMessage()),
+                    e);
+        }
+        if (sinkConfig.usesVisibleDeletes()) {
+            valueMap.put(sinkConfig.getVisibleDeleteColumn(), deleted);
+        }
     }
 
     /** serializer RecordData to Doris Value. */

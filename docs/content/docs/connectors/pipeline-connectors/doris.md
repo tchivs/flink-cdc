@@ -141,6 +141,37 @@ pipeline:
        <td>Whether to enable the delete function </td>
      </tr>
      <tr>
+       <td>sink.delete-mode</td>
+       <td>optional</td>
+       <td style="word-wrap: break-word;">PHYSICAL</td>
+       <td>String</td>
+       <td><code>PHYSICAL</code> preserves the default Doris delete-sign behavior.
+         <code>VISIBLE</code> writes deletes as ordinary upserts with a queryable tombstone column.</td>
+     </tr>
+     <tr>
+       <td>sink.visible-delete-column</td>
+       <td>required in VISIBLE mode</td>
+       <td style="word-wrap: break-word;">(none)</td>
+       <td>String</td>
+       <td>Safe Doris identifier for the BOOLEAN tombstone column. Inserts, updates, and replaces
+         write <code>false</code>; deletes write <code>true</code> from the before image and do not
+         set Doris's hidden delete sign.</td>
+     </tr>
+     <tr>
+       <td>sink.metadata-columns.&lt;target&gt;.source<br/>
+         sink.metadata-columns.&lt;target&gt;.type<br/>
+         sink.metadata-columns.&lt;target&gt;.default</td>
+       <td>optional</td>
+       <td style="word-wrap: break-word;">(none)</td>
+       <td>String</td>
+       <td>Maps a <code>DataChangeEvent</code> metadata key to a visible Doris column. Each target
+         requires <code>source</code> and <code>type</code>; <code>default</code> is optional except for a
+         column selected by <code>function_column.sequence_col</code>. Supported types are
+         <code>BIGINT</code>, <code>BOOLEAN</code>, and <code>STRING</code>. Target names must be unique safe
+         identifiers and cannot collide with source, tombstone, or Doris delete-sign columns. Missing
+         metadata without a default, invalid canonical values, and overflowing BIGINT values fail the record.</td>
+     </tr>
+     <tr>
        <td>sink.max-retries</td>
        <td>optional</td>
        <td style="word-wrap: break-word;">3</td>
@@ -195,6 +226,26 @@ pipeline:
        </td>
      </tr>
      <tr>
+       <td>schema-change.allowed-types</td>
+       <td>optional</td>
+       <td style="word-wrap: break-word;">(all supported types)</td>
+       <td>String</td>
+       <td>Strict, comma-separated allowlist of schema changes that the Doris sink may apply.
+         Supported values are <code>ADD_COLUMN</code>, <code>ALTER_COLUMN_TYPE</code>,
+         <code>DROP_COLUMN</code>, <code>DROP_TABLE</code>, <code>RENAME_COLUMN</code>, and
+         <code>TRUNCATE_TABLE</code>. <code>CREATE_TABLE</code> is always retained because it is
+         required for initial table provisioning. Pipeline schema-evolution settings may narrow
+         this list but cannot widen it.</td>
+     </tr>
+     <tr>
+       <td>table.create.buckets</td>
+       <td>optional</td>
+       <td style="word-wrap: break-word;">(none)</td>
+       <td>Integer</td>
+       <td>Explicit bucket count, from 1 through 256, for automatically created tables. When this
+         option is absent, the connector preserves Doris automatic bucket selection.</td>
+     </tr>
+     <tr>
        <td>table.create.properties.*</td>
        <td>optional</td>
        <td style="word-wrap: break-word;">(none)</td>
@@ -226,6 +277,35 @@ pipeline:
      </tbody>
 </table>
 </div>
+
+## Visible tombstones and event metadata
+
+The opt-in settings below preserve a row for deletes and project source metadata without changing
+the upstream event schema or any source payload:
+
+```yaml
+sink:
+  type: doris
+  # ... connection options
+  sink.delete-mode: VISIBLE
+  sink.visible-delete-column: deleted
+  sink.metadata-columns.source_lsn.source: source.lsn
+  sink.metadata-columns.source_lsn.type: BIGINT
+  table.create.properties.function_column.sequence_col: source_lsn
+```
+
+Configured columns are appended to auto-created Doris tables in target-name order. They are
+non-null because serialization either emits a converted value/default or fails closed. The visible
+delete column is created as <code>BOOLEAN NOT NULL DEFAULT false</code>. A configured default is also
+used as the Doris column default.
+
+<code>BIGINT</code> accepts only canonical signed decimal text in the Java 64-bit range: zero is
+<code>0</code>, positive values have no plus sign or leading zero, and negative values have no leading
+zero. A BIGINT target named by <code>function_column.sequence_col</code> cannot configure a default;
+missing, negative, noncanonical, or overflowing values fail. PostgreSQL snapshot
+<code>source.lsn=0</code> is accepted, while incremental unsigned LSN values must fit the signed range.
+<code>BOOLEAN</code> accepts only lowercase <code>true</code> or <code>false</code>, while
+<code>STRING</code> preserves the metadata value exactly.
 
 ## Data Type Mapping
 

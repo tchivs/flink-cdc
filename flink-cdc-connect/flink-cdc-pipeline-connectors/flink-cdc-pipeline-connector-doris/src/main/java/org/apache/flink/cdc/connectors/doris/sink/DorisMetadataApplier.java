@@ -44,8 +44,6 @@ import org.apache.flink.cdc.common.types.utils.DataTypeUtils;
 import org.apache.flink.cdc.connectors.doris.utils.DorisSchemaUtils;
 import org.apache.flink.util.CollectionUtil;
 
-import org.apache.flink.shaded.guava31.com.google.common.collect.Sets;
-
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.doris.flink.catalog.DorisTypeMapper;
 import org.apache.doris.flink.catalog.doris.DataModel;
@@ -57,40 +55,45 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import static org.apache.flink.cdc.common.event.SchemaChangeEventType.ADD_COLUMN;
-import static org.apache.flink.cdc.common.event.SchemaChangeEventType.ALTER_COLUMN_TYPE;
-import static org.apache.flink.cdc.common.event.SchemaChangeEventType.DROP_COLUMN;
-import static org.apache.flink.cdc.common.event.SchemaChangeEventType.DROP_TABLE;
-import static org.apache.flink.cdc.common.event.SchemaChangeEventType.RENAME_COLUMN;
-import static org.apache.flink.cdc.common.event.SchemaChangeEventType.TRUNCATE_TABLE;
+import static org.apache.flink.cdc.common.event.SchemaChangeEventType.CREATE_TABLE;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.CHARSET_ENCODING;
+import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.TABLE_CREATE_BUCKETS;
 import static org.apache.flink.cdc.connectors.doris.sink.DorisDataSinkOptions.TABLE_CREATE_PROPERTIES_PREFIX;
 
 /** Supports {@link DorisDataSink} to schema evolution. */
 public class DorisMetadataApplier implements MetadataApplier {
     private static final Logger LOG = LoggerFactory.getLogger(DorisMetadataApplier.class);
-    private DorisOptions dorisOptions;
-    private DorisSchemaChangeManager schemaChangeManager;
-    private Configuration config;
+
+    private final DorisSchemaChangeManager schemaChangeManager;
+    private final Configuration config;
+    private final Set<SchemaChangeEventType> configuredSchemaEvolutionTypes;
+    private final DorisSinkConfig sinkConfig;
     private Set<SchemaChangeEventType> enabledSchemaEvolutionTypes;
 
     public DorisMetadataApplier(DorisOptions dorisOptions, Configuration config) {
-        this.dorisOptions = dorisOptions;
+        this.config = config.clone();
         this.schemaChangeManager =
-                new DorisSchemaChangeManager(dorisOptions, config.get(CHARSET_ENCODING));
-        this.config = config;
-        this.enabledSchemaEvolutionTypes = getSupportedSchemaEvolutionTypes();
+                new DorisSchemaChangeManager(dorisOptions, this.config.get(CHARSET_ENCODING));
+        this.sinkConfig = DorisSinkConfig.from(this.config);
+        this.configuredSchemaEvolutionTypes =
+                DorisSchemaUtils.getAllowedSchemaEvolutionTypes(this.config);
+        this.enabledSchemaEvolutionTypes = configuredSchemaEvolutionTypes;
     }
 
     @Override
     public MetadataApplier setAcceptedSchemaEvolutionTypes(
             Set<SchemaChangeEventType> schemaEvolutionTypes) {
-        this.enabledSchemaEvolutionTypes = schemaEvolutionTypes;
+        EnumSet<SchemaChangeEventType> acceptedTypes =
+                EnumSet.copyOf(configuredSchemaEvolutionTypes);
+        acceptedTypes.retainAll(schemaEvolutionTypes);
+        acceptedTypes.add(CREATE_TABLE);
+        this.enabledSchemaEvolutionTypes = Collections.unmodifiableSet(acceptedTypes);
         return this;
     }
 
@@ -101,17 +104,20 @@ public class DorisMetadataApplier implements MetadataApplier {
 
     @Override
     public Set<SchemaChangeEventType> getSupportedSchemaEvolutionTypes() {
-        return Sets.newHashSet(
-                ADD_COLUMN,
-                ALTER_COLUMN_TYPE,
-                DROP_COLUMN,
-                DROP_TABLE,
-                RENAME_COLUMN,
-                TRUNCATE_TABLE);
+        return DorisSchemaUtils.getSupportedSchemaEvolutionTypes();
     }
 
     @Override
     public void applySchemaChange(SchemaChangeEvent event) {
+        if (event.getType() != CREATE_TABLE
+                && !enabledSchemaEvolutionTypes.contains(event.getType())) {
+            throw new SchemaEvolveException(
+                    event,
+                    String.format(
+                            "Schema evolution type %s is not allowed by Doris sink option '%s'.",
+                            event.getType(),
+                            DorisDataSinkOptions.SCHEMA_CHANGE_ALLOWED_TYPES.key()));
+        }
         SchemaChangeEventVisitor.<Void, SchemaEvolveException>visit(
                 event,
                 addColumnEvent -> {
@@ -150,38 +156,44 @@ public class DorisMetadataApplier implements MetadataApplier {
 
     private void applyCreateTableEvent(CreateTableEvent event) throws SchemaEvolveException {
         try {
-            Schema schema = event.getSchema();
-            TableId tableId = event.tableId();
-            TableSchema tableSchema = new TableSchema();
-            tableSchema.setTable(tableId.getTableName());
-            tableSchema.setDatabase(tableId.getSchemaName());
-            tableSchema.setModel(
-                    CollectionUtils.isEmpty(schema.primaryKeys())
-                            ? DataModel.DUPLICATE
-                            : DataModel.UNIQUE);
-            tableSchema.setFields(buildFields(schema));
-            tableSchema.setKeys(buildKeys(schema));
-            tableSchema.setDistributeKeys(buildDistributeKeys(schema));
-            tableSchema.setTableComment(schema.comment());
-
-            Map<String, String> tableProperties =
-                    DorisDataSinkOptions.getPropertiesByPrefix(
-                            config, TABLE_CREATE_PROPERTIES_PREFIX);
-            tableSchema.setProperties(tableProperties);
-
-            Tuple2<String, String> partitionInfo =
-                    DorisSchemaUtils.getPartitionInfo(config, schema, tableId);
-            if (partitionInfo != null) {
-                LOG.info("Partition info of {} is: {}.", tableId.identifier(), partitionInfo);
-                tableSchema.setPartitionInfo(partitionInfo);
-            }
-            schemaChangeManager.createTable(tableSchema);
+            schemaChangeManager.createTable(buildTableSchema(event));
         } catch (Exception e) {
             throw new SchemaEvolveException(event, e.getMessage(), e);
         }
     }
 
+    TableSchema buildTableSchema(CreateTableEvent event) {
+        Schema schema = event.getSchema();
+        TableId tableId = event.tableId();
+        TableSchema tableSchema = new TableSchema();
+        tableSchema.setTable(tableId.getTableName());
+        tableSchema.setDatabase(tableId.getSchemaName());
+        tableSchema.setModel(
+                CollectionUtils.isEmpty(schema.primaryKeys())
+                        ? DataModel.DUPLICATE
+                        : DataModel.UNIQUE);
+
+        tableSchema.setFields(buildFields(schema));
+        tableSchema.setKeys(buildKeys(schema));
+        tableSchema.setDistributeKeys(buildDistributeKeys(schema));
+        tableSchema.setTableComment(schema.comment());
+        config.getOptional(TABLE_CREATE_BUCKETS).ifPresent(tableSchema::setTableBuckets);
+
+        Map<String, String> tableProperties =
+                DorisDataSinkOptions.getPropertiesByPrefix(config, TABLE_CREATE_PROPERTIES_PREFIX);
+        tableSchema.setProperties(tableProperties);
+
+        Tuple2<String, String> partitionInfo =
+                DorisSchemaUtils.getPartitionInfo(config, schema, tableId);
+        if (partitionInfo != null) {
+            LOG.info("Partition info of {} is: {}.", tableId.identifier(), partitionInfo);
+            tableSchema.setPartitionInfo(partitionInfo);
+        }
+        return tableSchema;
+    }
+
     private Map<String, FieldSchema> buildFields(Schema schema) {
+        sinkConfig.validateSchema(schema);
         // Guaranteed the order of column
         Map<String, FieldSchema> fieldSchemaMap = new LinkedHashMap<>();
         List<String> columnNameList = schema.getColumnNames();
@@ -207,6 +219,24 @@ public class DorisMetadataApplier implements MetadataApplier {
                             convertInvalidTimestampDefaultValue(
                                     column.getDefaultValueExpression(), column.getType()),
                             column.getComment()));
+        }
+        for (DorisSinkConfig.MetadataColumn metadataColumn : sinkConfig.getMetadataColumns()) {
+            fieldSchemaMap.put(
+                    metadataColumn.getTargetColumn(),
+                    new FieldSchema(
+                            metadataColumn.getTargetColumn(),
+                            metadataColumn.getDdlType(),
+                            metadataColumn.getDdlDefaultValue(),
+                            "Flink CDC event metadata"));
+        }
+        if (sinkConfig.usesVisibleDeletes()) {
+            fieldSchemaMap.put(
+                    sinkConfig.getVisibleDeleteColumn(),
+                    new FieldSchema(
+                            sinkConfig.getVisibleDeleteColumn(),
+                            "BOOLEAN NOT NULL",
+                            "false",
+                            "Flink CDC visible delete marker"));
         }
         return fieldSchemaMap;
     }
@@ -240,6 +270,11 @@ public class DorisMetadataApplier implements MetadataApplier {
         try {
             TableId tableId = event.tableId();
             List<AddColumnEvent.ColumnWithPosition> addedColumns = event.getAddedColumns();
+            List<String> addedColumnNames = new ArrayList<>();
+            for (AddColumnEvent.ColumnWithPosition col : addedColumns) {
+                addedColumnNames.add(col.getAddColumn().getName());
+            }
+            sinkConfig.validateColumnNames(addedColumnNames);
             for (AddColumnEvent.ColumnWithPosition col : addedColumns) {
                 Column column = col.getAddColumn();
                 FieldSchema addFieldSchema =
@@ -274,6 +309,7 @@ public class DorisMetadataApplier implements MetadataApplier {
         try {
             TableId tableId = event.tableId();
             Map<String, String> nameMapping = event.getNameMapping();
+            sinkConfig.validateColumnNames(nameMapping.values());
             for (Map.Entry<String, String> entry : nameMapping.entrySet()) {
                 schemaChangeManager.renameColumn(
                         tableId.getSchemaName(),

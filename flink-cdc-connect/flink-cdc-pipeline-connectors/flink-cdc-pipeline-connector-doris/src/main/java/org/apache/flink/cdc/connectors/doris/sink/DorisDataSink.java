@@ -38,7 +38,7 @@ public class DorisDataSink implements DataSink, Serializable {
     private final DorisOptions dorisOptions;
     private final DorisReadOptions readOptions;
     private final DorisExecutionOptions executionOptions;
-    private Configuration configuration;
+    private final Configuration configuration;
     private final ZoneId zoneId;
 
     public DorisDataSink(
@@ -50,7 +50,7 @@ public class DorisDataSink implements DataSink, Serializable {
         this.dorisOptions = dorisOptions;
         this.readOptions = dorisReadOptions;
         this.executionOptions = dorisExecutionOptions;
-        this.configuration = configuration;
+        this.configuration = configuration.clone();
         this.zoneId = zoneId;
     }
 

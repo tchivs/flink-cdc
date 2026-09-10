@@ -141,6 +141,35 @@ pipeline:
        <td>是否启用删除 </td>
      </tr>
      <tr>
+       <td>sink.delete-mode</td>
+       <td>optional</td>
+       <td style="word-wrap: break-word;">PHYSICAL</td>
+       <td>String</td>
+       <td><code>PHYSICAL</code> 保留默认的 Doris 删除标记行为；<code>VISIBLE</code>
+         将删除写成普通 upsert，并保留可查询的墓碑列。</td>
+     </tr>
+     <tr>
+       <td>sink.visible-delete-column</td>
+       <td>VISIBLE 模式必填</td>
+       <td style="word-wrap: break-word;">(none)</td>
+       <td>String</td>
+       <td>BOOLEAN 墓碑列的安全 Doris 标识符。插入、更新和替换写入 <code>false</code>；
+         删除使用 before image 写入 <code>true</code>，且不设置 Doris 隐藏删除标记。</td>
+     </tr>
+     <tr>
+       <td>sink.metadata-columns.&lt;target&gt;.source<br/>
+         sink.metadata-columns.&lt;target&gt;.type<br/>
+         sink.metadata-columns.&lt;target&gt;.default</td>
+       <td>optional</td>
+       <td style="word-wrap: break-word;">(none)</td>
+       <td>String</td>
+       <td>将 <code>DataChangeEvent</code> 元数据键映射为可见 Doris 列。每个目标必须配置
+         <code>source</code> 和 <code>type</code>；除被 <code>function_column.sequence_col</code>
+         选中的列外，<code>default</code> 可选。类型支持 <code>BIGINT</code>、<code>BOOLEAN</code>
+         和 <code>STRING</code>。目标名必须是唯一的安全标识符，且不能与源列、墓碑列或 Doris
+         删除标记列冲突。元数据缺失且没有默认值、值不是规范格式或 BIGINT 溢出时，该记录失败。</td>
+     </tr>
+     <tr>
        <td>sink.max-retries</td>
        <td>optional</td>
        <td style="word-wrap: break-word;">3</td>
@@ -194,6 +223,25 @@ pipeline:
       </td>
     </tr>
     <tr>
+      <td>schema-change.allowed-types</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">（全部支持的类型）</td>
+      <td>String</td>
+      <td>Doris Sink 可以执行的 Schema 变更严格白名单，多个类型以逗号分隔。
+        支持 <code>ADD_COLUMN</code>、<code>ALTER_COLUMN_TYPE</code>、
+        <code>DROP_COLUMN</code>、<code>DROP_TABLE</code>、<code>RENAME_COLUMN</code> 和
+        <code>TRUNCATE_TABLE</code>。初始建表必须使用 <code>CREATE_TABLE</code>，因此该类型
+        始终保留。Pipeline 的 Schema 演进配置可以进一步收窄此白名单，但不能扩大它。</td>
+    </tr>
+    <tr>
+      <td>table.create.buckets</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>Integer</td>
+      <td>自动创建 Doris 表时显式指定分桶数，取值范围为 1 到 256。未配置时保留 Doris
+        自动选择分桶数的行为。</td>
+    </tr>
+    <tr>
       <td>table.create.properties.*</td>
       <td>optional</td>
       <td style="word-wrap: break-word;">(none)</td>
@@ -225,6 +273,32 @@ pipeline:
     </tbody>
 </table>
 </div>
+
+## 可见墓碑与事件元数据
+
+以下配置通过 Doris Sink 内部投影保留删除行和源元数据，不会修改上游事件 Schema 或源端载荷：
+
+```yaml
+sink:
+  type: doris
+  # ... 连接配置
+  sink.delete-mode: VISIBLE
+  sink.visible-delete-column: deleted
+  sink.metadata-columns.source_lsn.source: source.lsn
+  sink.metadata-columns.source_lsn.type: BIGINT
+  table.create.properties.function_column.sequence_col: source_lsn
+```
+
+配置列按目标列名排序后追加到自动创建的 Doris 表。序列化必须写入转换后的值或默认值，否则严格失败，
+因此这些列为非空列。可见删除列创建为 <code>BOOLEAN NOT NULL DEFAULT false</code>；配置的元数据
+默认值也会成为 Doris 列默认值。
+
+<code>BIGINT</code> 只接受 Java 有符号 64 位范围内的规范十进制文本：零必须写成 <code>0</code>，
+正数不能带加号或前导零，负数不能带前导零。被 <code>function_column.sequence_col</code> 选中的
+BIGINT 列不能配置默认值；缺失、负数、非规范或溢出的值都会失败。PostgreSQL 快照
+<code>source.lsn=0</code> 可用，增量阶段的无符号 LSN 必须落在有符号 BIGINT 范围内。
+<code>BOOLEAN</code> 只接受小写 <code>true</code> 或 <code>false</code>；<code>STRING</code>
+完整保留元数据值。
 
 ## 数据类型映射
 
