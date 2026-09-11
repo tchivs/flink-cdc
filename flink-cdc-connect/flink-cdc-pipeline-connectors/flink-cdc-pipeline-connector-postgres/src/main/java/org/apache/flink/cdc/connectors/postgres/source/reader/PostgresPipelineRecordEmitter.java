@@ -48,6 +48,7 @@ import org.slf4j.LoggerFactory;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 import static io.debezium.connector.AbstractSourceInfo.SCHEMA_NAME_KEY;
@@ -97,6 +98,7 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
             TableId tableId = splitState.asSnapshotSplitState().toSourceSplit().getTableId();
             sendCreateTableEventIfNeeded(tableId, output, splitState);
         } else if (isDataChangeRecord(element)) {
+            element = routeToParentTable(element);
             handleDataChangeRecord(element, output, splitState);
         } else if (isSchemaChangeEvent(element) && sourceConfig.isIncludeSchemaChanges()) {
             handleSchemaChangeRecord(element, output, splitState);
@@ -202,7 +204,7 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
     private CreateTableEvent getCreateTableEvent(
             PostgresSourceConfig sourceConfig, TableId tableId) {
         try (PostgresConnection jdbc = postgresDialect.openJdbcConnection()) {
-            Schema schema = PostgresSchemaUtils.getTableSchema(tableId, sourceConfig, jdbc);
+            Schema schema = resolveTableSchema(tableId, sourceConfig, jdbc);
             return new CreateTableEvent(
                     toCdcTableId(
                             tableId,
@@ -221,6 +223,25 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
         return typeRegistry;
     }
 
+    /**
+     * Returns the schema of the given table, or the schema of one of its child partitions when the
+     * table is a partition root without a primary key of its own.
+     */
+    private Schema resolveTableSchema(
+            TableId tableId, PostgresSourceConfig sourceConfig, PostgresConnection jdbc) {
+        Schema schema = PostgresSchemaUtils.getTableSchema(tableId, sourceConfig, jdbc);
+        if (schema.primaryKeys().isEmpty()) {
+            Optional<String> sampleChild =
+                    sourceConfig.getPartitionRouting().sampleChildOf(schemaDotTable(tableId));
+            if (sampleChild.isPresent()) {
+                schema =
+                        PostgresSchemaUtils.getTableSchema(
+                                toTableId(sampleChild.get()), sourceConfig, jdbc);
+            }
+        }
+        return schema;
+    }
+
     private TableId getTableId(SourceRecord dataRecord) {
         Struct value = (Struct) dataRecord.value();
         Struct source = value.getStruct(Envelope.FieldName.SOURCE);
@@ -231,5 +252,53 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
         }
         String tableName = source.getString(TABLE_NAME_KEY);
         return new TableId(null, schemaName, tableName);
+    }
+
+    /**
+     * Rewrites a record of a child partition into a record of the configured partition root. Such a
+     * server has no {@code publish_via_partition_root}, so the topic, the source metadata and the
+     * table id of the event all report the identity of the partition and have to be corrected.
+     */
+    private SourceRecord routeToParentTable(SourceRecord element) {
+        Struct value = (Struct) element.value();
+        Struct source = value.getStruct(Envelope.FieldName.SOURCE);
+        if (source == null || source.schema().field(SCHEMA_NAME_KEY) == null) {
+            return element;
+        }
+        Optional<String> parent =
+                sourceConfig
+                        .getPartitionRouting()
+                        .parentOf(
+                                source.getString(SCHEMA_NAME_KEY)
+                                        + "."
+                                        + source.getString(TABLE_NAME_KEY));
+        if (!parent.isPresent()) {
+            return element;
+        }
+        TableId parentTableId = toTableId(parent.get());
+        source.put(SCHEMA_NAME_KEY, parentTableId.schema());
+        source.put(TABLE_NAME_KEY, parentTableId.table());
+        String topic = element.topic();
+        return element.newRecord(
+                topic.substring(0, topic.lastIndexOf('.') + 1) + parentTableId.table(),
+                element.kafkaPartition(),
+                element.keySchema(),
+                element.key(),
+                element.valueSchema(),
+                element.value(),
+                element.timestamp(),
+                element.headers());
+    }
+
+    private static TableId toTableId(String schemaDotTable) {
+        int separator = schemaDotTable.indexOf('.');
+        return new TableId(
+                null,
+                schemaDotTable.substring(0, separator),
+                schemaDotTable.substring(separator + 1));
+    }
+
+    private static String schemaDotTable(TableId tableId) {
+        return tableId.schema() + "." + tableId.table();
     }
 }

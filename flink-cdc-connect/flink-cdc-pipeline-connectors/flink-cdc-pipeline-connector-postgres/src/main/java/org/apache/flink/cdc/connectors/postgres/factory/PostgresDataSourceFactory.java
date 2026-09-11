@@ -72,6 +72,7 @@ import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSource
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_KEY_COLUMN;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_LSN_COMMIT_CHECKPOINTS_DELAY;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_NEWLY_ADDED_TABLE_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_PRE_EPOCH_TIMESTAMP_WALL_CLOCK_CONVERSION_ENABLED;
@@ -137,6 +138,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         boolean tableIdIncludeDatabase = config.get(TABLE_ID_INCLUDE_DATABASE);
         boolean includeSchemaChanges = config.get(SCHEMA_CHANGE_ENABLED);
         boolean scanNewlyAddedTableEnabled = config.get(SCAN_NEWLY_ADDED_TABLE_ENABLED);
+        boolean includePartitionedTables = config.get(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED);
 
         validateIntegerOption(SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE, splitSize, 1);
         validateIntegerOption(CHUNK_META_GROUP_SIZE, splitMetaGroupSize, 1);
@@ -180,6 +182,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
                         .includeDatabaseInTableId(tableIdIncludeDatabase)
                         .includeSchemaChanges(includeSchemaChanges)
                         .scanNewlyAddedTableEnabled(scanNewlyAddedTableEnabled)
+                        .includePartitionedTables(includePartitionedTables)
                         .getConfigFactory();
 
         List<TableId> tableIds = PostgresSchemaUtils.listTables(configFactory.create(0), null);
@@ -296,6 +299,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         options.add(SCHEMA_CHANGE_ENABLED);
         options.add(SCAN_NEWLY_ADDED_TABLE_ENABLED);
         options.add(SCAN_PRE_EPOCH_TIMESTAMP_WALL_CLOCK_CONVERSION_ENABLED);
+        options.add(SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED);
         return options;
     }
 

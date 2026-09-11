@@ -313,4 +313,22 @@ public class PostgresDataSourceOptions {
                                     + "to discover tables that match the source `tables:` pattern but were not part of "
                                     + "the captured set at savepoint time. Mirrors the MySQL Pipeline connector option "
                                     + "of the same name.");
+
+    /**
+     * Same switch as {@code
+     * org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceOptions#SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED},
+     * see there for the version dependent behaviour.
+     */
+    @Experimental
+    public static final ConfigOption<Boolean> SCAN_INCLUDE_PARTITIONED_TABLES_ENABLED =
+            ConfigOptions.key("scan.include-partitioned-tables.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Enable reading from partitioned tables by their partition root. "
+                                    + "On PostgreSQL 13 and later the publication must use "
+                                    + "publish_via_partition_root=true; on PostgreSQL 10/11/12 the "
+                                    + "connector resolves the partitions of the configured tables "
+                                    + "itself for the streaming path. The table list should only "
+                                    + "match the parent table name.");
 }

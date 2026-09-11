@@ -95,8 +95,18 @@ public class PostgresSourceOptions extends JdbcSourceOptions {
                     .withDescription(
                             "Enable reading from partitioned table via partition root.\n"
                                     + "If enabled:\n"
-                                    + "(1) PUBLICATION must be created beforehand with parameter publish_via_partition_root=true\n"
-                                    + "(2) Table list (regex or predefined list) should only match the parent table name, if table list matches both parent and child tables, snapshot data will be read twice.");
+                                    + "(1) On PostgreSQL 13 and later, the server publishes the changes of a partition "
+                                    + "with the identity of the partition root, so the publication must be created "
+                                    + "beforehand with parameter publish_via_partition_root=true.\n"
+                                    + "(2) PostgreSQL 10/11/12 have no publish_via_partition_root. For the streaming "
+                                    + "(latest-offset) path the connector then resolves the child partitions of the "
+                                    + "configured tables itself and reports their changes as the configured table, "
+                                    + "while the publication still has to contain every child partition; the connector "
+                                    + "does not maintain that publication. Snapshot (initial) mode is not supported by "
+                                    + "this client side routing.\n"
+                                    + "In both cases the table list (regex or predefined list) should only match the "
+                                    + "parent table name, if table list matches both parent and child tables, snapshot "
+                                    + "data will be read twice.");
 
     public static final ConfigOption<Boolean> TABLE_ID_INCLUDE_DATABASE =
             ConfigOptions.key("table-id.include-database")
