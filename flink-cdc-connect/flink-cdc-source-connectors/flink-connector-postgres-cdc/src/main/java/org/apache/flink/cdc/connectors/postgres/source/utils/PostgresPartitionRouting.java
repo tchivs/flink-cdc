@@ -22,6 +22,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.Serializable;
 import java.sql.Connection;
+import java.sql.Driver;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -32,6 +33,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Properties;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.regex.Pattern;
@@ -116,7 +118,7 @@ public class PostgresPartitionRouting implements Serializable {
         if (!includePartitionedTables || configuredTables == null || configuredTables.isEmpty()) {
             return empty();
         }
-        try (Connection connection = DriverManager.getConnection(jdbcUrl, username, password)) {
+        try (Connection connection = openConnection(jdbcUrl, username, password)) {
             int serverVersion = readServerVersion(connection);
             if (serverVersion >= PUBLISH_VIA_PARTITION_ROOT_SINCE) {
                 LOG.info(
@@ -149,6 +151,24 @@ public class PostgresPartitionRouting implements Serializable {
                     e);
             return empty();
         }
+    }
+
+    /**
+     * Opens the metadata connection without {@link DriverManager}: inside a Flink task the JDBC
+     * driver is loaded by a user class loader, so it is not registered with the system {@link
+     * DriverManager} and {@code DriverManager.getConnection} would fail with "No suitable driver".
+     */
+    private static Connection openConnection(String jdbcUrl, String username, String password)
+            throws Exception {
+        Driver driver =
+                (Driver)
+                        Class.forName("org.postgresql.Driver")
+                                .getDeclaredConstructor()
+                                .newInstance();
+        Properties properties = new Properties();
+        properties.setProperty("user", username == null ? "" : username);
+        properties.setProperty("password", password == null ? "" : password);
+        return driver.connect(jdbcUrl, properties);
     }
 
     /** Builds a routing from the ancestor relations returned by {@link #PARTITION_ANCESTORS_SQL}. */
