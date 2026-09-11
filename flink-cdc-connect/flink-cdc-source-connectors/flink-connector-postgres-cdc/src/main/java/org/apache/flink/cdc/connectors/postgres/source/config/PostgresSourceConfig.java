@@ -19,6 +19,7 @@ package org.apache.flink.cdc.connectors.postgres.source.config;
 
 import org.apache.flink.cdc.connectors.base.config.JdbcSourceConfig;
 import org.apache.flink.cdc.connectors.base.options.StartupOptions;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresPartitionRouting;
 
 import io.debezium.config.Configuration;
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
@@ -40,6 +41,7 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
     private final int lsnCommitCheckpointsDelay;
     private final boolean includePartitionedTables;
     private final boolean includeDatabaseInTableId;
+    private final PostgresPartitionRouting partitionRouting;
 
     public PostgresSourceConfig(
             int subtaskId,
@@ -71,7 +73,8 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
             int lsnCommitCheckpointsDelay,
             boolean assignUnboundedChunkFirst,
             boolean includePartitionedTables,
-            boolean includeDatabaseInTableId) {
+            boolean includeDatabaseInTableId,
+            PostgresPartitionRouting partitionRouting) {
         super(
                 startupOptions,
                 databaseList,
@@ -103,6 +106,7 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
         this.lsnCommitCheckpointsDelay = lsnCommitCheckpointsDelay;
         this.includePartitionedTables = includePartitionedTables;
         this.includeDatabaseInTableId = includeDatabaseInTableId;
+        this.partitionRouting = partitionRouting;
     }
 
     /**
@@ -155,5 +159,13 @@ public class PostgresSourceConfig extends JdbcSourceConfig {
     /** Returns whether to include database in the generated Table ID. */
     public boolean isIncludeDatabaseInTableId() {
         return includeDatabaseInTableId;
+    }
+
+    /**
+     * Returns the client side partition routing, which is empty unless the connector has to take
+     * care of partitioned tables itself.
+     */
+    public PostgresPartitionRouting getPartitionRouting() {
+        return partitionRouting == null ? PostgresPartitionRouting.empty() : partitionRouting;
     }
 }

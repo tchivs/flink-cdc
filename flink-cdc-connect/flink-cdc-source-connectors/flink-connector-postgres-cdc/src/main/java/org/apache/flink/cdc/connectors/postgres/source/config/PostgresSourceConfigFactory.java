@@ -19,11 +19,13 @@ package org.apache.flink.cdc.connectors.postgres.source.config;
 
 import org.apache.flink.cdc.connectors.base.config.JdbcSourceConfigFactory;
 import org.apache.flink.cdc.connectors.base.source.EmbeddedFlinkDatabaseHistory;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresPartitionRouting;
 
 import io.debezium.config.Configuration;
 import io.debezium.connector.postgresql.PostgresConnector;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -53,6 +55,8 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
     private int lsnCommitCheckpointsDelay;
 
     private boolean includePartitionedTables;
+
+    private PostgresPartitionRouting partitionRouting = PostgresPartitionRouting.empty();
 
     private boolean includeDatabaseInTableId =
             PostgresSourceOptions.TABLE_ID_INCLUDE_DATABASE.defaultValue();
@@ -96,8 +100,33 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
             props.setProperty("schema.include.list", String.join(",", schemaList));
         }
 
+        // The list handed to the config object drives the dialect-side table filter, so it has to
+        // carry the partition children as well; the emitter skips them when emitting create-table
+        // events, so this does not multiply schema reads.
+        List<String> sourceTableList = tableList;
         if (tableList != null) {
-            props.setProperty("table.include.list", String.join(",", tableList));
+            PostgresPartitionRouting partitionRouting = PostgresPartitionRouting.empty();
+            List<String> tableIncludeList = tableList;
+            if (includePartitionedTables) {
+                partitionRouting =
+                        PostgresPartitionRouting.resolve(
+                                String.format(
+                                        "jdbc:postgresql://%s:%d/%s", hostname, port, database),
+                                username,
+                                password,
+                                tableList,
+                                includePartitionedTables);
+                if (!partitionRouting.isEmpty()) {
+                    // The configured partition roots are captured as they are, their partitions
+                    // have to be added explicitly to be visible to Debezium at all.
+                    tableIncludeList = new ArrayList<>(tableList);
+                    tableIncludeList.addAll(
+                            partitionRouting.expansionForDebeziumIncludeList(database, tableList));
+                    sourceTableList = tableIncludeList;
+                }
+            }
+            props.setProperty("table.include.list", String.join(",", tableIncludeList));
+            this.partitionRouting = partitionRouting;
         }
 
         // override the user-defined debezium properties
@@ -115,7 +144,7 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
                 startupOptions,
                 Collections.singletonList(database),
                 schemaList,
-                tableList,
+                sourceTableList,
                 splitSize,
                 splitMetaGroupSize,
                 distributionFactorUpper,
@@ -140,7 +169,8 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
                 lsnCommitCheckpointsDelay,
                 assignUnboundedChunkFirst,
                 includePartitionedTables,
-                includeDatabaseInTableId);
+                includeDatabaseInTableId,
+                partitionRouting);
     }
 
     /**
