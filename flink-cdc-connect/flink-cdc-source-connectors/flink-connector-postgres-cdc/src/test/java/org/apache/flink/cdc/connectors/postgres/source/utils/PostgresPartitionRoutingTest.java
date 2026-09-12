@@ -39,9 +39,7 @@ class PostgresPartitionRoutingTest {
     void testPartitionIsRoutedToConfiguredParent() {
         PostgresPartitionRouting routing =
                 PostgresPartitionRouting.create(
-                        ancestors(PARTITION, PARENT),
-                        DATABASE,
-                        Collections.singletonList(PARENT));
+                        ancestors(PARTITION, PARENT), DATABASE, Collections.singletonList(PARENT));
 
         assertThat(routing.isEmpty()).isFalse();
         assertThat(routing.parentOf(PARTITION)).contains(PARENT);
@@ -50,6 +48,10 @@ class PostgresPartitionRoutingTest {
         assertThat(routing.sampleChildOf(PARENT)).contains(PARTITION);
         assertThat(routing.sampleChildOf("public.aia_t_icc_jjdb_202610")).isEmpty();
         assertThat(routing.childrenOf(PARENT)).containsExactly(PARTITION);
+        assertThat(routing.hasCapturedPartitions(PARENT)).isTrue();
+        assertThat(routing.hasCapturedPartitions(PARTITION)).isFalse();
+        assertThat(routing.hasCapturedPartitions("public.aia_t_icc_jjdb_202610")).isFalse();
+        assertThat(PostgresPartitionRouting.empty().hasCapturedPartitions(PARENT)).isFalse();
         assertThat(
                         routing.expansionForDebeziumIncludeList(
                                 DATABASE, Collections.singletonList(PARENT)))
@@ -103,8 +105,7 @@ class PostgresPartitionRoutingTest {
                         PostgresPartitionRouting.create(
                                         ancestors,
                                         DATABASE,
-                                        Collections.singletonList(
-                                                "public.aia_t_icc_jjdb_\\d{6}"))
+                                        Collections.singletonList("public.aia_t_icc_jjdb_\\d{6}"))
                                 .isEmpty())
                 .isTrue();
         assertThat(

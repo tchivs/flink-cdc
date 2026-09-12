@@ -176,14 +176,15 @@ public class PostgresDialect implements JdbcDataSourceDialect {
     @Override
     public List<TableId> discoverDataCollections(JdbcSourceConfig sourceConfig) {
         try (JdbcConnection jdbc = openJdbcConnection(sourceConfig)) {
-            boolean includePartitionedTables =
-                    ((PostgresSourceConfig) sourceConfig).includePartitionedTables();
-            return TableDiscoveryUtils.listTables(
-                    // there is always a single database provided
-                    sourceConfig.getDatabaseList().get(0),
-                    jdbc,
-                    sourceConfig.getTableFilters(),
-                    includePartitionedTables);
+            PostgresSourceConfig postgresSourceConfig = (PostgresSourceConfig) sourceConfig;
+            return TableDiscoveryUtils.withoutPartitionRoots(
+                    TableDiscoveryUtils.listTables(
+                            // there is always a single database provided
+                            sourceConfig.getDatabaseList().get(0),
+                            jdbc,
+                            sourceConfig.getTableFilters(),
+                            postgresSourceConfig.includePartitionedTables()),
+                    postgresSourceConfig.getPartitionRouting());
         } catch (SQLException e) {
             throw new FlinkRuntimeException("Error to discover tables: " + e.getMessage(), e);
         }
