@@ -56,4 +56,30 @@ public class TableDiscoveryUtils {
 
         return new ArrayList<>(capturedTables);
     }
+
+    /**
+     * Drops the configured partition roots whose leaf partitions are captured instead.
+     *
+     * <p>A server without {@code publish_via_partition_root} reports the leaf partition in the
+     * replication stream, so the leaf partitions are the data carriers; the configured root keeps
+     * no rows of its own and, on PostgreSQL 10, cannot even carry a primary key. Keeping the root
+     * in the discovered list would make the snapshot chunk splitter fail with "chunk key column
+     * must be set when the table doesn't have primary keys" and would read every row a second time,
+     * once through the root and once per partition. The record emitter routes the changes of a
+     * partition back to the configured root, so leaving the root out here changes no table identity
+     * that is visible downstream.
+     */
+    public static List<TableId> withoutPartitionRoots(
+            List<TableId> capturedTables, PostgresPartitionRouting partitionRouting) {
+        if (partitionRouting.isEmpty()) {
+            return capturedTables;
+        }
+        return capturedTables.stream()
+                .filter(tableId -> !partitionRouting.hasCapturedPartitions(schemaDotTable(tableId)))
+                .collect(Collectors.toList());
+    }
+
+    private static String schemaDotTable(TableId tableId) {
+        return tableId.schema() + "." + tableId.table();
+    }
 }

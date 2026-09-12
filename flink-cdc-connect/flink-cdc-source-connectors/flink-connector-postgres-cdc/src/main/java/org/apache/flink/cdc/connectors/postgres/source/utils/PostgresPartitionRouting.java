@@ -45,14 +45,15 @@ import java.util.regex.Pattern;
  * <p>Such servers can never publish a partitioned parent, pgoutput always reports the identity of
  * the leaf partition. When only the partition root is configured, this class resolves the leaf
  * partitions of the configured roots so that they can be added to Debezium's {@code
- * table.include.list} and are captured at all, and maps the identity of a captured partition back to
- * its root, so that one table identity and one {@code CreateTableEvent} is produced per root no
+ * table.include.list} and are captured at all, and maps the identity of a captured partition back
+ * to its root, so that one table identity and one {@code CreateTableEvent} is produced per root no
  * matter how many partitions exist.
  *
- * <p>Table names are handled as {@code schema.table}, which is how Debezium maps a PostgreSQL {@code
- * TableId} for {@code table.include.list}. {@link #empty()} is returned when the server supports
- * {@code publish_via_partition_root} (PostgreSQL 13+), when the feature is switched off, or when the
- * metadata query fails, in which case the connector behaves exactly as without this feature.
+ * <p>Table names are handled as {@code schema.table}, which is how Debezium maps a PostgreSQL
+ * {@code TableId} for {@code table.include.list}. {@link #empty()} is returned when the server
+ * supports {@code publish_via_partition_root} (PostgreSQL 13+), when the feature is switched off,
+ * or when the metadata query fails, in which case the connector behaves exactly as without this
+ * feature.
  */
 public class PostgresPartitionRouting implements Serializable {
 
@@ -64,7 +65,7 @@ public class PostgresPartitionRouting implements Serializable {
     public static final int PUBLISH_VIA_PARTITION_ROOT_SINCE = 130000;
 
     private static final PostgresPartitionRouting EMPTY =
-            new PostgresPartitionRouting(Collections.emptyMap());
+            new PostgresPartitionRouting(Collections.emptyMap(), Collections.emptySet());
 
     private static final String PARTITION_ANCESTORS_SQL =
             "WITH RECURSIVE partition_tree(child_oid, ancestor_oid) AS ("
@@ -87,8 +88,17 @@ public class PostgresPartitionRouting implements Serializable {
     /** Partition root as {@code schema.table} to its child partitions as {@code schema.table}. */
     private final Map<String, List<String>> childrenByParent;
 
-    private PostgresPartitionRouting(Map<String, String> parentByChild) {
+    /**
+     * Every {@code schema.table} that is an ancestor of a routed child partition, the configured
+     * roots and the intermediate levels of a multi level tree included. Such a table holds no rows
+     * of its own: its data lives in the leaf partitions.
+     */
+    private final Set<String> partitionAncestors;
+
+    private PostgresPartitionRouting(
+            Map<String, String> parentByChild, Set<String> partitionAncestors) {
         this.parentByChild = parentByChild;
+        this.partitionAncestors = partitionAncestors;
         Map<String, List<String>> childrenByParent = new LinkedHashMap<>();
         for (Map.Entry<String, String> entry : parentByChild.entrySet()) {
             childrenByParent
@@ -171,26 +181,46 @@ public class PostgresPartitionRouting implements Serializable {
         return driver.connect(jdbcUrl, properties);
     }
 
-    /** Builds a routing from the ancestor relations returned by {@link #PARTITION_ANCESTORS_SQL}. */
+    /**
+     * Builds a routing from the ancestor relations returned by {@link #PARTITION_ANCESTORS_SQL}.
+     */
     static PostgresPartitionRouting create(
             Map<String, Set<String>> ancestorsByChild,
             String database,
             List<String> configuredTables) {
         Map<String, String> parentByChild = new LinkedHashMap<>();
+        Set<String> partitionAncestors = new TreeSet<>();
         for (String child : new TreeSet<>(ancestorsByChild.keySet())) {
             String partitionRoot =
                     partitionRootOf(ancestorsByChild.get(child), ancestorsByChild.keySet());
             if (partitionRoot != null
                     && matchesConfiguredTable(partitionRoot, database, configuredTables)) {
                 parentByChild.put(child, partitionRoot);
+                // The root and every intermediate level of the tree hold no rows of their own.
+                partitionAncestors.addAll(ancestorsByChild.get(child));
             }
         }
-        return parentByChild.isEmpty() ? empty() : new PostgresPartitionRouting(parentByChild);
+        return parentByChild.isEmpty()
+                ? empty()
+                : new PostgresPartitionRouting(parentByChild, partitionAncestors);
     }
 
     /** Returns whether no child partition is routed to a configured partition root. */
     public boolean isEmpty() {
         return parentByChild.isEmpty();
+    }
+
+    /**
+     * Returns whether the given {@code schema.table} is a partition ancestor whose captured data
+     * lives in its leaf partitions, so it should be excluded from snapshot discovery.
+     *
+     * <p>On a server without {@code publish_via_partition_root} the leaf partitions are the data
+     * carriers; the configured root and every intermediate partition ancestor hold no rows of their
+     * own and, on PostgreSQL 10, cannot even carry a primary key. Keeping them in the discovered
+     * list would make the snapshot chunk splitter fail and would read every row a second time.
+     */
+    public boolean hasCapturedPartitions(String schemaDotTable) {
+        return partitionAncestors.contains(schemaDotTable);
     }
 
     /** Returns the configured partition root of the given {@code schema.table}, if any. */
@@ -200,14 +230,21 @@ public class PostgresPartitionRouting implements Serializable {
 
     /**
      * Returns one child partition of the given partition root as {@code schema.table}. A PostgreSQL
-     * 10 partition root carries no primary key of its own, the table identity has to be taken from a
-     * partition.
+     * 10 partition root carries no primary key of its own, the table identity has to be taken from
+     * a partition.
      */
     public Optional<String> sampleChildOf(String schemaDotTable) {
         List<String> children = childrenByParent.get(schemaDotTable);
-        return children == null || children.isEmpty()
-                ? Optional.empty()
-                : Optional.of(children.get(0));
+        if (children == null || children.isEmpty()) {
+            return Optional.empty();
+        }
+        for (String child : children) {
+            if (!hasCapturedPartitions(child)) {
+                // A leaf partition: an intermediate level holds no primary key to borrow.
+                return Optional.of(child);
+            }
+        }
+        return Optional.of(children.get(0));
     }
 
     /** Returns the child partitions of the given partition root as {@code schema.table}. */

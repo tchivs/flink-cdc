@@ -17,14 +17,12 @@
 
 package org.apache.flink.cdc.connectors.postgres.source.utils;
 
-import io.debezium.relational.RelationalTableFilters;
-import io.debezium.relational.TableId;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfigFactory;
-import org.junit.jupiter.api.Test;
 
-import java.util.Arrays;
-import java.util.Collections;
+import io.debezium.relational.RelationalTableFilters;
+import io.debezium.relational.TableId;
+import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -32,7 +30,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Temporary live check against the dev PostgreSQL 10 server: the parent-only capture list must make
  * the partition children visible to both the JDBC discovery path and the Debezium replication
  * filter (the exact place where partition changes used to be dropped), and the feature switch must
- * keep the list untouched when disabled. Not part of the regular suite: it needs a reachable server.
+ * keep the list untouched when disabled. Not part of the regular suite: it needs a reachable
+ * server.
  */
 class PostgresParentOnlyConfigLiveTest {
 
@@ -49,7 +48,9 @@ class PostgresParentOnlyConfigLiveTest {
         assertThat(include).contains(CHILD_PLAIN).contains(CHILD_QUALIFIED);
 
         RelationalTableFilters filters = config.getDbzConnectorConfig().getTableFilters();
-        assertThat(filters.dataCollectionFilter().isIncluded(new TableId(null, "public", "aia_t_vcs_pjdb_202609")))
+        assertThat(
+                        filters.dataCollectionFilter()
+                                .isIncluded(new TableId(null, "public", "aia_t_vcs_pjdb_202609")))
                 .as("replication-connection filter must accept the partition in schema.table shape")
                 .isTrue();
     }
