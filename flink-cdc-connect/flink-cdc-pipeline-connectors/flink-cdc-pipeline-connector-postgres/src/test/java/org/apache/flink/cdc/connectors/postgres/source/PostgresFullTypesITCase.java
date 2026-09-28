@@ -302,8 +302,21 @@ public class PostgresFullTypesITCase extends PostgresTestBase {
                                     PostgresDataSourceFactory.IDENTIFIER,
                                     new EventTypeInfo())
                             .executeAndCollect()) {
-                List<Event> snapshotResults = fetchResultsAndCreateTableEvent(events, 1).f0;
+                Tuple2<List<Event>, List<CreateTableEvent>> snapshot =
+                        fetchResultsAndCreateTableEvent(events, 1);
+                List<Event> snapshotResults = snapshot.f0;
                 RecordData snapshotRecord = ((DataChangeEvent) snapshotResults.get(0)).after();
+                // 声明类型必须能解码源端实际写出的二进制行；否则下游读取 timestamptz 时失败。
+                var schema = snapshot.f1.get(0).getSchema();
+                int zonedIndex = schema.getColumnNames().indexOf("timestamp_tz_c");
+                Assertions.assertThat(
+                                RecordData.createFieldGetter(
+                                                schema.getColumnDataTypes().get(zonedIndex),
+                                                zonedIndex)
+                                        .getFieldOrNull(snapshotRecord))
+                        .isEqualTo(
+                                LocalZonedTimestampData.fromInstant(
+                                        toInstant("2020-07-17 18:00:22")));
 
                 Assertions.assertThat(recordFields(snapshotRecord, TIME_TYPES_WITH_ADAPTIVE))
                         .isEqualTo(
