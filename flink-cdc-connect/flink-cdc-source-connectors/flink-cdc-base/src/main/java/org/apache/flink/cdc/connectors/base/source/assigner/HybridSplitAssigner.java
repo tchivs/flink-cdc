@@ -266,6 +266,17 @@ public class HybridSplitAssigner<C extends SourceConfig> implements SplitAssigne
         for (SchemalessSnapshotSplit split : assignedSnapshotSplit) {
             // find the min and max offset of change log
             Offset changeLogOffset = splitFinishedOffsets.get(split.splitId());
+            if (changeLogOffset == null) {
+                // A snapshot split was assigned but never reported a finished offset, so it cannot
+                // contribute to the stream split's starting offset. Skip it instead of throwing a
+                // NullPointerException, which would trap the job in the snapshot-to-stream
+                // transition (FLINK-40052).
+                LOG.warn(
+                        "Snapshot split {} is assigned but has no finished offset, skip it when"
+                                + " building the stream split.",
+                        split.splitId());
+                continue;
+            }
             if (minOffset == null || changeLogOffset.isBefore(minOffset)) {
                 minOffset = changeLogOffset;
             }
