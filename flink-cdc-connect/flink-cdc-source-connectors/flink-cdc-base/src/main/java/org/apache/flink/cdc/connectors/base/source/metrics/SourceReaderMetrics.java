@@ -150,9 +150,14 @@ public class SourceReaderMetrics {
                         }
                     } else if (isSchemaChangeEvent(record)) {
                         schemaChangeCounter.inc();
-                        TableId tableId = getTableId(record);
-                        if (tableId != null) {
-                            getTableMetrics(tableId).markSchemaChangeRecord();
+                        // Schema records without a source block (e.g. PostgreSQL relation
+                        // records) carry no table identity in their value.
+                        if (record.valueSchema() != null
+                                && record.valueSchema().field(Envelope.FieldName.SOURCE) != null) {
+                            TableId tableId = getTableId(record);
+                            if (tableId != null) {
+                                getTableMetrics(tableId).markSchemaChangeRecord();
+                            }
                         }
                     }
                 });
