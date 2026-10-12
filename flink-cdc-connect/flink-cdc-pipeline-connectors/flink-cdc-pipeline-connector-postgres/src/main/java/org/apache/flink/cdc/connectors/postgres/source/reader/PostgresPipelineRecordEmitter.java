@@ -123,6 +123,14 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
                 TableChanges.TableChange tableChange = entry.getValue();
 
                 Table table = tableChange.getTable();
+                if (sourceConfig
+                        .getPartitionRouting()
+                        .parentOf(schemaDotTable(table.id()))
+                        .isPresent()) {
+                    // A partition must never be announced under its own identity: its changes
+                    // are emitted as the partition root, which is announced on its first change.
+                    continue;
+                }
                 CreateTableEvent createTableEvent =
                         toCreateTableEvent(table, sourceConfig, postgresDialect);
                 ((DebeziumEventDeserializationSchema) debeziumDeserializationSchema)
@@ -212,11 +220,19 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
         if (childBefore == null) {
             return;
         }
+        // What downstream knows of the root is the schema this partition had before the change.
+        // The create table event of the root is no baseline: after a restart it is read from the
+        // database and may already contain the change, which would then never be emitted.
+        Schema knownSchema = parentSchemas.get(parentId);
+        if (knownSchema == null) {
+            knownSchema =
+                    toCreateTableEvent(childBefore, sourceConfig, postgresDialect).getSchema();
+        }
         List<SchemaChangeEvent> events =
                 evolveParentSchema(
                         parentSchemas,
                         parentId,
-                        createTableEventCache.get(parentId).getSchema(),
+                        knownSchema,
                         inferSchemaChangeEvent(
                                 parentId, childBefore, childAfter, sourceConfig, postgresDialect));
         LOG.info("Inferred schema change events of partition {}: {}", childAfter.id(), events);
