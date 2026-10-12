@@ -17,6 +17,8 @@
 
 package org.apache.flink.cdc.connectors.postgres.source.schema;
 
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionGuard;
+
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.connector.postgresql.PostgresSchema;
 import io.debezium.connector.postgresql.PostgresValueConverter;
@@ -33,6 +35,7 @@ import io.debezium.schema.TopicSelector;
 public class RelationAwarePostgresSchema extends PostgresSchema {
 
     private SchemaDispatcher dispatcher;
+    private PartitionGuard partitionGuard;
 
     public RelationAwarePostgresSchema(
             PostgresConnectorConfig config,
@@ -47,10 +50,19 @@ public class RelationAwarePostgresSchema extends PostgresSchema {
         this.dispatcher = dispatcher;
     }
 
+    public void setPartitionGuard(PartitionGuard partitionGuard) {
+        this.partitionGuard = partitionGuard;
+    }
+
     @Override
     public void applySchemaChangesForTable(int relationId, Table table) {
         super.applySchemaChangesForTable(relationId, table);
-        if (dispatcher != null && !isFilteredOut(table.id())) {
+        if (isFilteredOut(table.id())) {
+            // Debezium sees the relation of every published table, filtered ones included.
+            if (partitionGuard != null) {
+                partitionGuard.check(table.id());
+            }
+        } else if (dispatcher != null) {
             dispatcher.dispatch(table);
         }
     }
