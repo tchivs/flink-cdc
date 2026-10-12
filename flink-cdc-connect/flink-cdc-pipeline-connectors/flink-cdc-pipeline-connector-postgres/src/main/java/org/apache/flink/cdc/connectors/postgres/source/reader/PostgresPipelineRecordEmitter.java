@@ -18,9 +18,11 @@
 package org.apache.flink.cdc.connectors.postgres.source.reader;
 
 import org.apache.flink.api.connector.source.SourceOutput;
+import org.apache.flink.cdc.common.annotation.VisibleForTesting;
 import org.apache.flink.cdc.common.event.CreateTableEvent;
 import org.apache.flink.cdc.common.event.SchemaChangeEvent;
 import org.apache.flink.cdc.common.schema.Schema;
+import org.apache.flink.cdc.common.utils.SchemaUtils;
 import org.apache.flink.cdc.connectors.base.options.StartupOptions;
 import org.apache.flink.cdc.connectors.base.source.meta.offset.OffsetFactory;
 import org.apache.flink.cdc.connectors.base.source.meta.split.SnapshotSplit;
@@ -30,12 +32,14 @@ import org.apache.flink.cdc.connectors.base.source.metrics.SourceReaderMetrics;
 import org.apache.flink.cdc.connectors.postgres.source.PostgresDialect;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
 import org.apache.flink.cdc.connectors.postgres.source.schema.PostgresSchemaRecord;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresPartitionRouting;
 import org.apache.flink.cdc.connectors.postgres.source.utils.TableDiscoveryUtils;
 import org.apache.flink.cdc.connectors.postgres.utils.PostgresSchemaUtils;
 import org.apache.flink.cdc.debezium.DebeziumDeserializationSchema;
 import org.apache.flink.cdc.debezium.event.DebeziumEventDeserializationSchema;
 import org.apache.flink.connector.base.source.reader.RecordEmitter;
 
+import io.debezium.connector.postgresql.PostgresSchema;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.data.Envelope;
 import io.debezium.relational.Table;
@@ -47,13 +51,17 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 
 import static io.debezium.connector.AbstractSourceInfo.SCHEMA_NAME_KEY;
 import static io.debezium.connector.AbstractSourceInfo.TABLE_NAME_KEY;
@@ -75,6 +83,9 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
     private final boolean isBounded;
     private final boolean includeDatabaseInTableId;
     private final Map<TableId, CreateTableEvent> createTableEventCache;
+
+    /** Schema of each routed partition root as evolved by the column changes emitted for it. */
+    private final Map<TableId, Schema> parentSchemas = new HashMap<>();
 
     // Used when startup mode is not initial
     private boolean shouldEmitAllCreateTableEventsInSnapshotMode = true;
@@ -135,21 +146,23 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
             TableId tableId = splitState.asSnapshotSplitState().toSourceSplit().getTableId();
             maybeSendCreateTableEventFromCache(tableId, output);
         } else if (isDataChangeRecord(element)) {
+            // Captured before routing rewrites the source block to the partition root.
+            TableId originTableId = getTableId(element);
             element = routeToParentTable(element);
-            handleDataChangeRecord(element, output);
+            ensureCreateTableEventSent(getTableId(element), originTableId, output);
         } else if (isSchemaChangeEvent(element) && sourceConfig.isIncludeSchemaChanges()) {
             handleSchemaChangeRecord(element, output, splitState);
         }
         super.processElement(element, output, splitState);
     }
 
-    private void handleDataChangeRecord(SourceRecord element, SourceOutput<T> output) {
-        TableId tableId = getTableId(element);
+    private void ensureCreateTableEventSent(
+            TableId tableId, @Nullable TableId originChild, SourceOutput<T> output) {
         maybeSendCreateTableEventFromCache(tableId, output);
         // In rare case, we may miss some CreateTableEvents before DataChangeEvents.
         // Don't send CreateTableEvent for SchemaChangeEvents as it's the latest schema.
         if (!createTableEventCache.containsKey(tableId)) {
-            CreateTableEvent createTableEvent = getCreateTableEvent(sourceConfig, tableId);
+            CreateTableEvent createTableEvent = getCreateTableEvent(tableId, originChild);
             sendCreateTableEvent(createTableEvent, output);
             createTableEventCache.put(tableId, createTableEvent);
         }
@@ -167,16 +180,69 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
                 splitState.toSourceSplit().getTableSchemas();
         PostgresSchemaRecord schemaRecord = (PostgresSchemaRecord) element;
         Table schemaAfter = schemaRecord.getTable();
-        maybeSendCreateTableEventFromCache(schemaAfter.id(), output);
         Table schemaBefore = null;
         if (existedTableSchemas.containsKey(schemaAfter.id())) {
             schemaBefore = existedTableSchemas.get(schemaAfter.id()).getTable();
         }
+        Optional<String> parent =
+                sourceConfig.getPartitionRouting().parentOf(schemaDotTable(schemaAfter.id()));
+        if (parent.isPresent()) {
+            handleRoutedSchemaChange(toTableId(parent.get()), schemaBefore, schemaAfter, output);
+            return;
+        }
+        maybeSendCreateTableEventFromCache(schemaAfter.id(), output);
         List<SchemaChangeEvent> schemaChangeEvents =
                 inferSchemaChangeEvent(
                         schemaAfter.id(), schemaBefore, schemaAfter, sourceConfig, postgresDialect);
         LOG.info("Inferred Schema change events: {}", schemaChangeEvents);
         schemaChangeEvents.forEach(schemaChangeEvent -> output.collect((T) schemaChangeEvent));
+    }
+
+    /**
+     * A child partition reports its own relation, but downstream only knows its partition root: a
+     * new or swapped-in partition must not create a table of its own, and a column change applied
+     * to the root is reported once by every partition, so it is emitted for the root only once.
+     */
+    private void handleRoutedSchemaChange(
+            TableId parentId,
+            @Nullable Table childBefore,
+            Table childAfter,
+            SourceOutput<T> output) {
+        ensureCreateTableEventSent(parentId, childAfter.id(), output);
+        if (childBefore == null) {
+            return;
+        }
+        List<SchemaChangeEvent> events =
+                evolveParentSchema(
+                        parentSchemas,
+                        parentId,
+                        createTableEventCache.get(parentId).getSchema(),
+                        inferSchemaChangeEvent(
+                                parentId, childBefore, childAfter, sourceConfig, postgresDialect));
+        LOG.info("Inferred schema change events of partition {}: {}", childAfter.id(), events);
+        events.forEach(schemaChangeEvent -> output.collect((T) schemaChangeEvent));
+    }
+
+    /**
+     * Applies the given events to the tracked schema of the partition root and returns those that
+     * are not applied yet.
+     */
+    @VisibleForTesting
+    static List<SchemaChangeEvent> evolveParentSchema(
+            Map<TableId, Schema> parentSchemas,
+            TableId parentId,
+            Schema initialSchema,
+            List<SchemaChangeEvent> events) {
+        Schema schema = parentSchemas.getOrDefault(parentId, initialSchema);
+        List<SchemaChangeEvent> evolving = new ArrayList<>();
+        for (SchemaChangeEvent event : events) {
+            if (!SchemaUtils.isSchemaChangeEventRedundant(schema, event)) {
+                schema = SchemaUtils.applySchemaChangeEvent(schema, event);
+                evolving.add(event);
+            }
+        }
+        parentSchemas.put(parentId, schema);
+        return evolving;
     }
 
     private void maybeSendCreateTableEventFromCache(TableId tableId, SourceOutput<T> output) {
@@ -193,10 +259,9 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
         output.collect((T) createTableEvent);
     }
 
-    private CreateTableEvent getCreateTableEvent(
-            PostgresSourceConfig sourceConfig, TableId tableId) {
+    private CreateTableEvent getCreateTableEvent(TableId tableId, @Nullable TableId originChild) {
         try (PostgresConnection jdbc = postgresDialect.openJdbcConnection()) {
-            Schema schema = resolveTableSchema(tableId, sourceConfig, jdbc);
+            Schema schema = resolveTableSchema(tableId, originChild, jdbc);
             return new CreateTableEvent(
                     toCdcTableId(
                             tableId,
@@ -207,22 +272,54 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
     }
 
     /**
-     * Returns the schema of the given table, or the schema of one of its child partitions when the
-     * table is a partition root without a primary key of its own.
+     * Returns the schema of the given table. A routed partition root takes its schema from one of
+     * its partitions: on PostgreSQL 10 the root carries no primary key of its own, so it is never
+     * looked up itself.
      */
     private Schema resolveTableSchema(
-            TableId tableId, PostgresSourceConfig sourceConfig, PostgresConnection jdbc) {
-        Schema schema = PostgresSchemaUtils.getTableSchema(tableId, sourceConfig, jdbc);
-        if (schema.primaryKeys().isEmpty()) {
-            Optional<String> sampleChild =
-                    sourceConfig.getPartitionRouting().sampleChildOf(schemaDotTable(tableId));
-            if (sampleChild.isPresent()) {
-                schema =
-                        PostgresSchemaUtils.getTableSchema(
-                                toTableId(sampleChild.get()), sourceConfig, jdbc);
+            TableId tableId, @Nullable TableId originChild, PostgresConnection jdbc) {
+        PostgresPartitionRouting routing = sourceConfig.getPartitionRouting();
+        if (routing.childrenOf(schemaDotTable(tableId)).isEmpty()) {
+            return PostgresSchemaUtils.getTableSchema(tableId, sourceConfig, jdbc);
+        }
+        PostgresSchema dbzSchema = PostgresSchemaUtils.newDbzSchema(sourceConfig, jdbc);
+        Table child =
+                partitionOf(
+                        tableId,
+                        routing.sampleChildOf(schemaDotTable(tableId)),
+                        originChild,
+                        dbzSchema::tableFor);
+        return PostgresSchemaUtils.toSchema(
+                child, sourceConfig.getDbzConnectorConfig(), jdbc.getTypeRegistry());
+    }
+
+    /**
+     * Returns the first visible of the sample partition and the partition the current event came
+     * from.
+     */
+    @VisibleForTesting
+    static Table partitionOf(
+            TableId partitionRoot,
+            Optional<String> sampleChild,
+            @Nullable TableId originChild,
+            Function<TableId, Table> lookup) {
+        if (sampleChild.isPresent()) {
+            Table table = lookup.apply(toTableId(sampleChild.get()));
+            if (table != null) {
+                return table;
             }
         }
-        return schema;
+        if (originChild != null && !originChild.equals(partitionRoot)) {
+            Table table = lookup.apply(originChild);
+            if (table != null) {
+                return table;
+            }
+        }
+        throw new IllegalStateException(
+                String.format(
+                        "Partition root %s: neither its sample partition %s nor partition %s is "
+                                + "visible in the Debezium schema",
+                        partitionRoot, sampleChild.orElse(null), originChild));
     }
 
     private TableId getTableId(SourceRecord dataRecord) {
@@ -303,7 +400,7 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
                     // The changes of a child partition are emitted as the configured parent table.
                     continue;
                 }
-                Schema schema = resolveTableSchema(tableId, sourceConfig, jdbc);
+                Schema schema = resolveTableSchema(tableId, null, jdbc);
                 createTableEventCache.put(
                         tableId,
                         new CreateTableEvent(

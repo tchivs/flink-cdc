@@ -32,6 +32,7 @@ import org.apache.flink.cdc.connectors.postgres.source.offset.PostgresOffsetUtil
 import org.apache.flink.cdc.connectors.postgres.source.schema.PostgresSchemaRecord;
 import org.apache.flink.cdc.connectors.postgres.source.schema.RelationAwarePostgresSchema;
 import org.apache.flink.cdc.connectors.postgres.source.utils.ChunkUtils;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionGuard;
 import org.apache.flink.table.types.logical.RowType;
 
 import io.debezium.DebeziumException;
@@ -269,6 +270,14 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
                                 }),
                         schemaNameAdjuster);
         schema.setDispatcher(postgresDispatcher);
+        PostgresSourceConfig postgresSourceConfig = (PostgresSourceConfig) sourceConfig;
+        // Only the global stream split captures the whole include list: snapshot and backfill
+        // splits narrow it to one table, which would make every other partition look unrouted.
+        if (sourceSplitBase.isStreamSplit()
+                && !isBackFillSplit(sourceSplitBase)
+                && !postgresSourceConfig.getPartitionRouting().isEmpty()) {
+            schema.setPartitionGuard(new PartitionGuard(postgresSourceConfig));
+        }
 
         ChangeEventSourceMetricsFactory<PostgresPartition> metricsFactory =
                 new DefaultChangeEventSourceMetricsFactory<>();

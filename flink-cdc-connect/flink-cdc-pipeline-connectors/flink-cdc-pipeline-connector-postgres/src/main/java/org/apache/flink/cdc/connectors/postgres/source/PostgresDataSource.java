@@ -80,11 +80,7 @@ public class PostgresDataSource implements DataSource {
 
         PostgresSourceBuilder.PostgresIncrementalSource<Event> source =
                 new PostgresPipelineSource<>(
-                        configFactory,
-                        deserializer,
-                        postgresOffsetFactory,
-                        postgresDialect,
-                        postgresSourceConfig);
+                        configFactory, deserializer, postgresOffsetFactory, postgresDialect);
 
         return FlinkSourceProvider.of(source);
     }
@@ -119,27 +115,26 @@ public class PostgresDataSource implements DataSource {
     /** The {@link JdbcIncrementalSource} implementation for Postgres. */
     public static class PostgresPipelineSource<T>
             extends PostgresSourceBuilder.PostgresIncrementalSource<T> {
-        private final PostgresSourceConfig sourceConfig;
         private final PostgresDialect dataSourceDialect;
 
         public PostgresPipelineSource(
                 PostgresSourceConfigFactory configFactory,
                 DebeziumDeserializationSchema<T> deserializationSchema,
                 PostgresOffsetFactory offsetFactory,
-                PostgresDialect dataSourceDialect,
-                PostgresSourceConfig sourceConfig) {
+                PostgresDialect dataSourceDialect) {
             super(configFactory, deserializationSchema, offsetFactory, dataSourceDialect);
-            this.sourceConfig = sourceConfig;
             this.dataSourceDialect = dataSourceDialect;
         }
 
         @Override
         protected RecordEmitter<SourceRecords, T, SourceSplitState> createRecordEmitter(
                 SourceConfig sourceConfig, SourceReaderMetrics sourceReaderMetrics) {
+            // The config created for this reader, not the one of the client: only it carries the
+            // partition routing re-resolved when the job restarts.
             return new PostgresPipelineRecordEmitter<>(
                     deserializationSchema,
                     sourceReaderMetrics,
-                    this.sourceConfig,
+                    (PostgresSourceConfig) sourceConfig,
                     offsetFactory,
                     this.dataSourceDialect);
         }

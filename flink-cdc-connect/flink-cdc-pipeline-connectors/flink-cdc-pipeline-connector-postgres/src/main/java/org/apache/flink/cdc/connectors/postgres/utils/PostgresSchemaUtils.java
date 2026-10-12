@@ -153,22 +153,31 @@ public class PostgresSchemaUtils {
             io.debezium.relational.TableId tableId,
             PostgresSourceConfig sourceConfig,
             PostgresConnection jdbc) {
+        Table tableSchema = newDbzSchema(sourceConfig, jdbc).tableFor(tableId);
+        if (tableSchema == null) {
+            throw new IllegalStateException(
+                    String.format(
+                            "Table %s is not visible in the Debezium schema, table.include.list: %s",
+                            tableId,
+                            sourceConfig.getDbzProperties().getProperty("table.include.list")));
+        }
+        return toSchema(tableSchema, sourceConfig.getDbzConnectorConfig(), jdbc.getTypeRegistry());
+    }
+
+    /** Reads the Debezium schema of every table in the configured {@code table.include.list}. */
+    public static PostgresSchema newDbzSchema(
+            PostgresSourceConfig sourceConfig, PostgresConnection jdbc) {
         try {
-            // fetch table schemas
             TopicSelector<io.debezium.relational.TableId> topicSelector =
                     PostgresTopicSelector.create(sourceConfig.getDbzConnectorConfig());
             PostgresConnection.PostgresValueConverterBuilder valueConverterBuilder =
                     newPostgresValueConverterBuilder(sourceConfig.getDbzConnectorConfig());
-            PostgresSchema postgresSchema =
-                    PostgresObjectUtils.newSchema(
-                            jdbc,
-                            sourceConfig.getDbzConnectorConfig(),
-                            jdbc.getTypeRegistry(),
-                            topicSelector,
-                            valueConverterBuilder.build(jdbc.getTypeRegistry()));
-            Table tableSchema = postgresSchema.tableFor(tableId);
-            return toSchema(
-                    tableSchema, sourceConfig.getDbzConnectorConfig(), jdbc.getTypeRegistry());
+            return PostgresObjectUtils.newSchema(
+                    jdbc,
+                    sourceConfig.getDbzConnectorConfig(),
+                    jdbc.getTypeRegistry(),
+                    topicSelector,
+                    valueConverterBuilder.build(jdbc.getTypeRegistry()));
         } catch (SQLException e) {
             throw new RuntimeException("Failed to initialize PostgresReplicationConnection", e);
         }
