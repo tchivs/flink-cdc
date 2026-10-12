@@ -108,7 +108,15 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
             throws Exception {
         if (isLowWatermarkEvent(element) && splitState.isSnapshotSplitState()) {
             TableId tableId = splitState.asSnapshotSplitState().toSourceSplit().getTableId();
-            sendCreateTableEventIfNeeded(tableId, null, output, splitState);
+            // A partition must never be announced under its own identity: its changes are
+            // emitted as the partition root.
+            Optional<String> parent =
+                    sourceConfig.getPartitionRouting().parentOf(schemaDotTable(tableId));
+            if (parent.isPresent()) {
+                sendCreateTableEventIfNeeded(toTableId(parent.get()), tableId, output, splitState);
+            } else {
+                sendCreateTableEventIfNeeded(tableId, null, output, splitState);
+            }
         } else if (isDataChangeRecord(element)) {
             // Captured before routing rewrites the source block to the partition root.
             TableId originTableId = getTableId(element);
@@ -180,11 +188,20 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
         if (childBefore == null) {
             return;
         }
+        // What downstream knows of the root is the schema this partition had before the change.
+        // The create table event of the root is no baseline: after a restart it is read from the
+        // database and may already contain the change, which would then never be emitted.
+        Schema knownSchema = parentSchemas.get(parentId);
+        if (knownSchema == null) {
+            knownSchema =
+                    PostgresSchemaUtils.toSchema(
+                            childBefore, sourceConfig.getDbzConnectorConfig(), getTypeRegistry());
+        }
         List<SchemaChangeEvent> events =
                 evolveParentSchema(
                         parentSchemas,
                         parentId,
-                        createTableEventCache.get(parentId).getSchema(),
+                        knownSchema,
                         inferSchemaChangeEvent(
                                 parentId,
                                 childBefore,
