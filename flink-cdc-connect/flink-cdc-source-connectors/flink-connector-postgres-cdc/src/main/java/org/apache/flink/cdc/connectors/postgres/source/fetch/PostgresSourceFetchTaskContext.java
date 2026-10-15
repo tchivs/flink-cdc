@@ -167,6 +167,11 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
                                         .keySet()
                                         .iterator()
                                         .next()));
+                // A backfill split narrows the include list to one table as well, so it must not
+                // reconcile the shared publication either.
+                builder.with(
+                        PUBLICATION_AUTOCREATE_MODE.name(),
+                        PostgresConnectorConfig.AutoCreateMode.DISABLED);
             }
 
             dbzConfig =
