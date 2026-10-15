@@ -35,11 +35,14 @@ import io.debezium.util.Clock;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /** A CustomPostgresSchema similar to PostgresSchema with customization. */
 public class CustomPostgresSchema {
@@ -112,7 +115,7 @@ public class CustomPostgresSchema {
                     tables,
                     dbzConfig.databaseName(),
                     null,
-                    dbzConfig.getTableFilters().dataCollectionFilter(),
+                    requestedTablesFilter(tableIds),
                     null,
                     false);
         } catch (SQLException e) {
@@ -141,5 +144,22 @@ public class CustomPostgresSchema {
             tableChanges.add(this.schemasByTableId.get(tableId));
         }
         return tableChanges;
+    }
+
+    /**
+     * Restricts metadata reads to the requested tables. Reading every table matched by the
+     * connector filter and keeping only the requested ones made each chunk-splitter lookup scan the
+     * whole catalog, i.e. O(N^2) over N captured tables. Tables outside the connector filter stay
+     * excluded, so an unknown table still fails exactly as before.
+     */
+    private Tables.TableFilter requestedTablesFilter(List<TableId> tableIds) {
+        Tables.TableFilter connectorFilter = dbzConfig.getTableFilters().dataCollectionFilter();
+        Set<List<String>> requested = new HashSet<>();
+        for (TableId tableId : tableIds) {
+            requested.add(Arrays.asList(tableId.schema(), tableId.table()));
+        }
+        return tableId ->
+                requested.contains(Arrays.asList(tableId.schema(), tableId.table()))
+                        && connectorFilter.isIncluded(tableId);
     }
 }
