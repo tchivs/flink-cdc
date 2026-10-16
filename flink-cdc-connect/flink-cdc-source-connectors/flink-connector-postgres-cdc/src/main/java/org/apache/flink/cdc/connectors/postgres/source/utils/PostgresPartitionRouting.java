@@ -24,6 +24,7 @@ import java.io.Serializable;
 import java.sql.Connection;
 import java.sql.Driver;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -67,9 +68,13 @@ public class PostgresPartitionRouting implements Serializable {
     private static final PostgresPartitionRouting EMPTY =
             new PostgresPartitionRouting(Collections.emptyMap(), Collections.emptySet());
 
+    // relispartition: pg_inherits also holds legacy INHERITS children, whose parent stores rows of
+    // its own and must neither be routed nor dropped from the snapshot. A partitioned table cannot
+    // take part in legacy inheritance, so filtering the leaf level is enough.
     private static final String PARTITION_ANCESTORS_SQL =
             "WITH RECURSIVE partition_tree(child_oid, ancestor_oid) AS ("
-                    + " SELECT inhrelid, inhparent FROM pg_inherits"
+                    + " SELECT i.inhrelid, i.inhparent FROM pg_inherits i"
+                    + " JOIN pg_class c ON c.oid = i.inhrelid WHERE c.relispartition"
                     + " UNION"
                     + " SELECT t.child_oid, i.inhparent FROM partition_tree t"
                     + " JOIN pg_inherits i ON i.inhrelid = t.ancestor_oid)"
@@ -81,6 +86,21 @@ public class PostgresPartitionRouting implements Serializable {
                     + " JOIN pg_class parent_cl ON parent_cl.oid = t.ancestor_oid"
                     + " JOIN pg_namespace parent_ns ON parent_ns.oid = parent_cl.relnamespace"
                     + " ORDER BY 1, 2";
+
+    /** The top level partition root of one partition, no row when it is not a partition. */
+    private static final String PARTITION_ROOT_SQL =
+            "WITH RECURSIVE ancestors(oid, depth) AS ("
+                    + " SELECT i.inhparent, 1 FROM pg_inherits i"
+                    + " JOIN pg_class c ON c.oid = i.inhrelid"
+                    + " JOIN pg_namespace n ON n.oid = c.relnamespace"
+                    + " WHERE c.relispartition AND n.nspname = ? AND c.relname = ?"
+                    + " UNION"
+                    + " SELECT i.inhparent, a.depth + 1 FROM ancestors a"
+                    + " JOIN pg_inherits i ON i.inhrelid = a.oid)"
+                    + " SELECT n.nspname || '.' || c.relname FROM ancestors a"
+                    + " JOIN pg_class c ON c.oid = a.oid"
+                    + " JOIN pg_namespace n ON n.oid = c.relnamespace"
+                    + " ORDER BY a.depth DESC LIMIT 1";
 
     /** Child partition as {@code schema.table} to the configured partition root of that child. */
     private final Map<String, String> parentByChild;
@@ -164,6 +184,37 @@ public class PostgresPartitionRouting implements Serializable {
     }
 
     /**
+     * Returns the configured partition root of one table, or empty when the table is not a
+     * partition of a configured root. Unlike {@link #resolve}, failures are thrown: the caller must
+     * not mistake an unreadable catalog for "not a partition".
+     *
+     * @param configuredTables the configured table list, entries are regular expressions
+     */
+    public static Optional<String> configuredRootOf(
+            String jdbcUrl,
+            String username,
+            String password,
+            List<String> configuredTables,
+            String schema,
+            String table)
+            throws Exception {
+        try (Connection connection = openConnection(jdbcUrl, username, password);
+                PreparedStatement statement = connection.prepareStatement(PARTITION_ROOT_SQL)) {
+            statement.setString(1, schema);
+            statement.setString(2, table);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (!resultSet.next()) {
+                    return Optional.empty();
+                }
+                String root = resultSet.getString(1);
+                return matchesConfiguredTable(root, databaseOf(jdbcUrl), configuredTables)
+                        ? Optional.of(root)
+                        : Optional.empty();
+            }
+        }
+    }
+
+    /**
      * Opens the metadata connection without {@link DriverManager}: inside a Flink task the JDBC
      * driver is loaded by a user class loader, so it is not registered with the system {@link
      * DriverManager} and {@code DriverManager.getConnection} would fail with "No suitable driver".
@@ -178,7 +229,12 @@ public class PostgresPartitionRouting implements Serializable {
         Properties properties = new Properties();
         properties.setProperty("user", username == null ? "" : username);
         properties.setProperty("password", password == null ? "" : password);
-        return driver.connect(jdbcUrl, properties);
+        Connection connection = driver.connect(jdbcUrl, properties);
+        if (connection == null) {
+            // Driver#connect returns null instead of failing for a url it does not accept.
+            throw new SQLException("The PostgreSQL driver does not accept " + jdbcUrl);
+        }
+        return connection;
     }
 
     /**
