@@ -27,6 +27,11 @@ import io.debezium.connector.postgresql.connection.PostgresDefaultValueConverter
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.schema.TopicSelector;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * Extends PostgresSchema to dispatch Relation messages as schema change events via the event queue
@@ -34,8 +39,17 @@ import io.debezium.schema.TopicSelector;
  */
 public class RelationAwarePostgresSchema extends PostgresSchema {
 
+    private static final Logger LOG = LoggerFactory.getLogger(RelationAwarePostgresSchema.class);
+
     private SchemaDispatcher dispatcher;
     private PartitionGuard partitionGuard;
+
+    /**
+     * Routed partitions found detached while streaming. They are filtered from the relation that
+     * revealed the DETACH on, so their earlier changes still reach the root and the later ones are
+     * dropped, without a restart.
+     */
+    private final Set<TableId> detachedPartitions = new HashSet<>();
 
     public RelationAwarePostgresSchema(
             PostgresConnectorConfig config,
@@ -64,12 +78,31 @@ public class RelationAwarePostgresSchema extends PostgresSchema {
             }
             return;
         }
-        if (partitionGuard != null) {
-            partitionGuard.checkRouted(table.id());
+        // pgoutput resends the relation of a partition after DETACH, before its next change.
+        if (partitionGuard != null && partitionGuard.isDetached(table.id())) {
+            LOG.warn(
+                    "Partition {} was detached from its partition root, its changes from now on "
+                            + "are no longer captured.",
+                    table.id());
+            detachedPartitions.add(table.id());
+            return;
         }
         if (dispatcher != null) {
             dispatcher.dispatch(table);
         }
+    }
+
+    @Override
+    protected boolean isFilteredOut(TableId id) {
+        return detachedPartitions.contains(id) || super.isFilteredOut(id);
+    }
+
+    /**
+     * The decoder resolves every change through this: changes of a detached partition are no-ops.
+     */
+    @Override
+    public Table tableFor(TableId id) {
+        return detachedPartitions.contains(id) ? null : super.tableFor(id);
     }
 
     @Override

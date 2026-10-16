@@ -28,18 +28,20 @@ import java.util.Optional;
 import java.util.concurrent.Callable;
 
 /**
- * Fails the stream when the partition routing resolved at startup no longer matches the catalog, so
- * that the restarted source re-resolves it.
+ * Verifies the partition routing resolved at startup against the catalog while streaming.
  *
  * <p>Debezium's {@code table.include.list} and the routing are fixed when the source config is
  * created. Both checks run when pgoutput sends a relation, which it does before the first change of
- * a table in a session and again after a catalog change of that table, ATTACH and DETACH included:
+ * a table in a session and again after a catalog change of that table, ATTACH and DETACH included,
+ * so they take effect exactly at that position of the stream:
  *
  * <ul>
  *   <li>{@link #checkFiltered}: a filtered table that is a partition of a configured root was
- *       attached later; its changes would be dropped silently.
- *   <li>{@link #checkRouted}: a routed partition that is no longer a partition of its root was
- *       detached; its changes would be written to the root.
+ *       attached later; its changes would be dropped silently, so the stream fails and the restart
+ *       re-resolves the routing and replays from the checkpoint with the partition included.
+ *   <li>{@link #isDetached}: a routed partition that is no longer a partition of any configured
+ *       root was detached; the caller drops its changes from here on, without a restart, because a
+ *       restart would replay its changes before the DETACH with the partition no longer included.
  * </ul>
  *
  * <p>Both fail closed: a catalog that cannot be read must not let a change through.
@@ -84,22 +86,28 @@ public class PartitionGuard {
         }
     }
 
-    /** Checks a table captured by Debezium, only routed partitions are looked up. */
-    public void checkRouted(TableId capturedTable) {
+    /**
+     * Returns whether a table captured by Debezium is a routed partition that is no longer a
+     * partition of any configured root. Only routed partitions are looked up.
+     *
+     * @throws IllegalStateException if the partition moved to another configured root, which needs
+     *     the restart to re-resolve the routing
+     */
+    public boolean isDetached(TableId capturedTable) {
         Optional<String> expectedRoot = routing.parentOf(schemaDotTable(capturedTable));
         if (!expectedRoot.isPresent()) {
-            return;
+            return false;
         }
         Optional<String> root = configuredRootOf(capturedTable);
-        if (!root.equals(expectedRoot)) {
+        if (root.isPresent() && !root.equals(expectedRoot)) {
             throw new IllegalStateException(
                     String.format(
-                            "Table %s is no longer a partition of partition root %s, it was "
-                                    + "detached after the partition routing was resolved; failing "
-                                    + "so that the restart re-resolves partition routing instead "
-                                    + "of writing its changes to %s.",
-                            schemaDotTable(capturedTable), expectedRoot.get(), expectedRoot.get()));
+                            "Partition %s moved from partition root %s to %s after the partition "
+                                    + "routing was resolved; failing so that the restart "
+                                    + "re-resolves partition routing.",
+                            schemaDotTable(capturedTable), expectedRoot.get(), root.get()));
         }
+        return !root.isPresent();
     }
 
     private Optional<String> configuredRootOf(TableId table) {

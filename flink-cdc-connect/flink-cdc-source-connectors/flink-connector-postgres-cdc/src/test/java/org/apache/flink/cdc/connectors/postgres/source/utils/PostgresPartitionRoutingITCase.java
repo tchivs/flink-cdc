@@ -51,7 +51,12 @@ class PostgresPartitionRoutingITCase {
                     .withPassword("postgres");
 
     private static final List<String> CONFIGURED =
-            Arrays.asList("public.orders", "public.events", "public.legacy", "public.metrics");
+            Arrays.asList(
+                    "public.orders",
+                    "public.events",
+                    "public.legacy",
+                    "public.metrics",
+                    "public.metrics_archive");
 
     /** The guard's connection, transactional like a Debezium connection may be. */
     private static Connection catalog;
@@ -99,6 +104,9 @@ class PostgresPartitionRoutingITCase {
             statement.execute(
                     "CREATE TABLE public.metrics_202610 PARTITION OF public.metrics"
                             + " FOR VALUES FROM ('2026-10-01') TO ('2026-11-01')");
+            statement.execute(
+                    "CREATE TABLE public.metrics_archive (id INT, dt DATE)"
+                            + " PARTITION BY RANGE (dt)");
         }
     }
 
@@ -160,13 +168,12 @@ class PostgresPartitionRoutingITCase {
     }
 
     @Test
-    void testGuardFailsForPartitionDetachedAfterResolution() throws Exception {
+    void testGuardReportsPartitionDetachedAfterResolution() throws Exception {
         PartitionGuard guard = guard();
         TableId metricsOctober = new TableId(null, "public", "metrics_202610");
 
-        assertThatCode(() -> guard.checkRouted(metricsOctober)).doesNotThrowAnyException();
-        assertThatCode(() -> guard.checkRouted(new TableId(null, "public", "events_2026_k1")))
-                .doesNotThrowAnyException();
+        assertThat(guard.isDetached(metricsOctober)).isFalse();
+        assertThat(guard.isDetached(new TableId(null, "public", "events_2026_k1"))).isFalse();
         try (Connection connection = connect();
                 Statement statement = connection.createStatement()) {
             // an open transaction on the shared connection would hold back vacuum
@@ -179,11 +186,20 @@ class PostgresPartitionRoutingITCase {
             statement.execute("ALTER TABLE public.metrics DETACH PARTITION public.metrics_202610");
         }
 
-        assertThatThrownBy(() -> guard.checkRouted(metricsOctober))
+        assertThat(guard.isDetached(metricsOctober)).isTrue();
+
+        // moved under another configured root: only a re-resolved routing can route it
+        try (Connection connection = connect();
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "ALTER TABLE public.metrics_archive ATTACH PARTITION public.metrics_202610"
+                            + " FOR VALUES FROM ('2026-10-01') TO ('2026-11-01')");
+        }
+        assertThatThrownBy(() -> guard.isDetached(metricsOctober))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining(
-                        "public.metrics_202610 is no longer a partition of partition root "
-                                + "public.metrics");
+                        "public.metrics_202610 moved from partition root public.metrics to "
+                                + "public.metrics_archive");
     }
 
     private static PostgresPartitionRouting resolve() {

@@ -199,7 +199,8 @@ class PostgresPartitionSwapITCase extends AbstractTestBase {
 
     /**
      * A detached partition is a table of its own: archiving its rows must not delete them from the
-     * root. With nothing attached, only the detach check can fail the source over.
+     * root, while its changes right before the DETACH still reach the root. Both hold without a
+     * restart, which would replay the change before the DETACH with the partition excluded.
      */
     @ParameterizedTest(name = "table-id.include-database={0}")
     @ValueSource(booleans = {true, false})
@@ -217,14 +218,13 @@ class PostgresPartitionSwapITCase extends AbstractTestBase {
             job.awaitParentRows(parent, 1, 2);
             execute("INSERT INTO public.jjdb VALUES (3, '2026-10-03', 'oct')");
             job.awaitParentRows(parent, 3);
-            // Let a checkpoint cover the stream position before the partition is detached.
-            Thread.sleep(3000L);
 
             execute(
+                    "INSERT INTO public.jjdb VALUES (5, '2026-10-05', 'oct')",
                     "ALTER TABLE public.jjdb DETACH PARTITION " + OLD_OCTOBER,
                     "DELETE FROM " + OLD_OCTOBER + " WHERE id = 3",
                     "INSERT INTO public.jjdb VALUES (40, '2026-09-25', 'sep')");
-            job.awaitParentRows(parent, 40);
+            job.awaitParentRows(parent, 5, 40);
             failovers = failovers(miniCluster, job);
         } finally {
             job.close();
@@ -234,8 +234,7 @@ class PostgresPartitionSwapITCase extends AbstractTestBase {
                 .filteredOn(DataChangeEvent.class::isInstance)
                 .as("no change of the detached partition reaches the root: %s", job.events)
                 .allSatisfy(e -> assertThat(((DataChangeEvent) e).after()).isNotNull());
-        // The detach check restarts the source once to re-resolve the routing.
-        assertThat(failovers).isEqualTo(1);
+        assertThat(failovers).isZero();
     }
 
     /**

@@ -24,7 +24,7 @@ import java.sql.SQLException;
 import java.util.Collections;
 import java.util.List;
 
-import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link PartitionGuard}. */
@@ -58,7 +58,7 @@ class PartitionGuardTest {
                 .hasCauseInstanceOf(SQLException.class);
         assertThatThrownBy(
                         () ->
-                                UNREADABLE_CATALOG.checkRouted(
+                                UNREADABLE_CATALOG.isDetached(
                                         new TableId(null, "public", "aia_t_icc_jjdb_202610")))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("Cannot verify")
@@ -67,10 +67,7 @@ class PartitionGuardTest {
 
     @Test
     void testCapturedTableThatIsNotRoutedNeedsNoCatalog() {
-        assertThatCode(
-                        () ->
-                                UNREADABLE_CATALOG.checkRouted(
-                                        new TableId(null, "public", "aia_t_icc_other")))
-                .doesNotThrowAnyException();
+        assertThat(UNREADABLE_CATALOG.isDetached(new TableId(null, "public", "aia_t_icc_other")))
+                .isFalse();
     }
 }
