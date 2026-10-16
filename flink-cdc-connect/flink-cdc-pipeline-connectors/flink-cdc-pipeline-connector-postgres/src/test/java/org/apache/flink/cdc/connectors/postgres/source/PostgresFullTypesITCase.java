@@ -44,7 +44,6 @@ import org.apache.flink.cdc.runtime.typeutils.EventTypeInfo;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.util.RestartStrategyUtils;
 import org.apache.flink.table.planner.factories.TestValuesTableFactory;
-import org.apache.flink.table.types.logical.DecimalType;
 import org.apache.flink.util.CloseableIterator;
 
 import org.assertj.core.api.Assertions;
@@ -209,7 +208,8 @@ public class PostgresFullTypesITCase extends PostgresTestBase {
                             LocalDateTime.parse("2020-07-17T18:00:22.123456")),
                     DateData.fromEpochDay(18460),
                     TimeData.fromMillisOfDay(64822000),
-                    DecimalData.fromBigDecimal(new BigDecimal("500"), 10, 0),
+                    // NUMERIC without typmod is emitted as lossless text.
+                    BinaryStringData.fromString("500"),
                     BinaryStringData.fromString(
                             "{\"coordinates\":\"[[174.9479,-36.7208]]\",\"type\":\"Point\",\"srid\":3187}"),
                     BinaryStringData.fromString(
@@ -1196,7 +1196,7 @@ public class PostgresFullTypesITCase extends PostgresTestBase {
                     DataTypes.TIMESTAMP(6),
                     DataTypes.DATE(),
                     DataTypes.TIME(0),
-                    DataTypes.DECIMAL(DecimalType.DEFAULT_PRECISION, DecimalType.DEFAULT_SCALE),
+                    DataTypes.STRING(),
                     DataTypes.STRING(),
                     DataTypes.STRING(),
                     DataTypes.BOOLEAN(),
