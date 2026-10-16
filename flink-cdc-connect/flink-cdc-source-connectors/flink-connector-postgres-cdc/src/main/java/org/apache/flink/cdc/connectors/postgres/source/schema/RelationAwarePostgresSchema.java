@@ -60,9 +60,14 @@ public class RelationAwarePostgresSchema extends PostgresSchema {
         if (isFilteredOut(table.id())) {
             // Debezium sees the relation of every published table, filtered ones included.
             if (partitionGuard != null) {
-                partitionGuard.check(table.id());
+                partitionGuard.checkFiltered(table.id());
             }
-        } else if (dispatcher != null) {
+            return;
+        }
+        if (partitionGuard != null) {
+            partitionGuard.checkRouted(table.id());
+        }
+        if (dispatcher != null) {
             dispatcher.dispatch(table);
         }
     }

@@ -52,9 +52,8 @@ import java.util.regex.Pattern;
  *
  * <p>Table names are handled as {@code schema.table}, which is how Debezium maps a PostgreSQL
  * {@code TableId} for {@code table.include.list}. {@link #empty()} is returned when the server
- * supports {@code publish_via_partition_root} (PostgreSQL 13+), when the feature is switched off,
- * or when the metadata query fails, in which case the connector behaves exactly as without this
- * feature.
+ * supports {@code publish_via_partition_root} (PostgreSQL 13+) or when the feature is switched off,
+ * in which case the connector behaves exactly as without this feature.
  */
 public class PostgresPartitionRouting implements Serializable {
 
@@ -134,10 +133,13 @@ public class PostgresPartitionRouting implements Serializable {
     }
 
     /**
-     * Resolves the partition routing from the database. Never fails: whenever the server does not
-     * need this routing or the metadata query fails, an {@link #empty()} routing is returned.
+     * Resolves the partition routing from the database. An {@link #empty()} routing is returned
+     * when the feature is switched off or the server does not need this routing.
      *
      * @param configuredTables the configured table list, entries are regular expressions
+     * @throws IllegalStateException if the catalog cannot be read: on PostgreSQL 10/11/12 a
+     *     partition root never carries changes of its own, so running without the routing would
+     *     capture none of its changes, silently
      */
     public static PostgresPartitionRouting resolve(
             String jdbcUrl,
@@ -174,12 +176,12 @@ public class PostgresPartitionRouting implements Serializable {
             }
             return routing;
         } catch (Exception e) {
-            LOG.warn(
-                    "Failed to resolve the partition routing of {}, capture the configured tables "
-                            + "as they are.",
-                    jdbcUrl,
+            throw new IllegalStateException(
+                    String.format(
+                            "Failed to resolve the partition routing of %s; failing instead of "
+                                    + "silently capturing none of the partitions of %s.",
+                            jdbcUrl, configuredTables),
                     e);
-            return empty();
         }
     }
 
@@ -190,28 +192,30 @@ public class PostgresPartitionRouting implements Serializable {
      *
      * @param configuredTables the configured table list, entries are regular expressions
      */
-    public static Optional<String> configuredRootOf(
-            String jdbcUrl,
-            String username,
-            String password,
+    static Optional<String> configuredRootOf(
+            Connection connection,
+            String database,
             List<String> configuredTables,
             String schema,
             String table)
-            throws Exception {
-        try (Connection connection = openConnection(jdbcUrl, username, password);
-                PreparedStatement statement = connection.prepareStatement(PARTITION_ROOT_SQL)) {
+            throws SQLException {
+        Optional<String> root = Optional.empty();
+        try (PreparedStatement statement = connection.prepareStatement(PARTITION_ROOT_SQL)) {
             statement.setString(1, schema);
             statement.setString(2, table);
             try (ResultSet resultSet = statement.executeQuery()) {
-                if (!resultSet.next()) {
-                    return Optional.empty();
+                if (resultSet.next()
+                        && matchesConfiguredTable(
+                                resultSet.getString(1), database, configuredTables)) {
+                    root = Optional.of(resultSet.getString(1));
                 }
-                String root = resultSet.getString(1);
-                return matchesConfiguredTable(root, databaseOf(jdbcUrl), configuredTables)
-                        ? Optional.of(root)
-                        : Optional.empty();
             }
         }
+        if (!connection.getAutoCommit()) {
+            // Never leave the shared connection idle in transaction: it would hold back vacuum.
+            connection.commit();
+        }
+        return root;
     }
 
     /**

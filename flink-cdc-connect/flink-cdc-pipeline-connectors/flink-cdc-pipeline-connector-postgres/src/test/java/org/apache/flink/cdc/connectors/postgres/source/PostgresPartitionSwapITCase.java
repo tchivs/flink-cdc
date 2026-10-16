@@ -198,6 +198,47 @@ class PostgresPartitionSwapITCase extends AbstractTestBase {
     }
 
     /**
+     * A detached partition is a table of its own: archiving its rows must not delete them from the
+     * root. With nothing attached, only the detach check can fail the source over.
+     */
+    @ParameterizedTest(name = "table-id.include-database={0}")
+    @ValueSource(booleans = {true, false})
+    void partitionDetachedWhileRunningIsNoLongerRouted(
+            boolean includeDatabase, @InjectMiniCluster MiniCluster miniCluster) throws Exception {
+        TableId parent = parent(includeDatabase);
+        createTables();
+        RunningJob job =
+                start(
+                        sourceProvider(
+                                includeDatabase, "flink_partition_detach_" + includeDatabase, null),
+                        null);
+        int failovers;
+        try {
+            job.awaitParentRows(parent, 1, 2);
+            execute("INSERT INTO public.jjdb VALUES (3, '2026-10-03', 'oct')");
+            job.awaitParentRows(parent, 3);
+            // Let a checkpoint cover the stream position before the partition is detached.
+            Thread.sleep(3000L);
+
+            execute(
+                    "ALTER TABLE public.jjdb DETACH PARTITION " + OLD_OCTOBER,
+                    "DELETE FROM " + OLD_OCTOBER + " WHERE id = 3",
+                    "INSERT INTO public.jjdb VALUES (40, '2026-09-25', 'sep')");
+            job.awaitParentRows(parent, 40);
+            failovers = failovers(miniCluster, job);
+        } finally {
+            job.close();
+        }
+        assertOnlyParent(job.events, parent);
+        assertThat(job.events)
+                .filteredOn(DataChangeEvent.class::isInstance)
+                .as("no change of the detached partition reaches the root: %s", job.events)
+                .allSatisfy(e -> assertThat(((DataChangeEvent) e).after()).isNotNull());
+        // The detach check restarts the source once to re-resolve the routing.
+        assertThat(failovers).isEqualTo(1);
+    }
+
+    /**
      * The field restart path: the restored job runs the source created by the client before the
      * swap, so only the config created by each reader knows the new partition.
      */

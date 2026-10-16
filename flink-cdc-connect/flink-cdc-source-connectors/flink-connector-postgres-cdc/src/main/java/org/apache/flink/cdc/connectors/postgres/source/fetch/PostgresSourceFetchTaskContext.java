@@ -289,7 +289,7 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
         if (sourceSplitBase.isStreamSplit()
                 && !isBackFillSplit(sourceSplitBase)
                 && !postgresSourceConfig.getPartitionRouting().isEmpty()) {
-            schema.setPartitionGuard(new PartitionGuard(postgresSourceConfig));
+            schema.setPartitionGuard(new PartitionGuard(postgresSourceConfig, jdbcConnection));
         }
 
         ChangeEventSourceMetricsFactory<PostgresPartition> metricsFactory =

@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link PostgresPartitionRouting}. */
 class PostgresPartitionRoutingTest {
@@ -133,7 +134,7 @@ class PostgresPartitionRoutingTest {
     }
 
     @Test
-    void testDisabledFeatureAndUnreadableDatabaseDegradeToEmptyRouting() {
+    void testDisabledFeatureIsEmptyAndUnreadableDatabaseFails() {
         assertThat(
                         PostgresPartitionRouting.resolve(
                                         "jdbc:postgresql://127.0.0.1:1/" + DATABASE,
@@ -152,16 +153,17 @@ class PostgresPartitionRoutingTest {
                                         true)
                                 .isEmpty())
                 .isTrue();
-        // the job must not fail when the server cannot be reached
-        assertThat(
-                        PostgresPartitionRouting.resolve(
+        // without the routing, no change of a PostgreSQL 10 partition root would be captured
+        assertThatThrownBy(
+                        () ->
+                                PostgresPartitionRouting.resolve(
                                         "jdbc:postgresql://127.0.0.1:1/" + DATABASE,
                                         "user",
                                         "password",
                                         Collections.singletonList(PARENT),
-                                        true)
-                                .isEmpty())
-                .isTrue();
+                                        true))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Failed to resolve the partition routing");
     }
 
     @Test

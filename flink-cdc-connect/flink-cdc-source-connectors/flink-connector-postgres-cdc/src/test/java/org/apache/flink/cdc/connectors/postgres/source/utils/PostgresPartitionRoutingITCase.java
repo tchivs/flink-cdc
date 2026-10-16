@@ -26,6 +26,7 @@ import org.testcontainers.utility.DockerImageName;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.Arrays;
 import java.util.Collections;
@@ -50,14 +51,24 @@ class PostgresPartitionRoutingITCase {
                     .withPassword("postgres");
 
     private static final List<String> CONFIGURED =
-            Arrays.asList("public.orders", "public.events", "public.legacy");
+            Arrays.asList("public.orders", "public.events", "public.legacy", "public.metrics");
+
+    /** The guard's connection, transactional like a Debezium connection may be. */
+    private static Connection catalog;
+
+    private static int catalogPid;
 
     @BeforeAll
     static void createTables() throws Exception {
         PG10.start();
-        try (Connection connection =
-                        DriverManager.getConnection(
-                                PG10.getJdbcUrl(), PG10.getUsername(), PG10.getPassword());
+        catalog = connect();
+        try (Statement statement = catalog.createStatement();
+                ResultSet pid = statement.executeQuery("SELECT pg_backend_pid()")) {
+            pid.next();
+            catalogPid = pid.getInt(1);
+        }
+        catalog.setAutoCommit(false);
+        try (Connection connection = connect();
                 Statement statement = connection.createStatement()) {
             // single level declarative partitioning
             statement.execute(
@@ -82,11 +93,18 @@ class PostgresPartitionRoutingITCase {
             // a partition attached after the routing was resolved
             statement.execute("CREATE TABLE public.orders_202611 (id INT, dt DATE)");
             statement.execute("CREATE TABLE public.unrelated (id INT)");
+            // a partition detached after the routing was resolved
+            statement.execute(
+                    "CREATE TABLE public.metrics (id INT, dt DATE) PARTITION BY RANGE (dt)");
+            statement.execute(
+                    "CREATE TABLE public.metrics_202610 PARTITION OF public.metrics"
+                            + " FOR VALUES FROM ('2026-10-01') TO ('2026-11-01')");
         }
     }
 
     @AfterAll
-    static void stopContainer() {
+    static void stopContainer() throws Exception {
+        catalog.close();
         PG10.stop();
     }
 
@@ -104,20 +122,18 @@ class PostgresPartitionRoutingITCase {
     @Test
     void testGuardFailsForPartitionAttachedAfterResolution() throws Exception {
         PartitionGuard guard = guard();
-        try (Connection connection =
-                        DriverManager.getConnection(
-                                PG10.getJdbcUrl(), PG10.getUsername(), PG10.getPassword());
+        try (Connection connection = connect();
                 Statement statement = connection.createStatement()) {
             statement.execute(
                     "ALTER TABLE public.orders ATTACH PARTITION public.orders_202611"
                             + " FOR VALUES FROM ('2026-11-01') TO ('2026-12-01')");
         }
 
-        assertThatThrownBy(() -> guard.check(new TableId(null, "public", "orders_202611")))
+        assertThatThrownBy(() -> guard.checkFiltered(new TableId(null, "public", "orders_202611")))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("public.orders_202611")
                 .hasMessageContaining("public.orders");
-        assertThatThrownBy(() -> guard.check(new TableId(null, "public", "events_2026_k1")))
+        assertThatThrownBy(() -> guard.checkFiltered(new TableId(null, "public", "events_2026_k1")))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("partition root public.events");
     }
@@ -126,18 +142,48 @@ class PostgresPartitionRoutingITCase {
     void testGuardPassesTablesThatAreNoConfiguredPartition() {
         PartitionGuard guard = guard();
 
-        assertThatCode(() -> guard.check(new TableId(null, "public", "unrelated")))
+        assertThatCode(() -> guard.checkFiltered(new TableId(null, "public", "unrelated")))
                 .doesNotThrowAnyException();
-        assertThatCode(() -> guard.check(new TableId(null, "public", "legacy_child")))
+        assertThatCode(() -> guard.checkFiltered(new TableId(null, "public", "legacy_child")))
                 .doesNotThrowAnyException();
         PartitionGuard ordersOnly =
                 new PartitionGuard(
-                        PG10.getJdbcUrl(),
-                        PG10.getUsername(),
-                        PG10.getPassword(),
-                        Collections.singletonList("public.orders"));
-        assertThatCode(() -> ordersOnly.check(new TableId(null, "public", "events_2026_k1")))
+                        resolve(),
+                        "routing",
+                        Collections.singletonList("public.orders"),
+                        () -> catalog);
+        assertThatCode(
+                        () ->
+                                ordersOnly.checkFiltered(
+                                        new TableId(null, "public", "events_2026_k1")))
                 .doesNotThrowAnyException();
+    }
+
+    @Test
+    void testGuardFailsForPartitionDetachedAfterResolution() throws Exception {
+        PartitionGuard guard = guard();
+        TableId metricsOctober = new TableId(null, "public", "metrics_202610");
+
+        assertThatCode(() -> guard.checkRouted(metricsOctober)).doesNotThrowAnyException();
+        assertThatCode(() -> guard.checkRouted(new TableId(null, "public", "events_2026_k1")))
+                .doesNotThrowAnyException();
+        try (Connection connection = connect();
+                Statement statement = connection.createStatement()) {
+            // an open transaction on the shared connection would hold back vacuum
+            try (ResultSet state =
+                    statement.executeQuery(
+                            "SELECT state FROM pg_stat_activity WHERE pid = " + catalogPid)) {
+                assertThat(state.next()).isTrue();
+                assertThat(state.getString(1)).isEqualTo("idle");
+            }
+            statement.execute("ALTER TABLE public.metrics DETACH PARTITION public.metrics_202610");
+        }
+
+        assertThatThrownBy(() -> guard.checkRouted(metricsOctober))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(
+                        "public.metrics_202610 is no longer a partition of partition root "
+                                + "public.metrics");
     }
 
     private static PostgresPartitionRouting resolve() {
@@ -146,7 +192,11 @@ class PostgresPartitionRoutingITCase {
     }
 
     private static PartitionGuard guard() {
-        return new PartitionGuard(
-                PG10.getJdbcUrl(), PG10.getUsername(), PG10.getPassword(), CONFIGURED);
+        return new PartitionGuard(resolve(), "routing", CONFIGURED, () -> catalog);
+    }
+
+    private static Connection connect() throws Exception {
+        return DriverManager.getConnection(
+                PG10.getJdbcUrl(), PG10.getUsername(), PG10.getPassword());
     }
 }

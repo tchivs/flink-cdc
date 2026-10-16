@@ -20,25 +20,57 @@ package org.apache.flink.cdc.connectors.postgres.source.utils;
 import io.debezium.relational.TableId;
 import org.junit.jupiter.api.Test;
 
+import java.sql.SQLException;
 import java.util.Collections;
+import java.util.List;
 
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link PartitionGuard}. */
 class PartitionGuardTest {
 
+    private static final List<String> CONFIGURED =
+            Collections.singletonList("public.aia_t_icc_jjdb");
+
+    private static final PartitionGuard UNREADABLE_CATALOG =
+            new PartitionGuard(
+                    PostgresPartitionRouting.create(
+                            Collections.singletonMap(
+                                    "public.aia_t_icc_jjdb_202610",
+                                    Collections.singleton("public.aia_t_icc_jjdb")),
+                            "aiadb",
+                            CONFIGURED),
+                    "aiadb",
+                    CONFIGURED,
+                    () -> {
+                        throw new SQLException("Connection refused");
+                    });
+
     @Test
     void testUnreadableCatalogFailsInsteadOfLettingThePartitionThrough() {
-        PartitionGuard guard =
-                new PartitionGuard(
-                        "jdbc:postgresql://127.0.0.1:1/aiadb",
-                        "user",
-                        "password",
-                        Collections.singletonList("public.aia_t_icc_jjdb"));
-
-        assertThatThrownBy(() -> guard.check(new TableId(null, "public", "aia_t_icc_jjdb_202611")))
+        assertThatThrownBy(
+                        () ->
+                                UNREADABLE_CATALOG.checkFiltered(
+                                        new TableId(null, "public", "aia_t_icc_jjdb_202611")))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("Cannot verify")
-                .hasCauseInstanceOf(Exception.class);
+                .hasCauseInstanceOf(SQLException.class);
+        assertThatThrownBy(
+                        () ->
+                                UNREADABLE_CATALOG.checkRouted(
+                                        new TableId(null, "public", "aia_t_icc_jjdb_202610")))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Cannot verify")
+                .hasCauseInstanceOf(SQLException.class);
+    }
+
+    @Test
+    void testCapturedTableThatIsNotRoutedNeedsNoCatalog() {
+        assertThatCode(
+                        () ->
+                                UNREADABLE_CATALOG.checkRouted(
+                                        new TableId(null, "public", "aia_t_icc_other")))
+                .doesNotThrowAnyException();
     }
 }
