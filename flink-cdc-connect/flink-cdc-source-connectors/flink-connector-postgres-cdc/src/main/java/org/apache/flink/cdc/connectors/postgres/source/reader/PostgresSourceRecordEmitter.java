@@ -23,7 +23,9 @@ import org.apache.flink.cdc.connectors.base.source.meta.split.SourceSplitState;
 import org.apache.flink.cdc.connectors.base.source.metrics.SourceReaderMetrics;
 import org.apache.flink.cdc.connectors.base.source.reader.IncrementalSourceRecordEmitter;
 import org.apache.flink.cdc.connectors.postgres.source.config.PostgresSourceConfig;
+import org.apache.flink.cdc.connectors.postgres.source.schema.PartitionRoutingRecord;
 import org.apache.flink.cdc.connectors.postgres.source.schema.PostgresSchemaRecord;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresPartitionRouting;
 import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresSourceRecordUtils;
 import org.apache.flink.cdc.debezium.DebeziumDeserializationSchema;
 
@@ -54,10 +56,17 @@ public class PostgresSourceRecordEmitter<T> extends IncrementalSourceRecordEmitt
         this.sourceConfig = sourceConfig;
     }
 
+    /** Called with the partition routing in force from this position of the stream on. */
+    protected void onPartitionRouting(PostgresPartitionRouting routing) {}
+
     @Override
     protected void processElement(
             SourceRecord element, SourceOutput<T> output, SourceSplitState splitState)
             throws Exception {
+        if (element instanceof PartitionRoutingRecord) {
+            onPartitionRouting(((PartitionRoutingRecord) element).getRouting());
+            return;
+        }
         if (isIncludeEmitLogicalMessage(element)) {
             updateStreamSplitState(splitState, element);
             emitElement(element, output);

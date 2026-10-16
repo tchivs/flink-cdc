@@ -5,6 +5,8 @@
  */
 package io.debezium.connector.postgresql;
 
+import org.apache.flink.cdc.connectors.postgres.source.schema.RelationAwarePostgresSchema;
+
 import io.debezium.DebeziumException;
 import io.debezium.connector.postgresql.connection.LogicalDecodingMessage;
 import io.debezium.connector.postgresql.connection.Lsn;
@@ -321,6 +323,18 @@ public class PostgresStreamingChangeEventSource
                                     if (message.getOperation() != Operation.NOOP) {
                                         tableId = PostgresSchema.parse(message.getTable());
                                         Objects.requireNonNull(tableId);
+                                        // Partition marker rows move the routing, exactly here.
+                                        if (schema instanceof RelationAwarePostgresSchema
+                                                && ((RelationAwarePostgresSchema) schema)
+                                                        .applyPartitionMarker(
+                                                                tableId,
+                                                                message,
+                                                                () ->
+                                                                        (BaseConnection)
+                                                                                connection
+                                                                                        .connection())) {
+                                            return;
+                                        }
                                     }
 
                                     offsetContext.updateWalPosition(

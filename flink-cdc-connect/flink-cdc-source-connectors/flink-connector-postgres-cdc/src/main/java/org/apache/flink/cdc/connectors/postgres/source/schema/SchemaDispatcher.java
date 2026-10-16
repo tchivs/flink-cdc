@@ -17,9 +17,13 @@
 
 package org.apache.flink.cdc.connectors.postgres.source.schema;
 
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresPartitionRouting;
+
 import io.debezium.relational.Table;
 
-/** Dispatches Debezium table schema changes into the change event queue. */
+/** Puts schema and routing changes found by the stream into the event queue, in stream order. */
 public interface SchemaDispatcher {
     void dispatch(Table table);
+
+    void dispatchRouting(PostgresPartitionRouting routing);
 }

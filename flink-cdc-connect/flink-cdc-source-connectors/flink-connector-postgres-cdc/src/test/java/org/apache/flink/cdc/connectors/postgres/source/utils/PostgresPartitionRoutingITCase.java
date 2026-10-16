@@ -204,7 +204,12 @@ class PostgresPartitionRoutingITCase {
 
     private static PostgresPartitionRouting resolve() {
         return PostgresPartitionRouting.resolve(
-                PG10.getJdbcUrl(), PG10.getUsername(), PG10.getPassword(), CONFIGURED, true);
+                PG10.getJdbcUrl(),
+                PG10.getUsername(),
+                PG10.getPassword(),
+                CONFIGURED,
+                true,
+                "dbz_publication");
     }
 
     private static PartitionGuard guard() {

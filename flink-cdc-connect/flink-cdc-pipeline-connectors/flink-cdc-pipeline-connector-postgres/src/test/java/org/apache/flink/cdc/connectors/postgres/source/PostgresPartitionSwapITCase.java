@@ -55,6 +55,9 @@ import org.testcontainers.utility.DockerImageName;
 
 import javax.annotation.Nullable;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -276,6 +279,64 @@ class PostgresPartitionSwapITCase extends AbstractTestBase {
         assertOnlyParent(after.events, parent);
     }
 
+    /**
+     * The restart lands between partition DDL and the next checkpoint: the replay from the
+     * checkpoint must route every change by the partitions at its own position, not by today's
+     * catalog. Without the partition marker table the change before the DETACH would be lost and
+     * the change before the ATTACH would reach the root.
+     */
+    @ParameterizedTest(name = "table-id.include-database={0}")
+    @ValueSource(booleans = {true, false})
+    void replayAcrossPartitionDdlRoutesByStreamPosition(
+            boolean includeDatabase, @InjectMiniCluster MiniCluster miniCluster) throws Exception {
+        TableId parent = parent(includeDatabase);
+        createTables();
+        installPartitionMarker();
+        FlinkSourceProvider sourceProvider =
+                sourceProvider(includeDatabase, "flink_partition_replay_" + includeDatabase, null);
+
+        String savepoint;
+        RunningJob before = start(sourceProvider, null);
+        try {
+            before.awaitParentRows(parent, 1, 2);
+            execute("INSERT INTO public.jjdb VALUES (3, '2026-10-03', 'oct-old')");
+            before.awaitParentRows(parent, 3);
+            // The last checkpoint before the DDL.
+            savepoint = before.stopWithSavepoint(getTempDirPath("savepoints"));
+        } finally {
+            before.close();
+        }
+
+        execute(
+                "INSERT INTO public.jjdb VALUES (5, '2026-10-05', 'oct-old')",
+                "ALTER TABLE public.jjdb DETACH PARTITION " + OLD_OCTOBER,
+                "DELETE FROM " + OLD_OCTOBER + " WHERE id = 3",
+                "INSERT INTO " + OLD_OCTOBER + " VALUES (6, '2026-10-06', 'detached')",
+                "CREATE TABLE public.jjdb_202610 (id INT NOT NULL, dt DATE NOT NULL,"
+                        + " name VARCHAR(32), PRIMARY KEY (id, dt))",
+                "INSERT INTO public.jjdb_202610 VALUES (7, '2026-10-07', 'standalone')",
+                "ALTER TABLE public.jjdb ATTACH PARTITION public.jjdb_202610"
+                        + " FOR VALUES FROM ('2026-10-01') TO ('2026-11-01')",
+                "INSERT INTO public.jjdb VALUES (8, '2026-10-08', 'oct-new'),"
+                        + " (40, '2026-09-25', 'sep')");
+
+        RunningJob after = start(sourceProvider, savepoint);
+        try {
+            after.awaitParentRows(parent, 5, 8, 40);
+            assertThat(failovers(miniCluster, after)).isZero();
+        } finally {
+            after.close();
+        }
+        assertOnlyParent(after.events, parent);
+        assertThat(after.parentRowIds(parent))
+                .as("only changes made while the table was a partition: %s", after.events)
+                .doesNotContain(6, 7);
+        assertThat(after.events)
+                .filteredOn(DataChangeEvent.class::isInstance)
+                .as("no change of the detached partition reaches the root: %s", after.events)
+                .allSatisfy(e -> assertThat(((DataChangeEvent) e).after()).isNotNull());
+    }
+
     /** The field recovery without checkpoint: a fresh job resumes the slot's committed offset. */
     @ParameterizedTest(name = "table-id.include-database={0}")
     @ValueSource(booleans = {true, false})
@@ -321,6 +382,9 @@ class PostgresPartitionSwapITCase extends AbstractTestBase {
 
     private static void createTables() throws SQLException {
         execute(
+                "DROP EVENT TRIGGER IF EXISTS flink_cdc_partition_marker_ddl",
+                "DROP EVENT TRIGGER IF EXISTS flink_cdc_partition_marker_drop",
+                "DROP TABLE IF EXISTS public.flink_cdc_partition_marker",
                 "DROP TABLE IF EXISTS public.jjdb, public.jjdb_202610, " + OLD_OCTOBER,
                 "DROP PUBLICATION IF EXISTS dbz_publication",
                 "CREATE TABLE public.jjdb (id INT NOT NULL, dt DATE NOT NULL, name VARCHAR(32))"
@@ -336,6 +400,18 @@ class PostgresPartitionSwapITCase extends AbstractTestBase {
                 // As provisioned by the DBA in production.
                 "CREATE PUBLICATION dbz_publication FOR ALL TABLES",
                 "INSERT INTO public.jjdb VALUES (1, '2026-09-15', 'sep'), (2, '2026-10-02', 'oct')");
+    }
+
+    /** The CDC prerequisite that lets the routing follow partition DDL by stream position. */
+    private static void installPartitionMarker() throws Exception {
+        execute(
+                new String(
+                        Files.readAllBytes(
+                                Paths.get(
+                                        PostgresPartitionSwapITCase.class
+                                                .getResource("/partition-marker.sql")
+                                                .toURI())),
+                        StandardCharsets.UTF_8));
     }
 
     private FlinkSourceProvider sourceProvider(

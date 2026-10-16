@@ -141,7 +141,8 @@ class PostgresPartitionRoutingTest {
                                         "user",
                                         "password",
                                         Collections.singletonList(PARENT),
-                                        false)
+                                        false,
+                                        "dbz_publication")
                                 .isEmpty())
                 .isTrue();
         assertThat(
@@ -150,7 +151,8 @@ class PostgresPartitionRoutingTest {
                                         "user",
                                         "password",
                                         Collections.emptyList(),
-                                        true)
+                                        true,
+                                        "dbz_publication")
                                 .isEmpty())
                 .isTrue();
         // without the routing, no change of a PostgreSQL 10 partition root would be captured
@@ -161,7 +163,8 @@ class PostgresPartitionRoutingTest {
                                         "user",
                                         "password",
                                         Collections.singletonList(PARENT),
-                                        true))
+                                        true,
+                                        "dbz_publication"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("Failed to resolve the partition routing");
     }

@@ -22,8 +22,10 @@ import org.apache.flink.cdc.connectors.base.source.meta.offset.Offset;
 import org.apache.flink.cdc.connectors.base.source.meta.split.SourceSplitBase;
 import org.apache.flink.cdc.connectors.base.source.meta.wartermark.WatermarkEvent;
 import org.apache.flink.cdc.connectors.base.source.meta.wartermark.WatermarkKind;
+import org.apache.flink.cdc.connectors.postgres.source.schema.PartitionRoutingRecord;
 import org.apache.flink.cdc.connectors.postgres.source.schema.PostgresSchemaRecord;
 import org.apache.flink.cdc.connectors.postgres.source.schema.SchemaDispatcher;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresPartitionRouting;
 
 import io.debezium.connector.base.ChangeEventQueue;
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
@@ -87,9 +89,17 @@ public class CDCPostgresDispatcher extends PostgresEventDispatcher<TableId>
 
     @Override
     public void dispatch(Table table) {
-        PostgresSchemaRecord schemaRecord = new PostgresSchemaRecord(table);
+        enqueue(new PostgresSchemaRecord(table));
+    }
+
+    @Override
+    public void dispatchRouting(PostgresPartitionRouting routing) {
+        enqueue(new PartitionRoutingRecord(routing));
+    }
+
+    private void enqueue(SourceRecord record) {
         try {
-            queue.enqueue(new DataChangeEvent(schemaRecord));
+            queue.enqueue(new DataChangeEvent(record));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException(e);

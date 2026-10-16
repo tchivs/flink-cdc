@@ -65,7 +65,8 @@ public class PostgresPartitionRouting implements Serializable {
     public static final int PUBLISH_VIA_PARTITION_ROOT_SINCE = 130000;
 
     private static final PostgresPartitionRouting EMPTY =
-            new PostgresPartitionRouting(Collections.emptyMap(), Collections.emptySet());
+            new PostgresPartitionRouting(
+                    Collections.emptyMap(), Collections.emptySet(), Collections.emptySet(), false);
 
     // relispartition: pg_inherits also holds legacy INHERITS children, whose parent stores rows of
     // its own and must neither be routed nor dropped from the snapshot. A partitioned table cannot
@@ -114,10 +115,27 @@ public class PostgresPartitionRouting implements Serializable {
      */
     private final Set<String> partitionAncestors;
 
+    /**
+     * Partitions routed at some marker but not routed now: they stay in Debezium's include list so
+     * that a replay still sees their changes from before a DETACH, but they are not snapshotted.
+     */
+    private final Set<String> formerPartitions;
+
+    /**
+     * Whether the partition marker table is installed, so that the stream follows partition DDL by
+     * position through {@link PartitionTopology}.
+     */
+    private final boolean markers;
+
     private PostgresPartitionRouting(
-            Map<String, String> parentByChild, Set<String> partitionAncestors) {
+            Map<String, String> parentByChild,
+            Set<String> partitionAncestors,
+            Set<String> formerPartitions,
+            boolean markers) {
         this.parentByChild = parentByChild;
         this.partitionAncestors = partitionAncestors;
+        this.formerPartitions = formerPartitions;
+        this.markers = markers;
         Map<String, List<String>> childrenByParent = new LinkedHashMap<>();
         for (Map.Entry<String, String> entry : parentByChild.entrySet()) {
             childrenByParent
@@ -137,16 +155,20 @@ public class PostgresPartitionRouting implements Serializable {
      * when the feature is switched off or the server does not need this routing.
      *
      * @param configuredTables the configured table list, entries are regular expressions
+     * @param publication the publication of the replication slot, the partition marker table has to
+     *     be in it when installed
      * @throws IllegalStateException if the catalog cannot be read: on PostgreSQL 10/11/12 a
      *     partition root never carries changes of its own, so running without the routing would
-     *     capture none of its changes, silently
+     *     capture none of its changes, silently; or if the partition marker table is installed but
+     *     not published
      */
     public static PostgresPartitionRouting resolve(
             String jdbcUrl,
             String username,
             String password,
             List<String> configuredTables,
-            boolean includePartitionedTables) {
+            boolean includePartitionedTables,
+            String publication) {
         if (!includePartitionedTables || configuredTables == null || configuredTables.isEmpty()) {
             return empty();
         }
@@ -159,11 +181,41 @@ public class PostgresPartitionRouting implements Serializable {
                         serverVersion);
                 return empty();
             }
+            String database = databaseOf(jdbcUrl);
+            Map<String, List<String>> edges = PartitionTopology.readEdges(connection);
             PostgresPartitionRouting routing =
-                    create(
-                            readPartitionAncestors(connection),
-                            databaseOf(jdbcUrl),
-                            configuredTables);
+                    create(readPartitionAncestors(connection), database, configuredTables);
+            Optional<List<PartitionTopology.Marker>> markers =
+                    PartitionTopology.readMarkers(connection);
+            Set<String> former =
+                    markers.isPresent()
+                            ? PartitionTopology.partitionsEverRouted(
+                                    edges, markers.get(), database, configuredTables)
+                            : Collections.emptySet();
+            if (!routing.isEmpty() || !former.isEmpty()) {
+                if (markers.isPresent()) {
+                    PartitionTopology.checkPublished(connection, publication);
+                    former.removeAll(routing.parentByChild.keySet());
+                    routing =
+                            new PostgresPartitionRouting(
+                                    routing.parentByChild,
+                                    routing.partitionAncestors,
+                                    former,
+                                    true);
+                    LOG.info(
+                            "Partition marker table found, partition routing follows partition "
+                                    + "DDL by stream position; former partitions kept in the "
+                                    + "include list: {}",
+                            former);
+                } else {
+                    LOG.warn(
+                            "Partition marker table {}.{} is not installed: a restart between a "
+                                    + "DETACH and the next checkpoint loses the changes of the "
+                                    + "detached partition made since that checkpoint.",
+                            PartitionTopology.MARKER_SCHEMA,
+                            PartitionTopology.MARKER_TABLE);
+                }
+            }
             if (routing.isEmpty()) {
                 LOG.info(
                         "None of the configured tables is a partition root, no client side "
@@ -262,12 +314,49 @@ public class PostgresPartitionRouting implements Serializable {
         }
         return parentByChild.isEmpty()
                 ? empty()
-                : new PostgresPartitionRouting(parentByChild, partitionAncestors);
+                : new PostgresPartitionRouting(
+                        parentByChild, partitionAncestors, Collections.emptySet(), false);
     }
 
     /** Returns whether no child partition is routed to a configured partition root. */
     public boolean isEmpty() {
         return parentByChild.isEmpty();
+    }
+
+    /**
+     * Returns whether the partition marker table is installed, i.e. the stream has to follow
+     * partition DDL by position through a {@link PartitionTopology}.
+     */
+    public boolean hasMarkers() {
+        return markers;
+    }
+
+    /**
+     * Returns whether the given {@code schema.table} was routed at some marker but is not routed
+     * now: it is in the include list for the stream only and must not be snapshotted.
+     */
+    public boolean isFormerPartition(String schemaDotTable) {
+        return formerPartitions.contains(schemaDotTable);
+    }
+
+    /** Returns the routed child partitions as {@code schema.table}. */
+    public Set<String> routedPartitions() {
+        return parentByChild.keySet();
+    }
+
+    /**
+     * Returns every partition this routing puts into Debezium's include list, the routed and the
+     * former ones: a stream must route each of them by position, never capture one as a table.
+     */
+    public Set<String> partitionsInIncludeList() {
+        Set<String> partitions = new TreeSet<>(parentByChild.keySet());
+        partitions.addAll(formerPartitions);
+        return partitions;
+    }
+
+    /** Returns whether both route the same partitions to the same roots. */
+    public boolean sameRoutes(PostgresPartitionRouting other) {
+        return parentByChild.equals(other.parentByChild);
     }
 
     /**
@@ -314,7 +403,8 @@ public class PostgresPartitionRouting implements Serializable {
 
     /**
      * Returns the child partitions of the configured partition roots as {@code schema.table}, ready
-     * to be appended to the configured table list for Debezium's {@code table.include.list}.
+     * to be appended to the configured table list for Debezium's {@code table.include.list}. Former
+     * partitions are included: a replay must still see their changes from before a DETACH.
      */
     public List<String> expansionForDebeziumIncludeList(
             String database, List<String> configuredTables) {
@@ -349,6 +439,13 @@ public class PostgresPartitionRouting implements Serializable {
                 if (childQualified != null) {
                     expansion.add(childQualified);
                 }
+            }
+        }
+        for (String former : formerPartitions) {
+            // Routed to a configured root at some marker, so the root matched the configuration.
+            expansion.add(former);
+            if (database != null && !database.isEmpty()) {
+                expansion.add(database + "." + former);
             }
         }
         return expansion;

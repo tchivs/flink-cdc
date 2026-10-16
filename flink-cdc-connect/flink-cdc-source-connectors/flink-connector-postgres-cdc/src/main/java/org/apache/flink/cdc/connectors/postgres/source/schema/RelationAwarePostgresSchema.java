@@ -18,19 +18,26 @@
 package org.apache.flink.cdc.connectors.postgres.source.schema;
 
 import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionGuard;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionTopology;
 
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.connector.postgresql.PostgresSchema;
+import io.debezium.connector.postgresql.PostgresStreamingChangeEventSource.PgConnectionSupplier;
 import io.debezium.connector.postgresql.PostgresValueConverter;
 import io.debezium.connector.postgresql.TypeRegistry;
 import io.debezium.connector.postgresql.connection.PostgresDefaultValueConverter;
+import io.debezium.connector.postgresql.connection.ReplicationMessage;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.schema.TopicSelector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.sql.Array;
+import java.sql.SQLException;
+import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -51,6 +58,10 @@ public class RelationAwarePostgresSchema extends PostgresSchema {
      */
     private final Set<TableId> detachedPartitions = new HashSet<>();
 
+    private PartitionTopology partitionTopology;
+    private int markerRelationId;
+    private Table markerTable;
+
     public RelationAwarePostgresSchema(
             PostgresConnectorConfig config,
             TypeRegistry typeRegistry,
@@ -68,14 +79,34 @@ public class RelationAwarePostgresSchema extends PostgresSchema {
         this.partitionGuard = partitionGuard;
     }
 
+    /** Follows partition DDL by stream position, the guard is not used then. */
+    public void setPartitionTopology(PartitionTopology partitionTopology) {
+        this.partitionTopology = partitionTopology;
+        LOG.info(
+                "Partition routing at the start of the stream: {}",
+                partitionTopology.routing().routedPartitions());
+        dispatcher.dispatchRouting(partitionTopology.routing());
+    }
+
     @Override
     public void applySchemaChangesForTable(int relationId, Table table) {
+        if (partitionTopology != null && PartitionTopology.isMarkerTable(table.id())) {
+            // Filtered by Debezium, but its rows have to be decoded to reach the topology.
+            markerRelationId = relationId;
+            markerTable = table;
+            return;
+        }
         super.applySchemaChangesForTable(relationId, table);
         if (isFilteredOut(table.id())) {
             // Debezium sees the relation of every published table, filtered ones included.
-            if (partitionGuard != null) {
+            if (partitionTopology != null) {
+                partitionTopology.checkFiltered(table.id());
+            } else if (partitionGuard != null) {
                 partitionGuard.checkFiltered(table.id());
             }
+            return;
+        }
+        if (partitionTopology != null && partitionTopology.isUnrouted(table.id())) {
             return;
         }
         // pgoutput resends the relation of a partition after DETACH, before its next change.
@@ -92,17 +123,84 @@ public class RelationAwarePostgresSchema extends PostgresSchema {
         }
     }
 
+    /**
+     * Applies a row of the partition marker table read from the stream.
+     *
+     * @return whether the message was a marker row, which must not be dispatched
+     */
+    public boolean applyPartitionMarker(
+            TableId tableId, ReplicationMessage message, PgConnectionSupplier connection)
+            throws SQLException {
+        if (partitionTopology == null || !PartitionTopology.isMarkerTable(tableId)) {
+            return false;
+        }
+        if (message.getOperation() != ReplicationMessage.Operation.INSERT) {
+            return true;
+        }
+        Long lsn = null;
+        String parent = null;
+        List<String> children = null;
+        for (ReplicationMessage.Column column : message.getNewTupleList()) {
+            Object value = column.getValue(connection, false);
+            switch (column.getName()) {
+                case "lsn":
+                    lsn = ((Number) value).longValue();
+                    break;
+                case "parent":
+                    parent = (String) value;
+                    break;
+                case "children":
+                    children =
+                            value == null
+                                    ? null
+                                    : Arrays.asList((String[]) ((Array) value).getArray());
+                    break;
+                default:
+                    break;
+            }
+        }
+        if (lsn == null || parent == null) {
+            throw new IllegalStateException("Malformed partition marker row: " + message);
+        }
+        PartitionTopology.Marker marker = new PartitionTopology.Marker(lsn, parent, children);
+        if (partitionTopology.apply(marker)) {
+            LOG.info(
+                    "Partition routing changed at {}: {}",
+                    marker,
+                    partitionTopology.routing().routedPartitions());
+            dispatcher.dispatchRouting(partitionTopology.routing());
+        }
+        return true;
+    }
+
     @Override
     protected boolean isFilteredOut(TableId id) {
         return detachedPartitions.contains(id) || super.isFilteredOut(id);
     }
 
-    /**
-     * The decoder resolves every change through this: changes of a detached partition are no-ops.
-     */
+    /** Changes of a detached partition are no-ops. */
     @Override
     public Table tableFor(TableId id) {
         return detachedPartitions.contains(id) ? null : super.tableFor(id);
+    }
+
+    /**
+     * The decoder resolves every change through this: changes of a partition not routed at this
+     * position are no-ops. Only the decoder lookup is filtered, the schema of such a partition is
+     * still registered, so that its changes are captured as soon as it is routed.
+     */
+    @Override
+    public Table tableFor(int relationId) {
+        if (markerTable != null && relationId == markerRelationId) {
+            return markerTable;
+        }
+        Table table = super.tableFor(relationId);
+        if (table != null
+                && partitionTopology != null
+                && partitionTopology.isUnrouted(table.id())) {
+            return null;
+        }
+        return table;
     }
 
     @Override

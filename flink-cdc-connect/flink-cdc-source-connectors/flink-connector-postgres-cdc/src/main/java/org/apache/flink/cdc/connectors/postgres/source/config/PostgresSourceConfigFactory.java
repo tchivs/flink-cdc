@@ -23,6 +23,7 @@ import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresPartitionRo
 
 import io.debezium.config.Configuration;
 import io.debezium.connector.postgresql.PostgresConnector;
+import io.debezium.connector.postgresql.PostgresConnectorConfig;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -117,8 +118,15 @@ public class PostgresSourceConfigFactory extends JdbcSourceConfigFactory {
                                 username,
                                 password,
                                 tableList,
-                                includePartitionedTables);
-                if (!partitionRouting.isEmpty()) {
+                                includePartitionedTables,
+                                dbzProperties == null
+                                        ? PostgresConnectorConfig.PUBLICATION_NAME
+                                                .defaultValueAsString()
+                                        : dbzProperties.getProperty(
+                                                PostgresConnectorConfig.PUBLICATION_NAME.name(),
+                                                PostgresConnectorConfig.PUBLICATION_NAME
+                                                        .defaultValueAsString()));
+                if (!partitionRouting.isEmpty() || partitionRouting.hasMarkers()) {
                     // The configured partition roots are captured as they are, their partitions
                     // have to be added explicitly to be visible to Debezium at all.
                     tableIncludeList = new ArrayList<>(tableList);

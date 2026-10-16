@@ -33,6 +33,8 @@ import org.apache.flink.cdc.connectors.postgres.source.schema.PostgresSchemaReco
 import org.apache.flink.cdc.connectors.postgres.source.schema.RelationAwarePostgresSchema;
 import org.apache.flink.cdc.connectors.postgres.source.utils.ChunkUtils;
 import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionGuard;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PartitionTopology;
+import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresPartitionRouting;
 import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresSourceRecordUtils;
 import org.apache.flink.table.types.logical.RowType;
 
@@ -48,6 +50,7 @@ import io.debezium.connector.postgresql.PostgresPartition;
 import io.debezium.connector.postgresql.PostgresSchema;
 import io.debezium.connector.postgresql.PostgresTaskContext;
 import io.debezium.connector.postgresql.PostgresTopicSelector;
+import io.debezium.connector.postgresql.connection.Lsn;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.connection.ReplicationConnection;
 import io.debezium.connector.postgresql.spi.Snapshotter;
@@ -286,16 +289,43 @@ public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
         PostgresSourceConfig postgresSourceConfig = (PostgresSourceConfig) sourceConfig;
         // Only the global stream split captures the whole include list: snapshot and backfill
         // splits narrow it to one table, which would make every other partition look unrouted.
-        if (sourceSplitBase.isStreamSplit()
-                && !isBackFillSplit(sourceSplitBase)
-                && !postgresSourceConfig.getPartitionRouting().isEmpty()) {
-            schema.setPartitionGuard(new PartitionGuard(postgresSourceConfig, jdbcConnection));
+        PostgresPartitionRouting routing = postgresSourceConfig.getPartitionRouting();
+        if (sourceSplitBase.isStreamSplit() && !isBackFillSplit(sourceSplitBase)) {
+            if (routing.hasMarkers()) {
+                schema.setPartitionTopology(
+                        partitionTopologyAt(
+                                (PostgresOffset)
+                                        sourceSplitBase.asStreamSplit().getStartingOffset(),
+                                postgresSourceConfig));
+            } else if (!routing.isEmpty()) {
+                schema.setPartitionGuard(new PartitionGuard(postgresSourceConfig, jdbcConnection));
+            }
         }
-
         ChangeEventSourceMetricsFactory<PostgresPartition> metricsFactory =
                 new DefaultChangeEventSourceMetricsFactory<>();
         this.snapshotChangeEventSourceMetrics =
                 metricsFactory.getSnapshotMetrics(taskContext, queue, metadataProvider);
+    }
+
+    /** The partition trees at the start offset of the stream, read on the stream's connection. */
+    private PartitionTopology partitionTopologyAt(
+            PostgresOffset startingOffset, PostgresSourceConfig postgresSourceConfig) {
+        long position = startingOffset.getLsn().asLong();
+        Lsn lastCommitLsn = startingOffset.getLastCommitLsn();
+        if (lastCommitLsn != null && lastCommitLsn.asLong() > position) {
+            position = lastCommitLsn.asLong();
+        }
+        try {
+            return PartitionTopology.atPosition(
+                    jdbcConnection.connection(),
+                    position,
+                    postgresSourceConfig.getDatabaseList().get(0),
+                    postgresSourceConfig.getTableList(),
+                    postgresSourceConfig.getPartitionRouting().partitionsInIncludeList());
+        } catch (SQLException e) {
+            throw new IllegalStateException(
+                    "Cannot read the partition topology at " + startingOffset, e);
+        }
     }
 
     @Override

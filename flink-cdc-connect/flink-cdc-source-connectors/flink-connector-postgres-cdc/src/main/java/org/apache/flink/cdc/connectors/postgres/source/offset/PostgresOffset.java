@@ -19,6 +19,7 @@ package org.apache.flink.cdc.connectors.postgres.source.offset;
 
 import org.apache.flink.cdc.connectors.base.source.meta.offset.Offset;
 
+import io.debezium.connector.postgresql.PostgresOffsetContext;
 import io.debezium.connector.postgresql.SourceInfo;
 import io.debezium.connector.postgresql.connection.Lsn;
 import io.debezium.time.Conversions;
@@ -77,6 +78,13 @@ public class PostgresOffset extends Offset {
 
     public Lsn getLsn() {
         return Lsn.valueOf(Long.valueOf(this.offset.get(SourceInfo.LSN_KEY)));
+    }
+
+    /** The commit LSN of the last transaction fully processed, absent in offsets of a snapshot. */
+    @Nullable
+    public Lsn getLastCommitLsn() {
+        String lsn = this.offset.get(PostgresOffsetContext.LAST_COMMIT_LSN_KEY);
+        return lsn == null ? null : Lsn.valueOf(Long.valueOf(lsn));
     }
 
     @Nullable

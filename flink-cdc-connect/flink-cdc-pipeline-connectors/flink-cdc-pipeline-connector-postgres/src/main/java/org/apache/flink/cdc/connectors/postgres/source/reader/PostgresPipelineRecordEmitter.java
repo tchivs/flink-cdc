@@ -82,6 +82,12 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
 
     private TypeRegistry typeRegistry;
 
+    /**
+     * The routing the stream is in at the current record, sent by the stream whenever it changes;
+     * until then, e.g. for snapshot splits, the routing resolved from the catalog at startup.
+     */
+    @Nullable private PostgresPartitionRouting streamRouting;
+
     public PostgresPipelineRecordEmitter(
             DebeziumDeserializationSchema<T> debeziumDeserializationSchema,
             SourceReaderMetrics sourceReaderMetrics,
@@ -103,6 +109,15 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
     }
 
     @Override
+    protected void onPartitionRouting(PostgresPartitionRouting routing) {
+        streamRouting = routing;
+    }
+
+    private PostgresPartitionRouting partitionRouting() {
+        return streamRouting != null ? streamRouting : sourceConfig.getPartitionRouting();
+    }
+
+    @Override
     protected void processElement(
             SourceRecord element, SourceOutput<T> output, SourceSplitState splitState)
             throws Exception {
@@ -110,8 +125,7 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
             TableId tableId = splitState.asSnapshotSplitState().toSourceSplit().getTableId();
             // A partition must never be announced under its own identity: its changes are
             // emitted as the partition root.
-            Optional<String> parent =
-                    sourceConfig.getPartitionRouting().parentOf(schemaDotTable(tableId));
+            Optional<String> parent = partitionRouting().parentOf(schemaDotTable(tableId));
             if (parent.isPresent()) {
                 sendCreateTableEventIfNeeded(toTableId(parent.get()), tableId, output, splitState);
             } else {
@@ -144,8 +158,7 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
         if (existedTableSchemas.containsKey(schemaAfter.id())) {
             schemaBefore = existedTableSchemas.get(schemaAfter.id()).getTable();
         }
-        Optional<String> parent =
-                sourceConfig.getPartitionRouting().parentOf(schemaDotTable(schemaAfter.id()));
+        Optional<String> parent = partitionRouting().parentOf(schemaDotTable(schemaAfter.id()));
         if (parent.isPresent()) {
             handleRoutedSchemaChange(
                     toTableId(parent.get()), schemaBefore, schemaAfter, output, splitState);
@@ -292,7 +305,7 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
     }
 
     private boolean isRoutedPartitionRoot(TableId tableId) {
-        return !sourceConfig.getPartitionRouting().childrenOf(schemaDotTable(tableId)).isEmpty();
+        return !partitionRouting().childrenOf(schemaDotTable(tableId)).isEmpty();
     }
 
     private CreateTableEvent getCreateTableEvent(TableId tableId, @Nullable TableId originChild) {
@@ -323,7 +336,7 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
      */
     private Schema resolveTableSchema(
             TableId tableId, @Nullable TableId originChild, PostgresConnection jdbc) {
-        PostgresPartitionRouting routing = sourceConfig.getPartitionRouting();
+        PostgresPartitionRouting routing = partitionRouting();
         if (routing.childrenOf(schemaDotTable(tableId)).isEmpty()) {
             return PostgresSchemaUtils.getTableSchema(tableId, sourceConfig, jdbc);
         }
@@ -391,8 +404,7 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
             return element;
         }
         Optional<String> parent =
-                sourceConfig
-                        .getPartitionRouting()
+                partitionRouting()
                         .parentOf(
                                 source.getString(SCHEMA_NAME_KEY)
                                         + "."

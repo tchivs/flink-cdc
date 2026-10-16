@@ -71,11 +71,14 @@ public class TableDiscoveryUtils {
      */
     public static List<TableId> withoutPartitionRoots(
             List<TableId> capturedTables, PostgresPartitionRouting partitionRouting) {
-        if (partitionRouting.isEmpty()) {
+        if (partitionRouting.isEmpty() && !partitionRouting.hasMarkers()) {
             return capturedTables;
         }
+        // A former partition is in the include list for the stream only: snapshotting it would
+        // emit the rows of a detached table as rows of nothing or of its former root.
         return capturedTables.stream()
                 .filter(tableId -> !partitionRouting.hasCapturedPartitions(schemaDotTable(tableId)))
+                .filter(tableId -> !partitionRouting.isFormerPartition(schemaDotTable(tableId)))
                 .collect(Collectors.toList());
     }
 
